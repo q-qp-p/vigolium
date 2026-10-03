@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/types"
 )
 
@@ -164,4 +165,170 @@ func TestRecordExportFailurePrecedence(t *testing.T) {
 			"a gate verdict whose artifact is missing must not report exit 4")
 		assert.Equal(t, errCodeExportFailed, classifyErrorCode(gated, ExitError))
 	})
+}
+
+// unwritableExportDir returns a path inside a directory that does not exist, so
+// a write there fails the same way for every user — including root, for whom
+// the permission trick above is a no-op.
+func unwritableExportDir(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "absent")
+}
+
+// The persisted path's two artifact steps used to print and swallow: a scan
+// whose html report could not be written exited 0.
+func TestMaybeGenerateReportsReturnsFailure(t *testing.T) {
+	db := newExportTestDB(t)
+	seedFindingAndRecord(t, db, "proj-reports", "a")
+
+	opts := types.DefaultOptions()
+	opts.ProjectUUID = "proj-reports"
+	opts.Output = filepath.Join(unwritableExportDir(t), "report.html")
+	opts.OutputFormats = []string{"html"}
+	// Stateless skips the scan-scope filter; this temp DB holds only this data.
+	opts.Stateless = true
+
+	err := maybeGenerateReports(db, opts)
+	require.Error(t, err, "an unwritable report path must fail the run, not just print")
+	assert.Contains(t, err.Error(), "generate", "the error must name the step")
+	assert.Contains(t, err.Error(), opts.Output, "the error must name the path that failed")
+
+	// A run that asked for no report cannot fail at this step.
+	clean := types.DefaultOptions()
+	assert.NoError(t, maybeGenerateReports(db, clean))
+}
+
+func TestFinishFSExportReturnsFailure(t *testing.T) {
+	db := newExportTestDB(t)
+	seedFindingAndRecord(t, db, "proj-fs", "b")
+
+	// The fs export creates its own directories, so a missing parent is not a
+	// failure. A regular FILE where a parent directory has to go is: mkdir
+	// refuses, on every platform and for root too.
+	blocked := filepath.Join(t.TempDir(), "not-a-dir")
+	require.NoError(t, os.WriteFile(blocked, []byte("x"), 0o600))
+
+	opts := types.DefaultOptions()
+	opts.ProjectUUID = "proj-fs"
+	opts.Output = filepath.Join(blocked, "tree")
+	opts.OutputFormats = []string{"fs"}
+
+	err := finishFSExport(db, opts)
+	require.Error(t, err, "an unwritable fs destination must fail the run")
+	assert.Contains(t, err.Error(), "export fs tree")
+
+	// Stateless runs are handled by finishStatelessExport, and a run that never
+	// asked for fs has nothing to do here.
+	stateless := types.DefaultOptions()
+	stateless.Output, stateless.OutputFormats, stateless.Stateless = opts.Output, []string{"fs"}, true
+	assert.NoError(t, finishFSExport(db, stateless))
+
+	noFS := types.DefaultOptions()
+	noFS.OutputFormats = []string{"console"}
+	assert.NoError(t, finishFSExport(db, noFS))
+}
+
+// isExportFailure is what keeps one failed format from cancelling the others.
+func TestIsExportFailure(t *testing.T) {
+	assert.False(t, isExportFailure(nil))
+	assert.False(t, isExportFailure(errors.New("the scan itself broke")))
+
+	var recorded error
+	recordExportFailure(&recorded, errors.New("generate html /nope/out.html: no such directory"))
+	require.Error(t, recorded)
+	assert.True(t, isExportFailure(recorded),
+		"recordExportFailure's own error must be recognizable as an export failure")
+	assert.True(t, isExportFailure(errors.Join(errors.New("other"), recorded)),
+		"it reaches the defer guards wrapped")
+
+	// A gate trip is a completed result with its output already written.
+	assert.False(t, isExportFailure(gateError{errors.New("--fail-on: tripped")}))
+}
+
+// The guard the jsonl-export defers use, stated as the rule.
+func TestReportFailureDoesNotSkipJSONLExport(t *testing.T) {
+	var exportErr error
+	recordExportFailure(&exportErr, errors.New("generate html: unwritable"))
+	scanBroke := errors.New("session init failed")
+
+	// The REAL predicate both executeNativeScan and runRunnerScan defer on, not a
+	// local restatement of it: a copy here would keep passing after the rule it
+	// describes had changed underneath.
+	skip := func(err error, stateless bool) bool {
+		return skipDeferredJSONLExport(err, stateless, "")
+	}
+
+	assert.False(t, skip(exportErr, false),
+		"a failed html report must not cancel the jsonl export — that is the format that would still have landed")
+	assert.True(t, skip(scanBroke, false),
+		"a failed scan still skips: a success-looking file of stale data is worse than none")
+	assert.False(t, skip(nil, false), "a clean run exports")
+	assert.False(t, skip(scanBroke, true),
+		"stateless is exempt — its temp DB is discarded, so this is the only chance to surface anything")
+	assert.True(t, skipDeferredJSONLExport(nil, true, "/tmp/out.jsonl"),
+		"stateless WITH -o already materialized every format; exporting again would double the output")
+}
+
+// failingDBOpen stands in for a getDB that cannot open the configured store.
+func failingDBOpen() (*database.DB, error) {
+	return nil, errors.New("failed to connect to database: not a database")
+}
+
+// A pinned store that cannot be opened must fail the direct path BEFORE any
+// request goes out. Scanning for minutes and then discarding every finding
+// because --db pointed somewhere unusable is the silent data loss a pin exists
+// to prevent.
+func TestDirectScanPinnedDBFailureIsFatal(t *testing.T) {
+	prevDB, prevConfig, prevSilent := globalDB, globalConfig, globalSilent
+	t.Cleanup(func() { globalDB, globalConfig, globalSilent = prevDB, prevConfig, prevSilent })
+
+	t.Run("pinned --db is fatal", func(t *testing.T) {
+		globalDB, globalConfig, globalSilent = filepath.Join(t.TempDir(), "pinned.sqlite"), "", true
+		repo, project, err := acquireDirectScanDB(failingDBOpen)
+		require.Error(t, err, "a pinned --db that cannot be opened must fail the command")
+		assert.Contains(t, err.Error(), "database unavailable")
+		assert.Nil(t, repo)
+		assert.Empty(t, project)
+	})
+
+	t.Run("pinned --config is fatal", func(t *testing.T) {
+		globalDB, globalConfig, globalSilent = "", filepath.Join(t.TempDir(), "cfg.yaml"), true
+		_, _, err := acquireDirectScanDB(failingDBOpen)
+		require.Error(t, err, "--config names the store too, so it is equally a pin")
+	})
+
+	t.Run("unpinned warns and keeps scanning", func(t *testing.T) {
+		globalDB, globalConfig, globalSilent = "", "", false
+		var repo *database.Repository
+		var err error
+		out := captureStderr(t, func() { repo, _, err = acquireDirectScanDB(failingDBOpen) })
+		require.NoError(t, err, "nobody asked for persistence, so the scan still runs")
+		assert.Nil(t, repo, "a nil repository is what makes the result report persisted: false")
+		assert.Contains(t, out, "will not be persisted",
+			"the operator must be told their findings are memory-only")
+	})
+
+	t.Run("unpinned and silent says nothing", func(t *testing.T) {
+		globalDB, globalConfig, globalSilent = "", "", true
+		out := captureStderr(t, func() {
+			_, _, err := acquireDirectScanDB(failingDBOpen)
+			require.NoError(t, err)
+		})
+		assert.Empty(t, strings.TrimSpace(out), "--silent means silent")
+	})
+}
+
+// The result document states whether the findings also reached a store, so a
+// caller that reads them here and then expects `vigolium finding` to list them
+// can tell which of the two runs it got.
+func TestScanResultPersistedIsSerialized(t *testing.T) {
+	doc, err := encodeAgentJSON(&scanResult{Target: "http://a.example/", Method: "GET"})
+	require.NoError(t, err)
+	assert.Contains(t, string(doc), `"persisted": false`)
+	assert.NotContains(t, string(doc), "interrupted", "interrupted is omitempty on a normal run")
+
+	doc, err = encodeAgentJSON(&scanResult{Target: "http://a.example/", Persisted: true, Interrupted: true})
+	require.NoError(t, err)
+	assert.Contains(t, string(doc), `"persisted": true`)
+	assert.Contains(t, string(doc), `"interrupted": true`)
 }

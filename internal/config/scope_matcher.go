@@ -208,6 +208,42 @@ func (m *ScopeMatcher) HostInScope(host string) bool {
 	return m.hostInScope(host)
 }
 
+// ExplicitlyExcluded reports whether host or path matches an operator-written
+// exclude pattern — scope.host.exclude or scope.path.exclude — and nothing else.
+//
+// It is deliberately narrower than InScope. Include lists, origin mode, the
+// static-file filter and the runtime allow-set are all ignored, so an
+// include-only configuration excludes nothing here. The question it answers is
+// "did the operator name this and say no", which is the only scope decision safe
+// to enforce BEFORE a request leaves (triage C12): enforcing the include side
+// pre-send would silently narrow discovery to the include list, which is not what
+// an include list means.
+//
+// Nil-safe: a scan with no matcher excludes nothing.
+func (m *ScopeMatcher) ExplicitlyExcluded(host, path string) bool {
+	if m == nil {
+		return false
+	}
+	return matchesExcludeRule(host, m.cfg.Host) || matchesExcludeRule(path, m.cfg.Path)
+}
+
+// matchesExcludeRule reports whether value matches one of rule's exclude globs.
+// Unlike matchGlob it never consults Include and never short-circuits on
+// isDefaultPassAll, because a rule with excludes is not pass-all and a rule
+// without them is not an exclusion.
+func matchesExcludeRule(value string, rule ScopeRule) bool {
+	if len(rule.Exclude) == 0 {
+		return false
+	}
+	valueLower := strings.ToLower(value)
+	for _, pattern := range rule.Exclude {
+		if globMatch(valueLower, strings.ToLower(pattern)) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsStaticFile returns true if the URL path ends with a known static-asset extension.
 func (m *ScopeMatcher) IsStaticFile(path string) bool {
 	if len(m.staticExts) == 0 {
@@ -368,13 +404,11 @@ func matchGlob(value string, rule ScopeRule) bool {
 		return true
 	}
 
-	valueLower := strings.ToLower(value)
-
-	// Check excludes first (higher priority)
-	for _, pattern := range rule.Exclude {
-		if globMatch(valueLower, strings.ToLower(pattern)) {
-			return false
-		}
+	// Check excludes first (higher priority). Through the same helper
+	// ExplicitlyExcluded uses, so the pre-send exclusion check and the full scope
+	// decision cannot disagree about what an exclude pattern matches.
+	if matchesExcludeRule(value, rule) {
+		return false
 	}
 
 	// If include is empty or only contains "*", match everything
@@ -383,6 +417,7 @@ func matchGlob(value string, rule ScopeRule) bool {
 	}
 
 	// Check includes
+	valueLower := strings.ToLower(value)
 	for _, pattern := range rule.Include {
 		if globMatch(valueLower, strings.ToLower(pattern)) {
 			return true

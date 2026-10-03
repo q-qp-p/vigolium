@@ -1,6 +1,7 @@
 package authentication
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,8 +14,39 @@ import (
 	"golang.org/x/net/publicsuffix"
 )
 
+// loginRequestTimeout bounds ONE login request. The total across all sessions
+// and steps is bounded separately by the manager's login budget; this is the
+// per-request stop that keeps one unanswered request from consuming it all.
+const loginRequestTimeout = 30 * time.Second
+
+// withLoginJar returns a copy of client that uses jar, leaving the caller's
+// client (and its transport, shared across sessions) untouched. A nil client is
+// replaced by one carrying only the per-request timeout — so a caller that
+// passes nothing gets the old literal's behaviour, minus the proxy and TLS
+// policy it never had.
+//
+// Redirects are left at Go's default (followed, up to 10) so a login whose
+// Set-Cookie rides a 302 still lands its cookies in the jar.
+func withLoginJar(client *http.Client, jar http.CookieJar) *http.Client {
+	if client == nil {
+		return &http.Client{Timeout: loginRequestTimeout, Jar: jar}
+	}
+	c := *client
+	c.Jar = jar
+	if c.Timeout <= 0 {
+		c.Timeout = loginRequestTimeout
+	}
+	return &c
+}
+
 // executeLogin performs the login flow and populates session headers with extracted credentials.
-func executeLogin(sess *Session) error {
+//
+// ctx bounds the whole flow: it carries the caller's cancellation and the
+// manager's total login budget, so a scan that is shutting down or has spent its
+// login budget aborts the in-flight request instead of running to the
+// per-request timeout. client supplies the transport (proxy, target TLS) and is
+// never mutated — each flow takes a copy with its own cookie jar.
+func executeLogin(ctx context.Context, sess *Session, client *http.Client) error {
 	if sess.Login == nil {
 		return fmt.Errorf("session %q: no login flow defined", sess.Name)
 	}
@@ -24,7 +56,7 @@ func executeLogin(sess *Session) error {
 
 	// Multi-step login flows.
 	if len(sess.Login.Steps) > 0 {
-		return executeMultiStepLogin(sess)
+		return executeMultiStepLogin(ctx, sess, client)
 	}
 
 	login := sess.Login
@@ -34,18 +66,14 @@ func executeLogin(sess *Session) error {
 		return fmt.Errorf("session %q: failed to create cookie jar: %w", sess.Name, err)
 	}
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     jar,
-		// Follow redirects to capture cookies from redirect responses
-	}
+	client = withLoginJar(client, jar)
 
 	var body io.Reader
 	if login.Body != "" {
 		body = strings.NewReader(login.Body)
 	}
 
-	req, err := http.NewRequest(strings.ToUpper(login.Method), login.URL, body)
+	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(login.Method), login.URL, body)
 	if err != nil {
 		return fmt.Errorf("session %q: failed to create login request: %w", sess.Name, err)
 	}
@@ -99,16 +127,17 @@ func executeLogin(sess *Session) error {
 
 // executeMultiStepLogin handles login flows with multiple steps.
 // Variables extracted in step N are available as {varname} placeholders in step N+1.
-func executeMultiStepLogin(sess *Session) error {
+//
+// ctx bounds every step AND the sequence: the manager's total login budget is on
+// it, so a three-step flow that would outlast the budget fails at the step the
+// budget ran out on rather than at the end.
+func executeMultiStepLogin(ctx context.Context, sess *Session, client *http.Client) error {
 	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
 		return fmt.Errorf("session %q: failed to create cookie jar: %w", sess.Name, err)
 	}
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     jar,
-	}
+	client = withLoginJar(client, jar)
 
 	// Variables extracted across steps, available as {varname} in subsequent steps.
 	vars := map[string]string{}
@@ -118,6 +147,13 @@ func executeMultiStepLogin(sess *Session) error {
 	}
 
 	for i, step := range sess.Login.Steps {
+		// Checked per step, not only per session: a flow whose budget ran out
+		// mid-sequence reports the step it stopped at instead of sending a
+		// request that is already doomed.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("session %q: step[%d] not attempted: %w", sess.Name, i, err)
+		}
+
 		// Substitute variables in URL and body.
 		stepURL := substituteVars(step.URL, vars)
 		stepBody := substituteVars(step.Body, vars)
@@ -127,7 +163,7 @@ func executeMultiStepLogin(sess *Session) error {
 			body = strings.NewReader(stepBody)
 		}
 
-		req, err := http.NewRequest(strings.ToUpper(step.Method), stepURL, body)
+		req, err := http.NewRequestWithContext(ctx, strings.ToUpper(step.Method), stepURL, body)
 		if err != nil {
 			return fmt.Errorf("session %q: step[%d] failed to create request: %w", sess.Name, i, err)
 		}
@@ -433,14 +469,28 @@ func extractRegexValue(body []byte, rule ExtractRule) (string, error) {
 	return value, nil
 }
 
-// ProbeLogin sends the login request and returns the HTTP status code.
+// ProbeLogin sends the login request on a background context with no transport
+// of its own. It is the convenience wrapper for the interactive `session`
+// commands; a scan should use ProbeLoginContext so the probe follows the scan's
+// proxy and cancellation.
+func ProbeLogin(sess *Session) (statusCode int, err error) {
+	return ProbeLoginContext(context.Background(), sess, nil)
+}
+
+// ProbeLoginContext sends the login request and returns the HTTP status code.
 // Unlike executeLogin, it does not fail on non-2xx status codes — it returns
 // the status code and lets the caller decide. If extract rules are present and
 // the status is 2xx/3xx, it also runs extraction to populate session headers.
 // Returns an error only on network/request-building failures.
-func ProbeLogin(sess *Session) (statusCode int, err error) {
+//
+// ctx bounds the probe; client supplies the transport (proxy, target TLS) and is
+// copied, never mutated. A nil client keeps Go's default transport.
+func ProbeLoginContext(ctx context.Context, sess *Session, client *http.Client) (statusCode int, err error) {
 	if sess.Login == nil {
 		return 0, fmt.Errorf("session %q: no login flow defined", sess.Name)
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
 	// Expand shorthand type/token_path into extract rules.
@@ -452,17 +502,14 @@ func ProbeLogin(sess *Session) (statusCode int, err error) {
 		return 0, fmt.Errorf("session %q: failed to create cookie jar: %w", sess.Name, err)
 	}
 
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     jar,
-	}
+	client = withLoginJar(client, jar)
 
 	var body io.Reader
 	if login.Body != "" {
 		body = strings.NewReader(login.Body)
 	}
 
-	req, err := http.NewRequest(strings.ToUpper(login.Method), login.URL, body)
+	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(login.Method), login.URL, body)
 	if err != nil {
 		return 0, fmt.Errorf("session %q: failed to create login request: %w", sess.Name, err)
 	}

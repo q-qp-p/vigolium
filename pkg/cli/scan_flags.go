@@ -89,11 +89,13 @@ func registerNativeScanFlags(flags *pflag.FlagSet, includeAuth bool) {
 	flags.BoolVar(&scanOpts.SpideringEnabled, "spider", false, "Enable browser-based spidering phase before scanning")
 	flags.DurationVar(&scanOpts.SpideringMaxDuration, "spider-max-time", 30*time.Minute, "Max time for spidering per target")
 	flags.StringVarP(&scanOpts.SpideringBrowserEngine, "browser-engine", "E", "chromium", "Browser engine: 'chromium', 'ungoogled', or 'fingerprint'")
-	flags.IntVarP(&scanOpts.SpideringBrowserCount, "browsers", "b", 1, "Number of parallel browser instances for spidering")
+	flags.IntVarP(&scanOpts.SpideringBrowserCount, "browsers", "b", 1, "Browser instances to launch for spidering (currently clamped to 1 — the crawler is single-threaded)")
 	flags.BoolVar(&scanOpts.SpideringHeadless, "headless", true, "Run browser in headless mode")
 	flags.BoolVar(&scanOpts.SpideringHeaded, "headed", false, "Show the browser window during spidering (sugar for --headless=false; wins when both are set)")
 	flags.BoolVar(&scanOpts.SpideringNoCDP, "no-cdp", false, "Disable Chrome DevTools Protocol event listener detection")
-	flags.BoolVar(&scanOpts.SpideringNoForms, "no-forms", false, "Disable automatic form detection and filling during spidering")
+	flags.BoolVar(&scanOpts.SpideringNoForms, "no-forms", false, "Disable form filling and submission during spidering (sets spidering.interaction edit_fields and submit_forms off; an explicit interaction key wins)")
+	flags.BoolVar(&scanOpts.SpideringRequireAuth, "require-auth", false, "Fail a target's spidering instead of crawling anonymously when configured authentication (session cookies/auth headers) cannot be applied to the browser (sets spidering.require_auth)")
+	flags.BoolVar(&scanOpts.SpideringBrowserInsecure, "browser-insecure", false, "Spider with every browser security exception on: no sandbox, TLS errors ignored, mixed content allowed, same-origin policy off. For local test apps only")
 	flags.BoolVar(&scanNoCarryBrowserSession, "no-carry-browser-session", false, "Do not carry the spidering browser's cleared session (cookies + UA) into discovery/scanning (on by default when --spider runs; scoped to the same host, respects -H)")
 
 	// External intelligence harvesting flags
@@ -116,6 +118,7 @@ func registerNativeScanFlags(flags *pflag.FlagSet, includeAuth bool) {
 
 	// Stateless mode
 	flags.BoolVarP(&globalStateless, "stateless", "S", false, "Use a temporary database that is discarded after the scan (pass --output/--format to persist results)")
+	registerKeepDBOnErrorFlag(flags)
 	flags.BoolVar(&globalSplitByHost, "split-by-host", false, "In stateless multi-target mode (-S -T file), write a separate per-host output file (base-<host>.<ext>) instead of one unified file")
 	flags.BoolVar(&globalDBIsolate, "db-isolate", false, "Scan into a private temporary database, then merge results into --db (or the default DB) at the end — lets many parallel scans share one --db without write contention (SQLite only; ignored under --stateless, which keeps nothing to merge; combine with -P -T to fan out targets and export one unified output from the merged DB)")
 	flags.IntVarP(&globalParallel, "parallel", "P", 1, "Scan up to N targets concurrently as isolated child processes (requires -S -T --split-by-host, OR --db-isolate -T which merges into --db and exports one unified output; each target keeps its own --concurrency, so real in-flight requests ≈ N × --concurrency)")

@@ -494,6 +494,22 @@ const riskPrefetchBatchSize = 128
 
 // RiskPrioritizedDBInputSource processes high-risk records first, then falls back
 // to normal cursor-based order. It implements source.InputSource.
+//
+// Delivery is AT-LEAST-ONCE. The durable cursor advances only once every item in
+// the round has been acknowledged or written off, so a round cut short re-serves
+// its tail on the next pass rather than skipping it — duplicate work being far
+// cheaper than a silent coverage hole. Two consequences follow from that choice
+// and are accepted rather than fixed here:
+//
+//   - The checkpoint is `processed_count = processed_count + ?`, which is not
+//     idempotent. A write that commits but reports an error (a connection lost
+//     after the server applied it) is retried by FlushCursor and can double-count
+//     processed_count. The cursor position itself is an absolute (created_at,
+//     uuid) assignment and stays correct; only the counter can overshoot, and a
+//     wrong progress number is a far smaller problem than a cursor past
+//     unprocessed records.
+//   - A record served twice is scanned twice. Findings dedup downstream, so the
+//     visible cost is time rather than duplicate results.
 type RiskPrioritizedDBInputSource struct {
 	db                   *DB
 	repo                 *Repository
@@ -529,11 +545,17 @@ type RiskPrioritizedDBInputSource struct {
 
 	coalescer *paramShapeCoalescer // nil when coalescing is disabled
 
-	total            int  // coalescing survivors committed to (each ends acked or skipped)
-	acked            int  // survivors a worker acknowledged
-	skipped          int  // survivors that can't be served (parse fail, missing/deleted, fetch error)
-	committed        bool // guards the one-shot cursor advance so it can't fire twice
-	streamsExhausted bool // the stream is drained → total is final, so the commit can fire
+	total            int   // coalescing survivors committed to (each ends acked or skipped)
+	acked            int   // survivors a worker acknowledged
+	skipped          int   // survivors that can't be served (parse fail, missing/deleted, fetch error)
+	committed        bool  // guards the one-shot cursor advance so it can't fire twice
+	streamsExhausted bool  // the stream is drained → total is final, so the commit can fire
+	commitErr        error // the last failed checkpoint attempt, cleared on success
+
+	// advanceCursor is the durable checkpoint write, injectable so the failure
+	// path is testable without a broken database. Defaults to the repository's
+	// AdvanceScanCursorBy.
+	advanceCursor func(ctx context.Context, scanUUID string, at time.Time, id string, delta int64) error
 }
 
 // NewRiskPrioritizedDBInputSource creates a DBInputSource that processes
@@ -878,6 +900,13 @@ func (s *RiskPrioritizedDBInputSource) ackSnapshotItem() {
 // streamsExhausted is essential: the total grows as pages stream in, so an
 // early acked+skipped == total (before the last page is pulled) must NOT commit.
 // One-shot (guarded by s.committed). Caller holds s.mu.
+//
+// committed is set only AFTER the write succeeds. It used to be set before, so a
+// failed checkpoint latched the source shut and reported nothing: the scan went
+// on to record a clean completion while its durable cursor still sat at the
+// start of the round, and the whole round's work was silently re-served (or, with
+// a cursor inherited by a later scan, silently skipped). A failure now leaves the
+// commit pending and keeps the error for FlushCursor to retry and report.
 func (s *RiskPrioritizedDBInputSource) maybeCommitCursorLocked() {
 	if s.committed || !s.streamsExhausted {
 		return
@@ -885,10 +914,97 @@ func (s *RiskPrioritizedDBInputSource) maybeCommitCursorLocked() {
 	if s.acked+s.skipped < s.total {
 		return
 	}
-	s.committed = true
-	if err := s.repo.AdvanceScanCursorBy(context.Background(), s.scanUUID, s.boundAt, s.boundID, int64(s.total)); err != nil {
+	if err := s.writeCursorLocked(context.Background()); err != nil {
 		zap.L().Warn("RiskPrioritizedDBInputSource: failed to acknowledge snapshot", zap.Error(err))
 	}
+}
+
+// writeCursorLocked performs the checkpoint write and records its result. Caller
+// holds s.mu.
+func (s *RiskPrioritizedDBInputSource) writeCursorLocked(ctx context.Context) error {
+	advance := s.advanceCursor
+	if advance == nil {
+		advance = s.repo.AdvanceScanCursorBy
+	}
+	if err := advance(ctx, s.scanUUID, s.boundAt, s.boundID, int64(s.total)); err != nil {
+		s.commitErr = err
+		return err
+	}
+	s.committed = true
+	s.commitErr = nil
+	return nil
+}
+
+// cursorFlushAttempts and cursorFlushBackoff bound FlushCursor's retry. Three
+// attempts with a linear back-off mirrors the page-fetch retry in
+// fillNextPageLocked: enough to ride out a SQLITE_BUSY window or a brief
+// failover, short enough that a genuinely unreachable database is reported
+// rather than waited on.
+const (
+	cursorFlushAttempts = 3
+	cursorFlushBackoff  = 100 * time.Millisecond
+)
+
+// FlushCursor makes one last, reported attempt to checkpoint the round's cursor.
+//
+// The steady path commits from the ack that resolves the final item, on a
+// background context, and logs a failure at warn level. That is the right place
+// for it — the cursor must advance whether or not anyone is watching — but it
+// leaves a phase with no way to learn that the checkpoint never landed. This is
+// that call: the phase runs it after its executor returns and can turn a failure
+// into a reported partial run instead of a clean one whose cursor lies.
+//
+// A no-op once committed, and a no-op while items are still unresolved (the
+// commit has not become due yet, so there is nothing to flush). Returns the last
+// error when the retries are exhausted.
+func (s *RiskPrioritizedDBInputSource) FlushCursor(ctx context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.committed || !s.hasBound {
+		return nil
+	}
+	if !s.streamsExhausted || s.acked+s.skipped < s.total {
+		// Not due: the round ended with work still unresolved. Report the last
+		// write failure if there was one, but do not invent a checkpoint for items
+		// nobody finished — leaving the cursor behind them is the correct outcome.
+		return s.commitErr
+	}
+
+	var err error
+	for attempt := 0; attempt < cursorFlushAttempts; attempt++ {
+		if err = s.writeCursorLocked(ctx); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		if attempt < cursorFlushAttempts-1 {
+			s.mu.Unlock()
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Duration(attempt+1) * cursorFlushBackoff):
+			}
+			s.mu.Lock()
+			// A concurrent ack may have succeeded while the lock was released.
+			if s.committed {
+				return nil
+			}
+		}
+	}
+	return err
+}
+
+// Unresolved reports how many of this round's items ended neither acknowledged
+// nor skipped — items a worker took and never finished, because the phase was
+// cancelled or ran out of budget. Valid after the round's executor has returned.
+func (s *RiskPrioritizedDBInputSource) Unresolved() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n := s.total - s.acked - s.skipped; n > 0 {
+		return n
+	}
+	return 0
 }
 
 // Close stops the source.

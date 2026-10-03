@@ -2,30 +2,47 @@ package cli
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/internal/runner"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/scanevents"
+	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/types"
 )
 
 // beginScanEventStream installs the process event emitter for this scan and
-// writes the opening scan.started line. It returns a finish func that emits the
-// terminal scan.finished — call it (deferred) on every exit path.
+// writes the opening scan.started line.
 //
 // The emitter is installed AFTER the scan uuid is pinned and the DB is open, so
 // scan.started can carry the two facts a consumer most needs to attribute later
 // events: which scan row this is, and which database it landed in. Everything
 // before that point is setup that fails loudly on its own.
-func beginScanEventStream(db *database.DB, opts *types.Options, settings *config.Settings, strategyName string, start time.Time) (finish func(error), err error) {
+//
+// The terminal event is returned as TWO functions because the facts it carries
+// become available at two different moments, and a single deferred call could
+// only ever be right about one of them:
+//
+//   - prepare reads the totals and the coverage verdict, and must run while the
+//     database is still open — which is before the --db-isolate merge copies
+//     the run into the real store.
+//   - emit writes the line, and must run after everything that can still fail
+//     has failed. A merge that cannot write is a failed scan, and the stream
+//     used to say `completed` because its terminal event had already gone out.
+//
+// Deferred in that order (emit registered first, so LIFO runs it last), the
+// line reports what prepare measured and the status the whole invocation
+// earned.
+func beginScanEventStream(db *database.DB, opts *types.Options, settings *config.Settings, strategyName string, start time.Time) (prepare func(error), emit func(error), err error) {
 	format, err := scanevents.ParseFormat(opts.Events)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if format == "" {
-		return func(error) {}, nil
+		return func(error) {}, func(error) {}, nil
 	}
 
 	emitter := scanevents.NewStdout(opts.ScanUUID)
@@ -54,24 +71,70 @@ func beginScanEventStream(db *database.DB, opts *types.Options, settings *config
 		PhasePace: phasePace,
 	})
 
-	// SIGINT/SIGTERM must still produce a terminal event: the absence of one is
-	// how a consumer detects a SIGKILL, and that only works if every signal we
-	// CAN catch produces one.
-	stopSignals := scanevents.TrapSignals(start)
+	// A consumer that goes away must not take the scan with it. Without this the
+	// first event written to a closed stdout killed the process outright on the
+	// default SIGPIPE disposition — `vigolium scan --events ndjson | head -5`
+	// terminated a running scan, mid-write, with no scan row and no findings.
+	// Handled, the write returns EPIPE instead and the emitter latches.
+	stopPipeGuard := guardEventStreamPipe()
 
-	return func(runErr error) {
-		stopSignals()
-		ev := scanevents.Event{
-			Status:     scanevents.StatusCompleted,
-			DurationMS: time.Since(start).Milliseconds(),
-		}
+	var ev scanevents.Event
+	prepared := false
+
+	prepare = func(runErr error) {
+		ev.DurationMS = time.Since(start).Milliseconds()
+		ev.Status = scanevents.StatusCompleted
 		if runErr != nil {
 			ev.Status = scanevents.StatusFailed
 			ev.Message = runErr.Error()
 		}
+		// Reads the totals AND the coverage verdict from the scan row, which is
+		// why this half has to happen while the database is open.
 		scanFinishTotals(db, &ev, opts)
+		prepared = true
+	}
+
+	emit = func(runErr error) {
+		stopPipeGuard()
+		if !prepared {
+			// A path that reached emit without prepare has no totals to report;
+			// a terminal event with none still beats no terminal event at all,
+			// which a consumer reads as a SIGKILL.
+			ev.Status = scanevents.StatusCompleted
+		}
+		ev.DurationMS = time.Since(start).Milliseconds()
+		switch {
+		case runErr != nil:
+			// Later than prepare's view: the --db-isolate merge runs between
+			// the two, and a run whose results never reached the real database
+			// did not complete.
+			ev.Status = scanevents.StatusFailed
+			ev.Message = runErr.Error()
+		case activeScanSignals.Interrupted():
+			// Beats `curtailed`: both say the run did not cover everything, and
+			// only this one says why. The reasons list still carries the detail.
+			ev.Status = scanevents.StatusInterrupted
+		}
 		scanevents.Finish(ev)
-	}, nil
+		reportEventStreamDelivery()
+	}
+	return prepare, emit, nil
+}
+
+// reportEventStreamDelivery warns on stderr when the stream was cut short.
+//
+// The emitter swallows write errors by design — a scan does not fail because
+// nobody was listening — but swallowing them silently meant an operator whose
+// consumer died early got a complete-looking exit 0 and a truncated stream,
+// with nothing anywhere saying the two did not match. The exit code is
+// deliberately unchanged: the scan really did run to completion.
+func reportEventStreamDelivery() {
+	err := scanevents.Default().Err()
+	if err == nil || globalSilent {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s event stream delivery failed: %v; the scan ran to completion\n",
+		terminal.WarnPrefix(), err)
 }
 
 // scanFinishTotals fills the terminal event's tallies from the database the scan
@@ -79,6 +142,12 @@ func beginScanEventStream(db *database.DB, opts *types.Options, settings *config
 // number is the persisted one: findings are deduped and grouped on their way in,
 // so a live counter of emitted results overstates what a consumer will actually
 // find when it queries.
+//
+// The coverage verdict is read here for the same reason, from the same
+// repository and under the same deadline: the scan row is authoritative after
+// the runner's finalizer, and reading it in this one pass — rather than deciding
+// the verdict where the event is built, before the row exists — is what keeps
+// the row and the terminal event from disagreeing.
 func scanFinishTotals(db *database.DB, ev *scanevents.Event, opts *types.Options) {
 	if db == nil {
 		return
@@ -93,6 +162,59 @@ func scanFinishTotals(db *database.DB, ev *scanevents.Event, opts *types.Options
 	if n, err := repo.CountRecordsForScan(ctx, opts.ProjectUUID, opts.ScanUUID); err == nil {
 		ev.RecordsWritten = scanevents.Int64(n)
 	}
+	if scan, err := repo.GetScanByUUID(ctx, opts.ScanUUID); err == nil {
+		applyScanCompletion(ev, scan)
+	}
+}
+
+// applyScanCompletion downgrades a "completed" terminal event to "curtailed"
+// when the scan row says the run was only partial, and attaches the stop reason
+// and the union of the phases' reasons.
+//
+// Pure, and applied to the event rather than decided when the event is built,
+// because the verdict is not known until the runner's finalizer has written the
+// row — and because `failed` and `interrupted` must pass through untouched: a
+// scan that failed is not a scan that was curtailed, and relabelling it would
+// lose the more serious of the two facts.
+//
+// `curtailed` is an existing status value (a phase already reported it), so a
+// consumer switching on status sees nothing new in kind.
+func applyScanCompletion(ev *scanevents.Event, scan *database.Scan) {
+	if ev == nil || scan == nil {
+		return
+	}
+	if scan.StopReason != "" {
+		ev.StopReason = scan.StopReason
+	}
+	if reasons := unionPhaseReasons(scan.PhaseOutcomes); len(reasons) > 0 {
+		ev.Reasons = reasons
+	}
+	// An empty Completeness means unknown (a row written by an older binary, or
+	// by a caller with no outcome data) and must never change the status.
+	if ev.Status == scanevents.StatusCompleted && scan.Completeness == database.CompletenessPartial {
+		ev.Status = scanevents.StatusCurtailed
+	}
+}
+
+// unionPhaseReasons collects every distinct reason across a scan's phases,
+// sorted — so the terminal event answers "what went wrong anywhere in this run"
+// without a consumer having to walk the per-phase list itself.
+//
+// A phase skipped for having nothing to do contributes nothing, by the same
+// rule the completeness verdict and the partial banner use: `no_modules` on a
+// phase with no modules is the plan working, not a gap, and unioning it here
+// put a reason on scan.finished that the other two correctly omitted.
+func unionPhaseReasons(phases []database.PhaseOutcome) []string {
+	seen := make(map[string]struct{})
+	for _, p := range phases {
+		if p.BenignSkip() {
+			continue
+		}
+		for _, reason := range p.Reasons {
+			seen[reason] = struct{}{}
+		}
+	}
+	return database.SortedCodes(seen)
 }
 
 // plannedPhaseIDs returns the CANONICAL ids of the phases this scan will run, in

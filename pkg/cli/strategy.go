@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/agent/agenttypes"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
 
@@ -47,9 +48,9 @@ func agentModeCatalog() []agentModeEntry {
 }
 
 func runStrategy(_ *cobra.Command, _ []string) error {
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	cfg := &settings.ScanningStrategy

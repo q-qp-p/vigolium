@@ -71,16 +71,18 @@ const primeChunkSize = 120
 // promptly even if CDP is slow. Best-effort: an empty list is a no-op and any
 // failure is logged at debug (tagged with kind) and swallowed. This is the shared
 // tail of every in-page URL primer (iframe/form/anchor/seed/speculative).
-func (c *Crawler) fetchURLsInPage(ctx context.Context, page *browser.Page, urls []string, kind string) {
+// Returns how many URLs were actually fetched (chunks that completed).
+func (c *Crawler) fetchURLsInPage(ctx context.Context, page *browser.Page, urls []string, kind string) int {
 	if page == nil || len(urls) == 0 || ctx.Err() != nil {
-		return
+		return 0
 	}
-	// Drop destructive endpoints before priming with live credentials. Applied here
-	// — the shared tail of every in-page URL primer — so all priming paths inherit
-	// one guard instead of each script filtering its own.
-	urls = filterDestructiveURLs(urls)
+	urls, denied := c.admissibleFetchURLs(urls)
+	if denied > 0 {
+		zap.L().Debug("In-page URLs outside the operator scope not fetched",
+			zap.String("kind", kind), zap.Int("denied", denied))
+	}
 	if len(urls) == 0 {
-		return
+		return 0
 	}
 
 	fetched := 0
@@ -110,4 +112,49 @@ func (c *Crawler) fetchURLsInPage(ctx context.Context, page *browser.Page, urls 
 		zap.String("kind", kind),
 		zap.Int("requested", len(urls)),
 		zap.Int("fetched", fetched))
+	return fetched
+}
+
+// admissibleFetchURLs is the enforcement point for every in-page URL primer
+// (iframe, GET-form, anchor, seed, speculative): it returns the urls a primer
+// may deliberately request and how many were denied by scope. Applied here —
+// the shared tail — so no primer decides for itself:
+//   - destructive-looking paths are dropped (live credentials ride along);
+//   - so is anything outside the operator's crawl scope, and any host the crawl
+//     denied as a login wall. The scripts' own same-origin checks are a weaker
+//     boundary than a path-scoped operator scope.
+//
+// Scope denials are counted in Stats.AuxFetchesDenied. Without a custom scope
+// (CrawlScope nil) only wall hosts are refused, as before.
+func (c *Crawler) admissibleFetchURLs(urls []string) ([]string, int) {
+	urls = filterDestructiveURLs(urls)
+	kept := make([]string, 0, len(urls))
+	denied := 0
+	for _, raw := range urls {
+		if c.auxFetchDenied(raw) {
+			denied++
+			continue
+		}
+		kept = append(kept, raw)
+	}
+	if denied > 0 {
+		c.mu.Lock()
+		c.stats.AuxFetchesDenied += denied
+		c.mu.Unlock()
+	}
+	return kept, denied
+}
+
+// auxFetchDenied reports whether an auxiliary fetch of raw is outside the
+// operator's boundary. A URL that fails to parse is denied only under a
+// custom scope, which cannot vouch for it.
+func (c *Crawler) auxFetchDenied(raw string) bool {
+	u, err := url.Parse(raw)
+	if err == nil && c.isWallHost(u.Hostname()) {
+		return true
+	}
+	if c.config.CrawlScope == nil {
+		return false
+	}
+	return err != nil || !c.config.CrawlScope(raw)
 }

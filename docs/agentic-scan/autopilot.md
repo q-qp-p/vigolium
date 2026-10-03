@@ -127,7 +127,7 @@ the vigolium `findings` table.
 │     if no tool calls:  emit EventRunDone, return             │
 │                                                              │
 │     for each tool call:                                      │
-│       • read-only batch (read_file/ls/grep/glob/web_fetch):  │
+│       • read-only batch (read_file/ls/grep/glob):            │
 │         dispatched in parallel (max fan-out 8)               │
 │       • anything else (bash, write_file, edit_file, …):      │
 │         dispatched serially                                  │
@@ -170,7 +170,7 @@ prompt and skills, not from the tool surface itself.
 | `ls`             | `pkg/olium/tool/files.go`       | Parallelizable.                                                       |
 | `grep`           | `pkg/olium/tool/search.go`      | Parallelizable.                                                       |
 | `glob`           | `pkg/olium/tool/search.go`      | Parallelizable.                                                       |
-| `web_fetch`      | `pkg/olium/tool/web.go`         | Parallelizable.                                                       |
+| `web_fetch`      | `pkg/olium/tool/web.go`         | Side-effect (any method, browser mode, records); serial only.         |
 | `load_skill`     | `pkg/olium/skill/tool.go`       | Pulls a skill body by name (skills are indexed in the system prompt). |
 | `halt_scan`      | `pkg/olium/autopilot/halt.go`   | Autopilot-only. Sets `HaltSignal`, engine exits naturally next turn.  |
 | `report_finding` | `pkg/olium/autopilot/report_…`  | Autopilot-only. Writes a `Finding` row scoped to the AgenticScan UUID. |

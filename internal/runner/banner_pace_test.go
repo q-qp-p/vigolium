@@ -6,6 +6,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/types"
 )
@@ -75,4 +76,43 @@ func TestPhaseSpeedDetail(t *testing.T) {
 		"the factor goes once it no longer explains the number")
 	assert.Empty(t, PhaseSpeedDetail(&config.Settings{}, "spidering", 0),
 		"no budget renders no fragment, so the caller adds no separator")
+}
+
+// TestSpideringBudgetZeroDuration is the F21 regression: `spidering.max_duration:
+// 0s` passed validation and was handed to context.WithTimeout as an expired
+// deadline, so every crawl finished instantly and the phase reported nothing
+// wrong. Zero now means the default.
+func TestSpideringBudgetZeroDuration(t *testing.T) {
+	for _, tc := range []struct{ name, value string }{
+		{"zero", "0s"},
+		{"unset", ""},
+		{"unparseable", "not-a-duration"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &config.Settings{}
+			s.Spidering = *config.DefaultSpideringConfig()
+			s.Spidering.MaxDuration = tc.value
+			assert.Equal(t, 30*time.Minute, SpideringBudget(s, nil))
+		})
+	}
+
+	// A real budget is still honored, and the option still outranks it.
+	s := &config.Settings{}
+	s.Spidering = *config.DefaultSpideringConfig()
+	s.Spidering.MaxDuration = "7m"
+	assert.Equal(t, 7*time.Minute, SpideringBudget(s, nil))
+	assert.Equal(t, 5*time.Minute, SpideringBudget(s, &types.Options{SpideringMaxDuration: 5 * time.Minute}))
+}
+
+// TestDiscoveryBudget covers the precedence the banner and buildDeparosConfig
+// must agree on. The unset case used to render as "no budget" while targets ran
+// for the input source's default hour.
+func TestDiscoveryBudget(t *testing.T) {
+	assert.Equal(t, source.DefaultDiscoveryMaxDuration, DiscoveryBudget(nil, nil),
+		"nothing configured must report the source's own default, not 0")
+
+	s := settingsWithPace("1h")
+	s.ScanningPace.Discovery.MaxDuration = "12m"
+	assert.Equal(t, 12*time.Minute, DiscoveryBudget(s, nil))
+	assert.Equal(t, 3*time.Minute, DiscoveryBudget(s, &types.Options{DiscoverMaxDuration: 3 * time.Minute}))
 }

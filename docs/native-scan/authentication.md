@@ -34,6 +34,13 @@ vigolium scan https://app.com --auth-file admin --auth "compare:Cookie:sid=xyz"
 
 If no session is explicitly marked as `primary`, the first session loaded is used as the primary.
 
+With neither flag given, sessions are loaded from the project's
+`authentication_hostnames` rows for the target hostnames. A stored session that
+carries a **login flow** re-runs that login, rather than reusing the token the
+flow produced in an earlier scan — a stored token is usually expired, and a scan
+that reused it collected 401s. A stored session with only **static headers**
+sends them as-is; there is nothing to re-run.
+
 ## Session Roles
 
 Each session has a **role** that determines how it is used during the scan:
@@ -483,6 +490,24 @@ vigolium scan https://app.com \
 |-------|---------------|
 | Discovery / Spidering | Primary session only (controlled by `use_in_discovery`) |
 | DynamicAssessment | Primary session for main scanning; compare sessions for IDOR/BOLA replay (controlled by `compare_enabled`) |
+| KnownIssueScan | Primary session headers (nuclei runs its own HTTP stack and receives the headers directly) |
+
+With `use_in_discovery: false`, Discovery and Spidering run unauthenticated and
+DynamicAssessment and KnownIssueScan still authenticate — the setting keeps the
+credentials out of discovery, it does not turn authentication off. The
+assessment phases send through a view of the same requester, so they share its
+connection pool, rate limiter and carried browser sessions but keep their own
+cookie jar and response-cache partition.
+
+Compare-session requesters carry the operator's own `-H` headers plus their own
+session's credentials, never the primary session's.
+
+In the browser crawl, session cookies keep their Domain/Path and auth headers
+are sent only while the crawl stays on a host the scope admits. Each target
+reports `auth_state` (`applied` or `failed`, never "verified"); a `failed`
+target is crawled unauthenticated unless `spidering.require_auth` /
+`--require-auth` makes it fail. See
+[Browser policy](../guides/browser-policy.md#credentials-and-scope).
 
 ## Validation and Troubleshooting
 
@@ -498,6 +523,33 @@ vigolium scan https://app.com \
 Do not print response bodies while debugging production credentials. Prefer a
 dedicated test account and rotate credentials that have appeared in shell
 history, logs, or support transcripts.
+
+## Login Request Lifecycle
+
+A login request goes to the host the scan is about to attack, so it is treated
+as target traffic:
+
+- It follows `--proxy` (and `HTTP_PROXY` / `HTTPS_PROXY`), resolved exactly as
+  the scan's own requests are, with an explicit proxy URL so a `localhost`
+  target is proxied too. A proxy log therefore shows the login alongside the
+  scan it authenticated.
+- It accepts self-signed, expired and wrong-host certificates, like every other
+  request to the target.
+- It is cancellable: Ctrl-C during setup aborts the in-flight login instead of
+  waiting out its timeout.
+
+Two bounds apply. Each login request has its own 30s timeout, and **all** login
+flows together — every session, every step — share a total budget of 2 minutes.
+A flow that exceeds the total fails naming the session and step it stopped on,
+rather than letting six three-step flows spend nine silent minutes before the
+first scan request.
+
+When a login fails and the scan continues anyway (`--auth-best-effort`, or a
+session loaded from the database), DynamicAssessment prints
+`configured authentication could not be applied — assessment runs
+unauthenticated` and the phase is recorded as partial with the reason
+`auth_unavailable`, plus `login_budget`, `cancelled` or `scan_budget` naming the
+cause. See [Scan completeness](../api-references/scan.md#scan-completeness).
 
 ## Current Authentication Limitations
 

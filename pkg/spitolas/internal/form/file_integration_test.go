@@ -168,7 +168,7 @@ func TestHandlerFillInputFile(t *testing.T) {
 	}
 
 	// Fill the input using handler
-	if err := handler.FillInput(page, fileInput); err != nil {
+	if _, err := handler.FillInput(page, fileInput); err != nil {
 		t.Fatalf("FillInput() failed: %v", err)
 	}
 
@@ -246,7 +246,7 @@ func TestHandlerFillInputFileWithConfiguredPath(t *testing.T) {
 	}
 
 	// Fill the input using handler
-	if err := handler.FillInput(page, fileInput); err != nil {
+	if _, err := handler.FillInput(page, fileInput); err != nil {
 		t.Fatalf("FillInput() failed: %v", err)
 	}
 
@@ -373,8 +373,8 @@ func TestFillInputsWithFileType(t *testing.T) {
 	}
 
 	expectedSucceeded := 2
-	if result.Succeeded != expectedSucceeded {
-		t.Errorf("Expected %d succeeded inputs, got %d", expectedSucceeded, result.Succeeded)
+	if result.Succeeded() != expectedSucceeded {
+		t.Errorf("Expected %d succeeded inputs, got %d", expectedSucceeded, result.Succeeded())
 	}
 
 	time.Sleep(100 * time.Millisecond)
@@ -449,7 +449,7 @@ func TestSmartFileSelectionWithAccept(t *testing.T) {
 		Accept: "image/*",
 	}
 
-	if err := handler.FillInput(page, imageInput); err != nil {
+	if _, err := handler.FillInput(page, imageInput); err != nil {
 		t.Fatalf("FillInput(avatar) failed: %v", err)
 	}
 
@@ -494,7 +494,7 @@ func TestSmartFileSelectionWithAccept(t *testing.T) {
 		Accept: ".pdf,.doc,.docx",
 	}
 
-	if err := handler.FillInput(page, docInput); err != nil {
+	if _, err := handler.FillInput(page, docInput); err != nil {
 		t.Fatalf("FillInput(documents) failed: %v", err)
 	}
 
@@ -697,7 +697,7 @@ func TestFillHiddenFileInputViaButtonTrigger(t *testing.T) {
 	}
 
 	// Fill the hidden file input via trigger button
-	if err := handler.FillInput(page, hiddenInput); err != nil {
+	if _, err := handler.FillInput(page, hiddenInput); err != nil {
 		t.Fatalf("FillInput(hidden_upload) failed: %v", err)
 	}
 
@@ -774,7 +774,7 @@ func TestFillHiddenFileInputViaLabelTrigger(t *testing.T) {
 	}
 
 	// Fill the hidden file input via trigger label
-	if err := handler.FillInput(page, labeledInput); err != nil {
+	if _, err := handler.FillInput(page, labeledInput); err != nil {
 		t.Fatalf("FillInput(labeled_upload) failed: %v", err)
 	}
 
@@ -866,7 +866,7 @@ func TestFillHiddenFileInputAutoDetectedTrigger(t *testing.T) {
 		hiddenUpload.Hidden, hiddenUpload.TriggerXPath, hiddenUpload.Accept)
 
 	// Fill using auto-detected trigger
-	if err := handler.FillInput(page, hiddenUpload); err != nil {
+	if _, err := handler.FillInput(page, hiddenUpload); err != nil {
 		t.Fatalf("FillInput(hidden_upload) failed: %v", err)
 	}
 

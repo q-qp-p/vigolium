@@ -16,11 +16,15 @@ import (
 // =============================================================================
 
 // TestPopups tests crawling pages with JavaScript popups (alert, confirm, prompt).
-// Expected: NUMBER_OF_STATES = 3, NUMBER_OF_EDGES = 3
+// Expected: NUMBER_OF_STATES = 3, NUMBER_OF_EDGES = 5 — the alert/prompt/confirm
+// links change nothing, "load" and "leave?" each reach a content state from the
+// index, each content state re-clicks the other link (click-once is per state),
+// and one reload edge backtracks. Crawljax, whose fixture this is, counts 3: it
+// clicks an element once across all states and records no reload edges.
 func TestPopups(t *testing.T) {
 	const (
 		NUMBER_OF_STATES = 3
-		NUMBER_OF_EDGES  = 3
+		NUMBER_OF_EDGES  = 5
 	)
 
 	server := testutil.PopupSiteServer()

@@ -32,12 +32,15 @@ func TestCrawlAutoScrollTriggersLazyContent(t *testing.T) {
 			<div style="height:4000px">hero</div>
 			<div id="lazy">loading…</div>
 			<script>
+				// Assembled at runtime: a literal URL would be found by the crawler's
+				// static JS endpoint extraction and requested without any scrolling.
+				const lazyURL = ['', 'api', 'lazy-section'].join('/') + '?loaded=1';
 				const t = document.getElementById('lazy');
 				const io = new IntersectionObserver((entries) => {
 					for (const e of entries) {
 						if (e.isIntersecting) {
 							io.disconnect();
-							fetch('/api/lazy-section?loaded=1').then(r => r.text()).then(x => { t.textContent = x; });
+							fetch(lazyURL).then(r => r.text()).then(x => { t.textContent = x; });
 						}
 					}
 				});
@@ -97,10 +100,13 @@ func TestCrawlAutoScrollDisabledMissesLazyContent(t *testing.T) {
 			<div style="height:4000px">hero</div>
 			<div id="lazy">loading…</div>
 			<script>
+				// Assembled at runtime: a literal URL would be found by the crawler's
+				// static JS endpoint extraction and requested without any scrolling.
+				const lazyURL = ['', 'api', 'lazy-section'].join('/') + '?loaded=1';
 				const t = document.getElementById('lazy');
 				const io = new IntersectionObserver((entries) => {
 					for (const e of entries) {
-						if (e.isIntersecting) { io.disconnect(); fetch('/api/lazy-section?loaded=1'); }
+						if (e.isIntersecting) { io.disconnect(); fetch(lazyURL); }
 					}
 				});
 				io.observe(t);

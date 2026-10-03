@@ -169,11 +169,12 @@ func (e *Executor) moduleFindingAllowed(moduleID string) bool {
 	if cap <= 0 {
 		return true
 	}
+	counts := &e.admission().counts
 	// Load-first to avoid the eager &moduleFindingTracker{} alloc on the common
 	// (already-present) path.
-	val, ok := e.caches.moduleFindingCount.Load(moduleID)
+	val, ok := counts.Load(moduleID)
 	if !ok {
-		val, _ = e.caches.moduleFindingCount.LoadOrStore(moduleID, &moduleFindingTracker{})
+		val, _ = counts.LoadOrStore(moduleID, &moduleFindingTracker{})
 	}
 	tracker := val.(*moduleFindingTracker)
 	n := tracker.count.Add(1)
@@ -192,8 +193,9 @@ func (e *Executor) moduleFindingAllowed(moduleID string) bool {
 // root-cause identity. first is true only for the goroutine that owns an
 // admitted identity; duplicates wait until that owner's decision is visible.
 func (e *Executor) admitFinding(id, moduleID string) (first, allowed bool) {
+	ids := &e.admission().ids
 	pending := &findingAdmission{ready: make(chan struct{})}
-	actual, loaded := e.caches.emittedFindingIDs.LoadOrStore(id, pending)
+	actual, loaded := ids.LoadOrStore(id, pending)
 	admission := actual.(*findingAdmission)
 	if loaded {
 		<-admission.ready
@@ -205,7 +207,7 @@ func (e *Executor) admitFinding(id, moduleID string) (first, allowed bool) {
 	if !admission.allowed {
 		// Do not retain an unbounded set of capped identities. A later retry may
 		// make another (still rejected) cap decision, but can never race past it.
-		e.caches.emittedFindingIDs.Delete(id)
+		ids.Delete(id)
 	}
 	return true, admission.allowed
 }
@@ -445,7 +447,7 @@ func (e *Executor) fillHostFromResult(result *output.ResultEvent) {
 
 // reportPanic logs a recovered panic with its stack trace and forwards it to the
 // operator notifier. label identifies where it happened (e.g. "processItem" or
-// "module <id>"). Shared by recoverFromPanic and the per-module guard so the
+// "module <id>"). Shared by recoverFromPanicInto and the per-module guard so the
 // stack-capture/formatting/notify logic lives in exactly one place.
 func (e *Executor) reportPanic(label string, r any) {
 	stack := make([]byte, 4096)
@@ -461,9 +463,20 @@ func (e *Executor) reportPanic(label string, r any) {
 	}
 }
 
-func (e *Executor) recoverFromPanic(ctx string) {
+// recoverFromPanicInto recovers a panic, reports it, and records that it
+// happened through recovered.
+//
+// The flag is an out-parameter rather than a return value because this runs as a
+// deferred call, where a return value is discarded. Its one caller needs the
+// fact: a work item whose processing panicked must still be acknowledged, or the
+// same poison item is re-served on every later run and the durable cursor never
+// moves past it.
+func (e *Executor) recoverFromPanicInto(label string, recovered *bool) {
 	if r := recover(); r != nil {
-		e.reportPanic(ctx, r)
+		e.reportPanic(label, r)
+		if recovered != nil {
+			*recovered = true
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -70,24 +71,32 @@ func runStorageUpload(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func uploadNativeScanResults(settings *config.Settings, opts *types.Options, repo *database.Repository) {
-	doUploadNativeScanResults(settings, opts, repo)
+// uploadNativeScanResults pushes the run's artifacts to cloud storage when
+// --upload-results asked for it, and fires the configured webhook.
+//
+// The upload's failure is returned, the webhook's is not, and the split is the
+// point: --upload-results names an artifact the caller asked for, so a run that
+// did not produce it did not finish the job. A webhook is a notification about
+// work that already happened and cannot un-happen; failing the scan because a
+// listener was down would be the wrong answer. opts.UploadResults is only ever
+// set from the flag (scan_flags.go), so nothing here fires without being asked.
+func uploadNativeScanResults(settings *config.Settings, opts *types.Options, repo *database.Repository) error {
+	err := doUploadNativeScanResults(settings, opts, repo)
 	webhook.FireNativeScan(settings, repo, opts.ScanUUID)
+	return err
 }
 
-func doUploadNativeScanResults(settings *config.Settings, opts *types.Options, repo *database.Repository) {
+func doUploadNativeScanResults(settings *config.Settings, opts *types.Options, repo *database.Repository) error {
 	if !opts.UploadResults {
-		return
+		return nil
 	}
 	if !settings.Storage.IsEnabled() {
-		zap.L().Warn("--upload-results specified but storage is not enabled in config")
-		return
+		return errors.New("--upload-results was requested but storage is not enabled in config")
 	}
 
 	sc, err := storage.NewClient(&settings.Storage)
 	if err != nil {
-		zap.L().Warn("Failed to create storage client for result upload", zap.Error(err))
-		return
+		return fmt.Errorf("create storage client for result upload: %w", err)
 	}
 
 	files := make(map[string]string)
@@ -111,17 +120,19 @@ func doUploadNativeScanResults(settings *config.Settings, opts *types.Options, r
 	}
 
 	if len(files) == 0 {
+		// Not a failure: a console-only run has nothing on disk to bundle.
 		zap.L().Info("storage: no result files to upload")
-		return
+		return nil
 	}
 
 	key := storage.NativeScanResultKey(opts.ScanUUID)
 	storageURL, err := sc.BundleAndUploadFiles(context.Background(), opts.ProjectUUID, key, files)
 	if err != nil {
-		zap.L().Warn("Failed to upload scan results", zap.Error(err))
-		return
+		return fmt.Errorf("upload scan results: %w", err)
 	}
 
+	// The bytes are in storage; only the pointer to them failed to persist. The
+	// artifact exists, so this stays a warning.
 	if repo != nil {
 		if updateErr := repo.UpdateScanStorageURL(context.Background(), opts.ScanUUID, storageURL); updateErr != nil {
 			zap.L().Warn("Failed to update scan storage URL", zap.Error(updateErr))
@@ -129,6 +140,7 @@ func doUploadNativeScanResults(settings *config.Settings, opts *types.Options, r
 	}
 
 	fmt.Fprintf(os.Stderr, "  %s Results uploaded to %s\n", terminal.SuccessSymbol(), terminal.Gray(storageURL))
+	return nil
 }
 
 func uploadAgenticScanResults(settings *config.Settings, projectUUID, agenticScanUUID, sessionDir string, repo *database.Repository) {

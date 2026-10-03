@@ -120,7 +120,7 @@ func TestFormTrainerMatchInput(t *testing.T) {
 	xpathInput := &TrainedInput{XPath: "//input[@id='specific']", Value: "xpath_match"}
 	idInput := &TrainedInput{ID: "myid", Value: "id_match"}
 	nameInput := &TrainedInput{Name: "myname", Type: "text", Value: "name_match"}
-	typeInput := &TrainedInput{Type: "email", Value: "type_match"}
+	typeInput := &TrainedInput{Type: "email", Value: "type_match", FormKey: "f1"}
 
 	trainer.RecordInput(xpathInput)
 	trainer.RecordInput(idInput)
@@ -128,27 +128,85 @@ func TestFormTrainerMatchInput(t *testing.T) {
 	trainer.RecordInput(typeInput)
 
 	// Test XPath priority (highest)
-	match := trainer.MatchInput("//input[@id='specific']", "", "", "")
+	match := trainer.MatchInput("//input[@id='specific']", "", "", "", "", "")
 	if match == nil || match.Value != "xpath_match" {
 		t.Errorf("Expected xpath_match, got %v", match)
 	}
 
 	// Test ID priority
-	match = trainer.MatchInput("", "myid", "", "")
+	match = trainer.MatchInput("", "myid", "", "", "", "")
 	if match == nil || match.Value != "id_match" {
 		t.Errorf("Expected id_match, got %v", match)
 	}
 
 	// Test name priority (with type preference)
-	match = trainer.MatchInput("", "", "myname", "text")
+	match = trainer.MatchInput("", "", "myname", "text", "", "")
 	if match == nil || match.Value != "name_match" {
 		t.Errorf("Expected name_match, got %v", match)
 	}
 
-	// Test type priority (lowest)
-	match = trainer.MatchInput("", "", "", "email")
+	// Test type priority (lowest) — within the same form only.
+	match = trainer.MatchInput("", "", "", "email", "", "f1")
 	if match == nil || match.Value != "type_match" {
 		t.Errorf("Expected type_match, got %v", match)
+	}
+}
+
+// TestFormTrainerMatchInputOriginDiscipline: a trained value never crosses an
+// origin, a type-only match needs the same origin and form, and a credential
+// field is never filled by type alone.
+func TestFormTrainerMatchInputOriginDiscipline(t *testing.T) {
+	const a, b = "https://a.test", "https://b.test"
+	trainer := NewFormTrainer(FillReplay, "")
+	trainer.RecordInput(&TrainedInput{XPath: "//input[1]", Name: "q", Type: "text", Value: "a-xpath", Origin: a, FormKey: "f1"})
+	trainer.RecordInput(&TrainedInput{Type: "email", Value: "a-email", Origin: a, FormKey: "f1"})
+	trainer.RecordInput(&TrainedInput{Type: "password", Name: "pw", Value: "a-secret", Origin: a, FormKey: "f1"})
+	trainer.RecordInput(&TrainedInput{XPath: "//input[1]", Type: "text", Value: "b-xpath", Origin: b})
+
+	cases := []struct {
+		name                                       string
+		xpath, id, fieldName, typ, origin, formKey string
+		want                                       string // "" = no match
+	}{
+		{"same-origin xpath", "//input[1]", "", "", "text", a, "f1", "a-xpath"},
+		{"xpath on the other origin gets its own value", "//input[1]", "", "", "text", b, "", "b-xpath"},
+		{"name does not cross origins", "", "", "q", "text", b, "", ""},
+		{"cross-origin type-only match", "", "", "", "email", b, "f1", ""},
+		{"same origin, other form, type-only", "", "", "", "email", a, "f2", ""},
+		{"same origin, no form, type-only", "", "", "", "email", a, "", ""},
+		{"same origin and form, type-only", "", "", "", "email", a, "f1", "a-email"},
+		{"password never by type alone", "", "", "", "password", a, "f1", ""},
+		{"credential-named field never by type alone", "", "", "csrf_token", "email", a, "f1", ""},
+	}
+	for _, c := range cases {
+		got := trainer.MatchInput(c.xpath, c.id, c.fieldName, c.typ, c.origin, c.formKey)
+		switch {
+		case c.want == "" && got != nil:
+			t.Errorf("%s: matched %q, want no match", c.name, got.Value)
+		case c.want != "" && (got == nil || got.Value != c.want):
+			t.Errorf("%s: got %v, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// TestFormTrainerSaveIsOwnerOnly: the training file holds typed values,
+// credentials included, so it is written 0600 into a 0700 directory.
+func TestFormTrainerSaveIsOwnerOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "training")
+	trainer := NewFormTrainer(FillTraining, dir)
+	trainer.RecordInput(&TrainedInput{Name: "pw", Type: "password", Value: "x"})
+	if err := trainer.Save(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "form_training.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("training file mode = %o, want 600", perm)
+	}
+	if dinfo, _ := os.Stat(dir); dinfo.Mode().Perm() != 0o700 {
+		t.Errorf("training dir mode = %o, want 700", dinfo.Mode().Perm())
 	}
 }
 

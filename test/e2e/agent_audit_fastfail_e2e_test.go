@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/agent"
 	"github.com/vigolium/vigolium/pkg/agent/agenttypes"
+	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/queue"
 	"github.com/vigolium/vigolium/pkg/server"
 )
@@ -128,8 +130,10 @@ func TestAutopilot_AuditDriverFastFailsOnMissingSourcePath_E2E(t *testing.T) {
 	t.Logf("autopilot run started: run_id=%s status=%s", ack.AgenticScanUUID, ack.Status)
 
 	// 4. Poll /api/agent/status/:id until the run settles.
+	// The failure message is built after polling: Eventually's msgAndArgs are
+	// evaluated at call time, when lastStatusBody is still empty.
 	var lastStatusBody []byte
-	require.Eventually(t, func() bool {
+	settled := assert.Eventually(t, func() bool {
 		r, err := http.Get(apiURL + "/api/agent/status/" + ack.AgenticScanUUID)
 		if err != nil {
 			return false
@@ -140,9 +144,11 @@ func TestAutopilot_AuditDriverFastFailsOnMissingSourcePath_E2E(t *testing.T) {
 			Status string `json:"status"`
 		}
 		_ = json.Unmarshal(lastStatusBody, &s)
-		return s.Status == "failed" || s.Status == "completed"
-	}, 60*time.Second, 250*time.Millisecond,
-		"autopilot run never settled; last status body: %s", string(lastStatusBody))
+		return slices.Contains(database.TerminalAgenticScanStatuses, s.Status)
+	}, 60*time.Second, 250*time.Millisecond)
+	if !settled {
+		t.Fatalf("autopilot run never settled; last status body: %s", lastStatusBody)
+	}
 	t.Logf("status response:\n%s", string(lastStatusBody))
 
 	// 5. Fetch /api/agent/sessions/:id/logs (runtime.log content).

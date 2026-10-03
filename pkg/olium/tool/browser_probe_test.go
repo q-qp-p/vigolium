@@ -55,7 +55,7 @@ func TestBrowserProbeReportsDialog(t *testing.T) {
 			FinalURL: cfg.URL,
 			Title:    "Example",
 			Dialogs: []spitolas.DialogEvent{
-				{Type: "alert", Message: "vig-x-12345", URL: cfg.URL, At: time.Now()},
+				{Type: "alert", Message: "vig-x-12345", URL: cfg.URL, At: time.Now(), Answered: "accepted"},
 			},
 		}, nil
 	}
@@ -78,6 +78,14 @@ func TestBrowserProbeReportsDialog(t *testing.T) {
 	}
 	if got, _ := res.Details["dialog_fired"].(bool); !got {
 		t.Errorf("Details.dialog_fired = false, want true")
+	}
+	// How the browser answered the dialog is reported, not just that it fired.
+	dialogs, _ := res.Details["dialogs"].([]map[string]any)
+	if len(dialogs) != 1 || dialogs[0]["answered"] != "accepted" {
+		t.Errorf("Details.dialogs = %v, want one entry answered=accepted", res.Details["dialogs"])
+	}
+	if !strings.Contains(res.Content, "accepted") {
+		t.Errorf("content does not say how the dialog was answered: %s", res.Content)
 	}
 }
 
@@ -131,5 +139,53 @@ func TestBrowserProbeNavErrorNoDialogFails(t *testing.T) {
 	}
 	if !res.IsError {
 		t.Errorf("expected IsError on nav failure with no result")
+	}
+}
+
+// TestProbeToolsReportReadiness: a wait_selector that timed out reaches the
+// details and the text of both browser tools, so the model is never told the
+// page was ready when it was not.
+func TestProbeToolsReportReadiness(t *testing.T) {
+	failed := func(ctx context.Context, cfg spitolas.ProbeConfig) (*spitolas.ProbeResult, error) {
+		if cfg.WaitSelector != "#app" {
+			t.Errorf("wait_selector not passed through: %q", cfg.WaitSelector)
+		}
+		return &spitolas.ProbeResult{
+			FinalURL:        cfg.URL,
+			HTML:            "<html><body>Loading…</body></html>",
+			Readiness:       spitolas.ReadinessTimeout,
+			ReadinessFailed: true,
+			ReadinessDetail: `selector "#app" did not appear within 25s`,
+		}, nil
+	}
+	args := map[string]any{"url": "https://example.com/", "wait_selector": "#app", "mode": "browser"}
+
+	bp := &browserProbeTool{probe: failed}
+	res, err := bp.Execute(context.Background(), args, nil)
+	if err != nil || res.IsError {
+		t.Fatalf("browser_probe: err=%v result=%s", err, res.Content)
+	}
+	if res.Details["readiness"] != "timeout" || !strings.Contains(res.Content, "Readiness:  timeout") {
+		t.Errorf("browser_probe readiness not surfaced: details=%v content=%s", res.Details, res.Content)
+	}
+
+	wf := &webFetchTool{probe: failed}
+	res, err = wf.Execute(context.Background(), args, nil)
+	if err != nil || res.IsError {
+		t.Fatalf("web_fetch: err=%v result=%s", err, res.Content)
+	}
+	if res.Details["readiness"] != "timeout" || res.Details["readiness_detail"] == nil {
+		t.Errorf("web_fetch readiness details = %v", res.Details)
+	}
+	if !strings.Contains(res.Content, "Readiness: timeout") || !strings.Contains(res.Content, "may be incomplete") {
+		t.Errorf("web_fetch text does not flag the unready page: %s", res.Content)
+	}
+
+	ready := func(ctx context.Context, cfg spitolas.ProbeConfig) (*spitolas.ProbeResult, error) {
+		return &spitolas.ProbeResult{FinalURL: cfg.URL, Readiness: spitolas.ReadinessReady}, nil
+	}
+	res, _ = (&webFetchTool{probe: ready}).Execute(context.Background(), args, nil)
+	if res.Details["readiness"] != "ready" || strings.Contains(res.Content, "Readiness:") {
+		t.Errorf("ready page misreported: details=%v content=%s", res.Details, res.Content)
 	}
 }

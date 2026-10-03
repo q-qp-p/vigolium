@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/pflag"
 	"github.com/vigolium/vigolium/internal/runner"
+	"github.com/vigolium/vigolium/pkg/input/source"
 )
 
 // Flag-registration helpers shared by the scan, run, ingest, scan-url, and
@@ -22,12 +23,30 @@ func registerInputSourceFlags(flags *pflag.FlagSet) {
 	flags.StringArrayVarP(&globalTargets, "target", "t", nil, "Target URL to scan (repeatable). Commas are literal so a URL query like ?ids=1,2,3 stays one target — repeat -t for multiple targets.")
 	flags.StringArrayVarP(&globalTargetFiles, "target-file", "T", nil, "File containing target URLs (one per line; repeatable for multiple files). Commas in the path are literal.")
 	flags.StringVarP(&globalInput, "input", "i", "-", "Input file path or spec (use - for stdin)")
-	flags.StringVarP(&globalInputMode, "input-mode", "I", "urls", "Input format: urls, openapi, swagger, wsdl, burp, curl, nuclei, har (see --list-input-mode)")
-	// Enforced by readStdin (see stdin.go). It used to be registered here,
-	// assigned into Options.InputReadTimeout, and read by nothing at all, so a
-	// pipe that never closed hung the process regardless of what was passed.
-	flags.DurationVar(&globalInputReadTimeout, "input-read-timeout", defaultInputReadTimeout,
-		"Deadline for reading input from stdin or a file; 0 disables it")
+	flags.StringVarP(&globalInputMode, "input-mode", "I", "urls", inputModeFlagUsage())
+	registerInputReadTimeoutFlag(flags)
+}
+
+// inputModeFlagUsage builds the -I help text from the format registry, so a
+// format added in pkg/input/source is advertised without a second edit here.
+// The hand-written list it replaced had drifted: it offered "swagger" and
+// "burp" (aliases) beside canonical names, and omitted postman, burpraw,
+// burpscope and deparos entirely.
+func inputModeFlagUsage() string {
+	return "Input format: " + source.SupportedFormats() + " (aliases accepted, see --list-input-mode)"
+}
+
+// registerInputReadTimeoutFlag declares --input-read-timeout. One definition,
+// shared by the ingesting commands and the lightweight single-request ones:
+// scan-url and scan-request both read stdin and both lacked the dial that
+// bounds it.
+//
+// Enforced by readStdin (see stdin.go). It used to be registered, assigned into
+// Options.InputReadTimeout, and read by nothing at all, so a pipe that never
+// closed hung the process regardless of what was passed.
+func registerInputReadTimeoutFlag(flags *pflag.FlagSet) {
+	flags.DurationVar(&globalInputReadTimeout, inputReadTimeoutFlag, defaultInputReadTimeout,
+		"Deadline for reading input from stdin; 0 disables it")
 }
 
 // registerHTTPClientFlags registers the network/concurrency knobs shared by
@@ -89,12 +108,26 @@ func registerScanModuleFlags(flags *pflag.FlagSet) {
 func registerLightweightScanIOFlags(flags *pflag.FlagSet) {
 	flags.StringVarP(&scanOpts.Output, "output", "o", "", "Write findings to this file (use with --format jsonl|html; pairs with -S/--stateless)")
 	flags.BoolVarP(&globalStateless, "stateless", "S", false, "Use a temporary database that is discarded after the scan (pass --output/--format to persist results)")
+	registerKeepDBOnErrorFlag(flags)
 	flags.StringSliceVar(&globalSkipPhases, "skip", nil, "Skip these phases (repeatable: "+runner.PhaseNamesDesc(true)+"; aliases accepted, see `vigolium run --help`)")
 	flags.StringVar(&scanFailOn, "fail-on", "", "Exit non-zero if a finding at or above this severity is present (info|low|medium|high|critical) — for CI/agent gating; --soft-fail overrides.")
 	flags.BoolVar(&scanPrintFinding, "print-finding", false, "After the scan, print each finding to stdout as Markdown (description + matched evidence + request/response), like 'vigolium finding --markdown'. Pairs well with -S and --silent for a quick single-target scan.")
 	flags.BoolVar(&scanPrintTrafficTree, "print-traffic-tree", false, "After the scan, print the run's HTTP traffic to stdout as a host/path hierarchy tree, like 'vigolium traffic --tree'. Pairs well with -S and --silent.")
 	flags.BoolVar(&scanPrintTraffic, "print-traffic", false, "After the scan, print the run's raw HTTP request/response pairs to stdout, like 'vigolium traffic --raw'. Pairs well with -S and --silent.")
 	registerEventsFlag(flags)
+	// scan-url and scan-request read a request from stdin just as scan does,
+	// so they get the same deadline dial. Neither registers
+	// registerInputSourceFlags, so there is no double registration.
+	registerInputReadTimeoutFlag(flags)
+}
+
+// registerKeepDBOnErrorFlag declares --keep-db-on-error, for the same reason
+// registerEventsFlag exists: it is offered by both the full scan commands and
+// the lightweight ones, and two literal registrations are two help texts waiting
+// to diverge.
+func registerKeepDBOnErrorFlag(flags *pflag.FlagSet) {
+	flags.BoolVar(&globalKeepDBOnError, "keep-db-on-error", false,
+		"On a failed -S/--stateless scan, move the throwaway working database to ~/.vigolium/recovered instead of deleting it, so the partial results survive the failure (requires -S)")
 }
 
 // registerEventsFlag declares --events. One definition, shared by the full scan

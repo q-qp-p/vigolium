@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"net/url"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -164,21 +162,16 @@ func MergeSQLiteFileWithOptions(ctx context.Context, dest *DB, srcPath string, o
 // literal '?', while the unencoded form loses `mode=ro` outright on '?' and
 // attaches a DIFFERENT database on '#'.
 //
-// A '?' in the path is therefore unaddressable and returns an error. That is not
-// a regression: such a path already attached an empty database and reported
-// success, so a merge over it silently copied nothing.
-//
-// Relative paths are made absolute first, since a URI filename resolves against
-// the process CWD rather than the main database's directory.
+// The encoding (and the '?' refusal, and the absolute-path rule, which matters
+// because a URI filename resolves against the process CWD rather than the main
+// database's directory) now lives in sqliteFileURIPath, shared with the two DSN
+// builders in db.go. One encoder, so a path that opens cannot fail to attach.
 func attachSpec(srcPath string) (string, error) {
-	if strings.Contains(srcPath, "?") {
-		return "", fmt.Errorf("cannot attach %q: the SQLite driver cannot address a path containing '?'", srcPath)
-	}
-	abs, err := filepath.Abs(srcPath)
+	uri, err := sqliteFileURIPath(srcPath)
 	if err != nil {
-		return "", fmt.Errorf("resolve source path %q: %w", srcPath, err)
+		return "", fmt.Errorf("cannot attach: %w", err)
 	}
-	return "file:" + (&url.URL{Path: abs}).EscapedPath() + "?mode=ro", nil
+	return "file:" + uri + "?mode=ro", nil
 }
 
 // mergeOnce performs a single merge attempt. Any failure rolls back the

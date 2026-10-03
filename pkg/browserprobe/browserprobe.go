@@ -47,6 +47,10 @@ func Launchable(binPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultTimeout)
 	defer cancel()
 
+	// A liveness probe, not a crawl: it always runs unsandboxed so the answer
+	// is about the binary, not the host's sandbox support. The crawl launcher's
+	// security posture is spitolas's config.BrowserCompat (sandbox on unless the
+	// host cannot provide one), applied in browser.applySecurityFlags.
 	l := launcher.New().
 		Context(ctx).
 		Bin(binPath).

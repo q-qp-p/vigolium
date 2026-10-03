@@ -53,7 +53,7 @@ States:
 Actions:
   - Executed: %d
   - Failed: %d
-  - Forms Submitted: %d
+  - Forms Submitted: %d (prevented by policy: %d, uncertain: %d)
 
 Fragments:
   - Total: %d
@@ -67,6 +67,8 @@ Fragments:
 		r.Stats.ActionsExecuted,
 		r.Stats.ActionsFailed,
 		r.Stats.FormsSubmitted,
+		r.Stats.FormSubmitsPrevented,
+		r.Stats.FormSubmitsUncertain,
 		r.Fragments.TotalFragments,
 		r.Fragments.DynamicFragments,
 		r.Fragments.StaticFragments,

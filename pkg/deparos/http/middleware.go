@@ -2,12 +2,99 @@ package http
 
 import (
 	"context"
+	"errors"
 	"io"
 	"math"
 	nethttp "net/http"
+	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// ErrRequestFiltered is returned in place of sending a request the caller's
+// policy refuses.
+//
+// It is deliberately NOT a network error: IsRetryable reports false for it, so a
+// refused request is never retried and never reaches the engine's
+// consecutive-network-error budget. Without that exemption an excluded host would
+// look like a flapping network — *url.Error satisfies net.Error — and enough of
+// them in a row would cancel the whole discovery run.
+var ErrRequestFiltered = errors.New("request filtered by scope policy")
+
+// FilterMiddleware refuses a request before it reaches the transport.
+//
+// allow is consulted with the outgoing request's URL and must return true for the
+// request to proceed. This is the egress seam: an operator's explicit exclusion
+// has to be enforced HERE rather than by discarding the response, because by then
+// the excluded host has already been contacted — which is the whole thing the
+// exclusion was asking not to happen.
+//
+// A nil allow returns next unwrapped, so a run without a policy pays nothing.
+// Place it OUTERMOST, ahead of retry: a refused request must not be reattempted.
+func FilterMiddleware(allow func(*url.URL) bool) Middleware {
+	return func(next nethttp.RoundTripper) nethttp.RoundTripper {
+		if allow == nil {
+			return next
+		}
+		return &filterRoundTripper{next: next, allow: allow}
+	}
+}
+
+type filterRoundTripper struct {
+	next  nethttp.RoundTripper
+	allow func(*url.URL) bool
+}
+
+// CloseIdleConnections forwards the idle-close to the wrapped transport.
+// See forwardCloseIdle for why every middleware here needs this method.
+func (f *filterRoundTripper) CloseIdleConnections() { forwardCloseIdle(f.next) }
+
+func (f *filterRoundTripper) RoundTrip(req *nethttp.Request) (*nethttp.Response, error) {
+	if !f.allow(req.URL) {
+		// Returned bare rather than wrapped in RequestError: there was no attempt
+		// to attribute. net/http wraps it in a *url.Error on the way out, which
+		// keeps errors.Is working for the caller.
+		return nil, ErrRequestFiltered
+	}
+	return f.next.RoundTrip(req)
+}
+
+// CountingMiddleware increments n once per physical round trip.
+//
+// Place it INNERMOST, closest to the transport, so it counts attempts rather than
+// logical requests: a request the retry middleware sends three times counts
+// three, which is what an operator comparing a scan against a server's access log
+// sees. Deparos never follows redirects, so there is no redirect inflation to
+// account for.
+//
+// The counter belongs to the caller — the engine only ever adds to it — so a
+// phase can read the real traffic a crawl generated without the engine knowing
+// anything about who is reading. A nil counter returns next unwrapped.
+func CountingMiddleware(n *atomic.Int64) Middleware {
+	return func(next nethttp.RoundTripper) nethttp.RoundTripper {
+		if n == nil {
+			return next
+		}
+		return &countingRoundTripper{next: next, n: n}
+	}
+}
+
+type countingRoundTripper struct {
+	next nethttp.RoundTripper
+	n    *atomic.Int64
+}
+
+// CloseIdleConnections forwards the idle-close to the wrapped transport.
+func (c *countingRoundTripper) CloseIdleConnections() { forwardCloseIdle(c.next) }
+
+func (c *countingRoundTripper) RoundTrip(req *nethttp.Request) (*nethttp.Response, error) {
+	// Counted before the call, not after: a request that fails or is cancelled was
+	// still put on the wire, and a counter that only tallied successes would
+	// under-report exactly the runs an operator looks at it for.
+	c.n.Add(1)
+	return c.next.RoundTrip(req)
+}
 
 // RetryConfig configures retry behavior.
 type RetryConfig struct {

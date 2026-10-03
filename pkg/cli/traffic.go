@@ -190,6 +190,7 @@ func init() {
 	f.BoolVar(&trafficMarkdown, "markdown", false, "Render the matched records as Markdown (request/response in fenced http blocks) to stdout; response bodies are compacted to a preview by default (use --full-body for whole bodies)")
 	f.BoolVarP(&globalStateless, "stateless", "S", false, "Read from --db (a .jsonl export or standalone .sqlite) with project scoping off; never writes to your project DB")
 	f.StringVar(&globalGlobDB, "glob-db", "", "Read across a glob of result files merged into one temporary DB (e.g. --glob-db 'scans/*.sqlite'); implies -S")
+	f.BoolVar(&globalGlobStrict, "glob-strict", false, "Fail the read on the first --glob-db source that cannot be imported, instead of skipping it with a warning")
 	f.StringSliceVar(&trafficColumns, "columns", nil, "Columns to show (comma-separated, e.g. HOST,METHOD,PATH,STATUS)")
 	f.StringSliceVar(&trafficExclude, "exclude-columns", nil, "Columns to hide (comma-separated)")
 	registerAgentJSONFlags(f)
@@ -231,7 +232,7 @@ func runTraffic(cmd *cobra.Command, args []string) error {
 	}
 	// Same reason, same place: an unknown --group-by name or a conflicting output
 	// mode is knowable from the flags alone and must not cost a database open.
-	if err := validateTrafficGroupFlags(cmd.Flags().Changed); err != nil {
+	if err := validateTrafficGroupFlags(func(name string) bool { return flagOn(cmd, name) }); err != nil {
 		return err
 	}
 	// -n governs the listing page size; the import path needs to know whether the
@@ -384,7 +385,7 @@ func runTraffic(cmd *cobra.Command, args []string) error {
 			if err != nil {
 				return fmt.Errorf("import Burp traffic: %w", err)
 			}
-			writeBurpImportResult(os.Stderr, trafficBurpBridgeURL, result, false)
+			writeBurpImportResult(os.Stderr, result)
 			warnImportTruncated(result, importFilters.Limit)
 		}
 		tuiActive, tuiErr := tui.Active(trafficTUI, trafficNoTUI, globalJSON)

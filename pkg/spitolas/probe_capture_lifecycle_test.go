@@ -61,4 +61,15 @@ func TestProbeOwnsCaptureLifetime(t *testing.T) {
 		t.Error("the capture's deferred Close must be registered after the browser's " +
 			"so LIFO tears the capture down first")
 	}
+
+	// The probe's receipt must come from the writer after the capture closed —
+	// a receipt read before the drain would report records as persisted that
+	// were still queued.
+	receipt := strings.Index(body, "writer.Receipt()")
+	switch {
+	case receipt == -1:
+		t.Error("ProbeURL must report the writer's receipt in ProbeResult.Capture")
+	case receipt < captureClose:
+		t.Error("the receipt must be read after capture.Close() has drained the writer")
+	}
 }

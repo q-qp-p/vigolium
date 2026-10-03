@@ -2,6 +2,7 @@ package scope
 
 import (
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -288,4 +289,59 @@ func BenchmarkChecker_IsInScope(b *testing.B) {
 	for b.Loop() {
 		_ = checker.IsInScope(u)
 	}
+}
+
+// TestChecker_ExplicitExclude pins that an explicit exclusion is honoured in
+// EVERY mode, Any included. Returning early on Any was the defect: a scan with
+// operator exclusions and the default "any" discovery scope queued every excluded
+// link, and the exclusion only took effect after the request had been sent.
+func TestChecker_ExplicitExclude(t *testing.T) {
+	exclude := func(u *url.URL) bool { return u.Path == "/admin" || u.Hostname() == "logout.example.com" }
+
+	for _, mode := range []Mode{ModeAny, "", ModeSubdomain, ModeExact} {
+		t.Run("mode="+string(mode), func(t *testing.T) {
+			c := NewChecker(Config{TargetHost: "example.com", Mode: mode, Exclude: exclude})
+
+			admin, err := url.Parse("https://example.com/admin")
+			require.NoError(t, err)
+			assert.False(t, c.IsInScope(admin), "excluded path must be out of scope in mode %q", mode)
+
+			byHost, err := url.Parse("https://logout.example.com/")
+			require.NoError(t, err)
+			assert.False(t, c.IsInScope(byHost), "excluded host must be out of scope in mode %q", mode)
+
+			ok, err := url.Parse("https://example.com/public")
+			require.NoError(t, err)
+			assert.True(t, c.IsInScope(ok), "a non-excluded in-scope URL must stay in scope in mode %q", mode)
+		})
+	}
+}
+
+func TestChecker_NilExcludeChangesNothing(t *testing.T) {
+	c := NewChecker(Config{TargetHost: "example.com", Mode: ModeExact})
+	u, err := url.Parse("https://example.com/admin")
+	require.NoError(t, err)
+	assert.True(t, c.IsInScope(u))
+}
+
+// TestChecker_ExcludeOutranksMode proves the exclude check runs BEFORE the host
+// check as well as before the mode shortcut: an excluded URL is out of scope
+// whatever the rest of the configuration would have said.
+func TestChecker_ExcludeOutranksMode(t *testing.T) {
+	c := NewChecker(Config{
+		TargetHost: "example.com",
+		Mode:       ModeSubdomain,
+		Exclude:    func(u *url.URL) bool { return strings.HasPrefix(u.Path, "/billing") },
+	})
+	for _, raw := range []string{
+		"https://example.com/billing",
+		"https://api.example.com/billing/invoices",
+	} {
+		u, err := url.Parse(raw)
+		require.NoError(t, err)
+		assert.False(t, c.IsInScope(u), raw)
+	}
+	u, err := url.Parse("https://api.example.com/orders")
+	require.NoError(t, err)
+	assert.True(t, c.IsInScope(u))
 }

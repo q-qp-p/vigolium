@@ -164,6 +164,9 @@ func (c *Crawler) seedFrontier(ctx context.Context, page *browser.Page) {
 		return
 	}
 
+	// Early pruning only — fetchURLsInPage (admissibleFetchURLs) is the
+	// enforcement point. Filtering here keeps SeedURLsDiscovered and the browse
+	// selection to in-scope locations.
 	inScope := c.filterInScope(discovered)
 	if len(inScope) == 0 {
 		return

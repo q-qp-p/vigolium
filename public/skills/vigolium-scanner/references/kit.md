@@ -17,6 +17,7 @@ files/stdin, honours `-j/--json` for machine output, and gates via exit codes.
 - [jwt-crack](#jwt-crack)
 - [wordlist](#wordlist)
 - [payload](#payload)
+- [tmp-clean](#tmp-clean)
 - [Gotchas](#gotchas)
 
 ---
@@ -216,6 +217,31 @@ vigolium kit payload --class sqli,xss -j # two classes, as JSON
 Classes: `cmdi`, `crlf`, `lfi`, `open_redirect`, `path_traversal`, `sqli`,
 `ssrf`, `ssti`, `xss`, `xxe` (aliases like `sql`→`sqli`, `traversal`→
 `path_traversal`). JSON: `{classes, count, payloads}`.
+
+---
+
+## tmp-clean
+
+Remove scratch vigolium left in the system temp directory. Every scan allocates
+its scratch under one root and removes it on exit, so a run that finishes — or
+is interrupted — cleans up after itself; this is for what a hard kill left
+behind.
+
+```bash
+vigolium kit tmp-clean                  # anything untouched for 6h+
+vigolium kit tmp-clean --max-age 1h     # narrower window
+vigolium kit tmp-clean --max-age 0      # everything not held by a running scan
+vigolium kit tmp-clean -j               # machine-readable receipt
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--max-age` | duration | `6h` | Only remove scratch untouched for at least this long (`0` removes everything not held by a running scan) |
+
+A directory held by a **live** scan is never collected, whatever `--max-age`
+says: on Unix the sweeper asks the kernel through a flocked `.lease` file rather
+than guessing from mtime (elsewhere it falls back to a pid check, then age), so
+a long-running scan is safe even at `--max-age 0`.
 
 ---
 

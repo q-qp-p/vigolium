@@ -11,6 +11,7 @@ import (
 	"github.com/grafana/sobek"
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/core/network"
 	hostlimit "github.com/vigolium/vigolium/pkg/core/ratelimit"
 	"github.com/vigolium/vigolium/pkg/core/services"
@@ -57,9 +58,9 @@ func runJsCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Load settings
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// Build the API surface (DB, scope, HTTP stack) shared with

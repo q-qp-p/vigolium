@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,9 +11,9 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/uptrace/bun"
 
-	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/agent"
 	"github.com/vigolium/vigolium/pkg/burpbridge"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/dbimport"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -236,7 +235,10 @@ func runImport(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("import Burp traffic: %w", err)
 		}
-		writeBurpImportResult(os.Stdout, bridgeURL, result, globalJSON)
+		if globalJSON {
+			return writeAgentJSONToStdout(burpImportResultJSON(bridgeURL, result))
+		}
+		writeBurpImportResult(os.Stdout, result)
 		return nil
 	}
 
@@ -279,9 +281,19 @@ func runImport(cmd *cobra.Command, args []string) error {
 		if globDB != "" {
 			label = globDB
 		}
-		printImportResult(label, aggregateImportResults(results))
+	}
+	summary := results[0]
+	if multi {
+		summary = aggregateImportResults(results)
+	}
+	// Human output prints now, because the per-stage lines are the progress
+	// report. The -j document is held until every requested artifact has landed:
+	// see importResultJSON.
+	var jsonOut map[string]any
+	if globalJSON {
+		jsonOut = importResultJSON(label, summary)
 	} else {
-		printImportResult(label, results[0])
+		printImportResult(label, summary)
 	}
 
 	if reportFormat != "" {
@@ -308,12 +320,24 @@ func runImport(cmd *cobra.Command, args []string) error {
 		if !multi {
 			reportScan = results[0].AgenticScan
 		}
-		if err := emitImportReport(ctx, db, reportScan, reportFormat, reportOutput, opts); err != nil {
-			return fmt.Errorf("import succeeded but report generation failed: %w", err)
+		reportPath, err := emitImportReport(ctx, db, reportScan, reportFormat, reportOutput, opts)
+		if err != nil {
+			// errCodeExportFailed, not the inferred code: the import landed and the
+			// findings are queryable; what failed is the artifact that was asked
+			// for, and a driver's correct response is to retry the report rather
+			// than the import. Left to inference, a missing parent directory wraps
+			// os.ErrNotExist and reports source_missing — which names the import
+			// source that was read successfully a moment earlier.
+			return codedErrorf(errCodeExportFailed,
+				"import succeeded but report generation failed: %w", err)
+		}
+		if jsonOut != nil {
+			jsonOut["report_path"] = reportPath
 		}
 	}
 
 	if upload {
+		var uploaded []string
 		for _, src := range sources {
 			// A gs:// source is already in cloud storage — nothing to push up.
 			if strings.HasPrefix(src, "gs://") {
@@ -322,12 +346,59 @@ func runImport(cmd *cobra.Command, args []string) error {
 			}
 			url, err := uploadImportSource(ctx, src, uploadKey)
 			if err != nil {
-				return fmt.Errorf("import succeeded but upload failed: %w", err)
+				// Same reasoning as the report above: the requested artifact is what
+				// failed, not the import.
+				return codedErrorf(errCodeExportFailed,
+					"import succeeded but upload failed: %w", err)
 			}
-			fmt.Printf("%s Source uploaded to %s\n", terminal.SuccessSymbol(), terminal.Gray(url))
+			uploaded = append(uploaded, url)
+			if !globalJSON {
+				fmt.Printf("%s Source uploaded to %s\n", terminal.SuccessSymbol(), terminal.Gray(url))
+			}
+		}
+		if jsonOut != nil && len(uploaded) > 0 {
+			jsonOut["uploaded_to"] = uploaded
 		}
 	}
+	if jsonOut != nil {
+		if err := writeAgentJSONToStdout(jsonOut); err != nil {
+			return err
+		}
+	}
+	// Reported after the summary, not instead of it. Both counters below mean the
+	// same thing — data that was in the source is not in the database — so the
+	// command must not exit 0. The operator still needs the counts to know what
+	// DID land, and under -j the result document is already on stdout, so
+	// emitJSONError suppresses the error envelope and the exit code carries it
+	// (one machine document per invocation).
+	if err := importIncompleteError(summary); err != nil {
+		return err
+	}
 	return nil
+}
+
+// importIncompleteError reports a lossy import, or nil when nothing was lost.
+//
+// A line the parser could not read and a finding the database refused are the
+// same outcome from the operator's side: the source had it and the destination
+// does not. Both used to be printed as an informational count next to exit 0,
+// which is how a truncated transfer passed for a clean import.
+func importIncompleteError(r *dbimport.Result) error {
+	if r == nil {
+		return nil
+	}
+	var parts []string
+	if r.FindingsFailed > 0 {
+		parts = append(parts, fmt.Sprintf("%d findings failed to save", r.FindingsFailed))
+	}
+	if r.ParseErrors > 0 {
+		parts = append(parts, fmt.Sprintf("%d lines could not be parsed", r.ParseErrors))
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("import is incomplete: %s (everything else was stored; see the summary above)",
+		strings.Join(parts, " and "))
 }
 
 // gatherImportSources resolves the full ordered, deduplicated list of import
@@ -444,9 +515,10 @@ func aggregateImportResults(results []*dbimport.Result) *dbimport.Result {
 // source's import during a multi-source run (human output only). The detailed
 // aggregate block is printed once at the end by printImportResult.
 func printImportSourceProgress(idx, total int, src string, r *dbimport.Result) {
-	fmt.Printf("  %s [%d/%d] %s — %d records, %d findings (%d dup)\n",
+	fmt.Printf("  %s [%d/%d] %s — %d records, %d findings (%d dup%s)\n",
 		terminal.SuccessSymbol(), idx, total, terminal.Cyan(src),
-		r.RecordsImported, r.FindingsSaved, r.FindingsSkipped)
+		r.RecordsImported, r.FindingsSaved, r.FindingsSkipped,
+		importFailedSuffix(r.FindingsFailed))
 }
 
 // cliSessionDirArchiver copies an audit source folder into the per-run agent
@@ -454,9 +526,9 @@ func printImportSourceProgress(idx, total int, src string, r *dbimport.Result) {
 // Best-effort: failures are logged to stderr and result in an empty return so
 // the import still completes. Mirrors the prior in-CLI helper.
 func cliSessionDirArchiver(scanUUID, srcDir string) (string, error) {
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		settings = config.DefaultSettings()
+		return "", err
 	}
 	sessionDir, err := agent.EnsureSessionDir(settings.Agent.EffectiveSessionsDir(), scanUUID)
 	if err != nil {
@@ -475,9 +547,74 @@ func cliSessionDirArchiver(scanUUID, srcDir string) (string, error) {
 	return sessionDir, nil
 }
 
-// printImportResult renders a CLI summary for the import (JSON when -j, human
-// otherwise). The shape mirrors the pre-refactor format so existing
-// CLI consumers and tests don't break.
+// importResultJSON builds the -j document for an import, without writing it.
+//
+// Nothing is encoded here because the import is not finished when the summary is
+// known: a --format report and an --upload still have to land, and either can
+// fail. Writing the success object at this point produced a stdout carrying an
+// ok-looking result followed by the root handler's error envelope — two
+// top-level documents, which the --json contract does not allow and no single
+// json.Unmarshal reads. The caller holds the map, adds report_path/uploaded_to
+// as those artifacts succeed, and emits it once at the end.
+func importResultJSON(localPath string, r *dbimport.Result) map[string]any {
+	if r == nil {
+		return nil
+	}
+	// A SQLite-database import is a merge, not a parse — summarize the merged
+	// tables (records/findings/scans/oast) rather than the JSONL/audit shape.
+	if r.MergeStats != nil {
+		return mergeResultJSON(localPath, r.MergeStats)
+	}
+	out := map[string]any{}
+	if uuid := r.AgenticScanUUID(); uuid != "" {
+		out["agentic_scan_uuid"] = uuid
+	}
+	if r.RecordsImported > 0 {
+		out["records_imported"] = r.RecordsImported
+	}
+	if r.RecordsSkippedDuplicate > 0 {
+		out["records_skipped_duplicate"] = r.RecordsSkippedDuplicate
+	}
+	out["findings_total"] = r.FindingsTotal
+	out["findings_saved"] = r.FindingsSaved
+	out["findings_skipped"] = r.FindingsSkipped
+	// Always present, unlike the other optional counters: a consumer checking for
+	// a lossy import needs "the field is 0" rather than "the field is absent,
+	// which might mean 0 or might mean an older vigolium".
+	out["findings_failed"] = r.FindingsFailed
+	if len(r.SeverityCounts) > 0 {
+		out["severity"] = r.SeverityCounts
+	}
+	if r.ParseErrors > 0 {
+		out["parse_errors"] = r.ParseErrors
+	}
+	if r.SessionDir != "" {
+		out["session_dir"] = r.SessionDir
+	}
+	if r.StorageURL != "" {
+		out["storage_url"] = r.StorageURL
+	}
+	return out
+}
+
+// mergeResultJSON builds the -j document for a SQLite→SQLite merge import.
+func mergeResultJSON(srcPath string, s *database.MergeStats) map[string]any {
+	return map[string]any{
+		"merged_from":            srcPath,
+		"records_merged":         s.RecordsMerged,
+		"findings_merged":        s.FindingsMerged,
+		"findings_deduped":       s.FindingsDeduped,
+		"scans_merged":           s.ScansMerged,
+		"agentic_scans_merged":   s.AgenticScansMerged,
+		"projects_merged":        s.ProjectsMerged,
+		"finding_records_merged": s.FindingRecordsMerged,
+		"oast_merged":            s.OASTMerged,
+	}
+}
+
+// printImportResult renders the human CLI summary for the import. The shape
+// mirrors the pre-refactor format so existing CLI consumers and tests don't
+// break. The -j document is built by importResultJSON instead.
 func printImportResult(localPath string, r *dbimport.Result) {
 	if r == nil {
 		return
@@ -490,37 +627,11 @@ func printImportResult(localPath string, r *dbimport.Result) {
 		return
 	}
 
-	if globalJSON {
-		out := map[string]interface{}{}
-		if uuid := r.AgenticScanUUID(); uuid != "" {
-			out["agentic_scan_uuid"] = uuid
-		}
-		if r.RecordsImported > 0 {
-			out["records_imported"] = r.RecordsImported
-		}
-		out["findings_total"] = r.FindingsTotal
-		out["findings_saved"] = r.FindingsSaved
-		out["findings_skipped"] = r.FindingsSkipped
-		if len(r.SeverityCounts) > 0 {
-			out["severity"] = r.SeverityCounts
-		}
-		if r.ParseErrors > 0 {
-			out["parse_errors"] = r.ParseErrors
-		}
-		if r.SessionDir != "" {
-			out["session_dir"] = r.SessionDir
-		}
-		if r.StorageURL != "" {
-			out["storage_url"] = r.StorageURL
-		}
-		_ = json.NewEncoder(os.Stdout).Encode(out)
-		return
-	}
-
 	if r.AgenticScan != nil {
 		scan := r.AgenticScan
-		fmt.Printf("%s Imported audit: %d findings (%d new, %d duplicates skipped)\n",
-			terminal.SuccessSymbol(), r.FindingsTotal, r.FindingsSaved, r.FindingsSkipped)
+		fmt.Printf("%s Imported audit: %d findings (%d new, %d duplicates skipped%s)\n",
+			terminal.SuccessSymbol(), r.FindingsTotal, r.FindingsSaved, r.FindingsSkipped,
+			importFailedSuffix(r.FindingsFailed))
 		fmt.Printf("  Agent run: %s (mode=%s, status=%s)\n", scan.UUID, scan.Mode, scan.Status)
 		if scan.TargetURL != "" {
 			fmt.Printf("  Target:   %s\n", terminal.BoldCyan(scan.TargetURL))
@@ -530,11 +641,16 @@ func printImportResult(localPath string, r *dbimport.Result) {
 		}
 	} else {
 		fmt.Printf("%s Imported JSONL data from %s\n", terminal.SuccessSymbol(), localPath)
-		if r.RecordsImported > 0 {
-			fmt.Printf("  HTTP records: %d imported\n", r.RecordsImported)
+		if r.RecordsImported > 0 || r.RecordsSkippedDuplicate > 0 {
+			dup := ""
+			if r.RecordsSkippedDuplicate > 0 {
+				dup = fmt.Sprintf(", %d already present", r.RecordsSkippedDuplicate)
+			}
+			fmt.Printf("  HTTP records: %d imported%s\n", r.RecordsImported, dup)
 		}
 		if r.FindingsTotal > 0 {
-			fmt.Printf("  Findings: %d total (%d new, %d duplicates skipped)\n", r.FindingsTotal, r.FindingsSaved, r.FindingsSkipped)
+			fmt.Printf("  Findings: %d total (%d new, %d duplicates skipped%s)\n",
+				r.FindingsTotal, r.FindingsSaved, r.FindingsSkipped, importFailedSuffix(r.FindingsFailed))
 		}
 	}
 
@@ -560,25 +676,21 @@ func printImportResult(localPath string, r *dbimport.Result) {
 	}
 }
 
-// printMergeResult renders the summary for a SQLite-database import — a
-// lossless SQLite→SQLite merge of another vigolium result database into the
-// current one. JSON when -j, human-readable otherwise.
-func printMergeResult(srcPath string, s *database.MergeStats) {
-	if globalJSON {
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-			"merged_from":            srcPath,
-			"records_merged":         s.RecordsMerged,
-			"findings_merged":        s.FindingsMerged,
-			"findings_deduped":       s.FindingsDeduped,
-			"scans_merged":           s.ScansMerged,
-			"agentic_scans_merged":   s.AgenticScansMerged,
-			"projects_merged":        s.ProjectsMerged,
-			"finding_records_merged": s.FindingRecordsMerged,
-			"oast_merged":            s.OASTMerged,
-		})
-		return
+// importFailedSuffix renders the failed-finding clause of a summary line, empty
+// when nothing failed. Separate from the duplicate count on purpose: a duplicate
+// is already in the destination, a failure is not in it at all, and the old
+// single "skipped" number reported both as the same benign outcome.
+func importFailedSuffix(failed int) string {
+	if failed <= 0 {
+		return ""
 	}
+	return fmt.Sprintf(", %s", terminal.BoldRed(fmt.Sprintf("%d failed", failed)))
+}
 
+// printMergeResult renders the human summary for a SQLite-database import — a
+// lossless SQLite→SQLite merge of another vigolium result database into the
+// current one. The -j document is built by mergeResultJSON instead.
+func printMergeResult(srcPath string, s *database.MergeStats) {
 	fmt.Printf("%s Merged SQLite database %s\n", terminal.SuccessSymbol(), terminal.Cyan(srcPath))
 	fmt.Printf("  HTTP records: %d merged\n", s.RecordsMerged)
 	fmt.Printf("  Findings:     %d merged, %d duplicates skipped\n", s.FindingsMerged, s.FindingsDeduped)
@@ -599,15 +711,28 @@ func printMergeResult(srcPath string, s *database.MergeStats) {
 // scoped to that audit's findings; otherwise it falls back to all findings in
 // the project DB. This collapses the historical import-then-export two-step
 // into one command.
-func emitImportReport(ctx context.Context, db *database.DB, scan *database.AgenticScan, format, outputArg string, opts importReportOpts) error {
+//
+// It returns the destination the report was actually published to — the
+// absolute local path, or the normalized gs:// URI for a cloud target — so the
+// -j document can name a location the caller can open. Expanding the
+// placeholders here rather than letting the caller re-expand outputArg is not
+// cosmetic: {ts} resolves to the current second, so a second expansion names a
+// file that does not exist.
+func emitImportReport(ctx context.Context, db *database.DB, scan *database.AgenticScan, format, outputArg string, opts importReportOpts) (string, error) {
 	gen, defaultTitle, ok := reportGenerator(format)
 	if !ok {
-		return fmt.Errorf("unsupported report format %q", format)
+		return "", fmt.Errorf("unsupported report format %q", format)
 	}
 
-	localOutput, finalize, err := resolveExportOutput(ctx, outputArg)
+	dest, err := expandOutputPlaceholders(outputArg)
 	if err != nil {
-		return err
+		return "", err
+	}
+	// resolveExportOutput expands again, which is a no-op now that every
+	// placeholder is gone.
+	localOutput, finalize, err := resolveExportOutput(ctx, dest)
+	if err != nil {
+		return "", err
 	}
 
 	scanUUID := ""
@@ -632,7 +757,7 @@ func emitImportReport(ctx context.Context, db *database.DB, scan *database.Agent
 		q = q.Where("LOWER(severity) IN (?)", bun.List(sevs))
 	}
 	if err := q.Scan(ctx); err != nil {
-		return fmt.Errorf("query findings for report: %w", err)
+		return "", fmt.Errorf("query findings for report: %w", err)
 	}
 	items := make([]any, 0, len(findings))
 	for _, f := range findings {
@@ -676,17 +801,27 @@ func emitImportReport(ctx context.Context, db *database.DB, scan *database.Agent
 			terminal.BoldCyan(fmt.Sprintf("Generating %s report%s — %d findings ...", format, detail, len(findings))))
 	}
 	if err := gen(items, localOutput, meta); err != nil {
-		return err
+		return "", err
 	}
 	if err := finalize(); err != nil {
-		return err
+		return "", err
 	}
 
+	published := dest
+	if storage.IsGCSURI(published) {
+		published = storage.NormalizeGCSURI(published)
+	} else {
+		published = absOrRaw(published)
+	}
 	scope := "all findings in project"
 	if scanUUID != "" {
 		scope = "imported audit " + scanUUID
 	}
-	fmt.Printf("%s Report written: %s (%d findings, %s, format=%s)\n",
-		terminal.SuccessSymbol(), terminal.Cyan(outputArg), len(findings), scope, format)
-	return nil
+	// Human mode only: under -j this line is the `report_path` key of the single
+	// result document, which the caller emits after every artifact has landed.
+	if !globalJSON {
+		fmt.Printf("%s Report written: %s (%d findings, %s, format=%s)\n",
+			terminal.SuccessSymbol(), terminal.Cyan(dest), len(findings), scope, format)
+	}
+	return published, nil
 }

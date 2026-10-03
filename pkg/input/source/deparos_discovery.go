@@ -7,12 +7,15 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vigolium/vigolium/internal/resources/wordlists"
@@ -64,10 +67,25 @@ type spideredJSProvider interface {
 
 // DeparosDiscoveryConfig configures the deparos content discovery source.
 type DeparosDiscoveryConfig struct {
-	Targets       []string      // Target URLs
-	Concurrency   int           // Worker threads (from -t flag); default: 25
-	MaxDuration   time.Duration // default: 1h
-	EnableModules []string      // Module selection for WorkItems
+	Targets     []string      // Target URLs
+	Concurrency int           // Worker threads (from -t flag); default: 25
+	MaxDuration time.Duration // default: 1h
+
+	// RateLimit caps each discovery engine's outgoing requests per second.
+	// 0 = unpaced (the historical behaviour; Concurrency is then the only
+	// throttle). Set it only from an EXPLICIT operator setting — see
+	// buildDeparosConfig in the runner — because imposing the global 100 rps
+	// default on a crawl changes the speed of every existing scan.
+	//
+	// Targets are discovered sequentially, so a per-engine bucket is the
+	// phase-wide rate.
+	RateLimit int
+
+	EnableModules []string // Module selection for WorkItems
+
+	// DrainTimeout bounds how long Close waits for the producer to finish
+	// persisting what it already collected. <=0 uses defaultDiscoveryDrainTimeout.
+	DrainTimeout time.Duration
 
 	// Full deparos settings (from YAML config)
 	Mode             string // "files_and_dirs" | "files_only" | "dirs_only"
@@ -144,6 +162,16 @@ type DeparosDiscoveryConfig struct {
 	// 0.5%). 0 = use default (defaultDedupClusterCap); negative = disabled;
 	// positive = that cap. Resolved via resolveClusterCap.
 	DedupClusterCap int
+
+	// RequestFilter is the egress policy for every request the discovery engine
+	// makes: returning false refuses the request before it is sent, instead of
+	// discarding its response afterwards. The engine also derives its spider-queue
+	// exclusion from it, so a refused URL is never even queued.
+	//
+	// It carries the operator's EXPLICIT denials only (scope.host.exclude /
+	// scope.path.exclude); how wide the crawl goes is still ScopeMode's job.
+	// nil = no denials.
+	RequestFilter func(*url.URL) bool
 
 	// DB import: if set, results are saved to vigolium's http_records table
 	Repository  RecordSaver
@@ -262,7 +290,30 @@ type DiscoveryStats struct {
 	AllCodes           [5]int // index 0=1xx, 1=2xx, 2=3xx, 3=4xx, 4=5xx
 	DedupedCodes       [5]int // status codes of hard-dedup removed records
 	CappedCodes        [5]int // status codes of cluster-capped removed records
+
+	// Coverage accounting. Discovery used to log per-target failures and move on,
+	// so a run where every target errored was indistinguishable from a run that
+	// found nothing. These make the difference reportable.
+
+	// TargetsFailed is the number of targets whose discovery returned an error.
+	TargetsFailed int
+	// TargetsTimedOut counts targets that exhausted their own MaxDuration. This
+	// is designed behavior (per-target time-boxing), not a failure.
+	TargetsTimedOut int
+	// TargetsSkipped is the number of targets never attempted because the phase
+	// was cancelled first.
+	TargetsSkipped int
+	// ImportFailed counts records that were collected but could not be persisted.
+	ImportFailed int
+	// TargetErrors holds up to maxReportedTargetErrors "<target>: <err>" strings.
+	TargetErrors []string
+	// Abandoned is set when Close gave up waiting for the producer to exit.
+	Abandoned bool
 }
+
+// maxReportedTargetErrors bounds TargetErrors so a sweep of thousands of hosts
+// cannot turn a stats struct into a log dump. The count stays exact.
+const maxReportedTargetErrors = 10
 
 // statusCodeBucket returns the bucket index (0-4) for a status code.
 func statusCodeBucket(code int) int {
@@ -417,39 +468,119 @@ func withinDedupTolerance(a, b int64) bool {
 type DeparosDiscoverySource struct {
 	cfg DeparosDiscoveryConfig
 
-	mu      sync.Mutex
-	items   chan *work.WorkItem
-	done    chan struct{}
-	cancel  context.CancelFunc
-	started bool
-	closed  bool
-	runErr  error
-	stats   DiscoveryStats
+	// baseCtx is the caller's lifetime. runDiscovery derives its working context
+	// from it, so cancelling the phase stops the engine immediately instead of
+	// letting the running target burn its full MaxDuration.
+	baseCtx context.Context
+
+	// finished closes when runDiscovery returns, so Close can join the producer
+	// instead of abandoning it to a detached drain goroutine.
+	finished chan struct{}
+
+	// abort is the second, harder stop. done means "stop emitting"; abort means
+	// "stop everything, including reading the local sitemap we already paid for".
+	// Keeping them separate is what lets a cancelled phase still persist the
+	// records it collected.
+	abort     chan struct{}
+	abortOnce sync.Once
+
+	mu             sync.Mutex
+	items          chan *work.WorkItem
+	done           chan struct{}
+	cancel         context.CancelFunc
+	started        bool
+	closed         bool
+	runErr         error
+	runErrReported bool
+	stats          DiscoveryStats
+
+	// discoverFn overrides discoverTarget in tests. nil means the real thing.
+	discoverFn func(ctx context.Context, target string) error
+
+	// abortGrace is how long Close waits after escalating to abort, and again
+	// before declaring the producer abandoned. Set in the constructor; a field
+	// rather than a constant only so the abandonment path is testable without a
+	// ten-second test.
+	abortGrace time.Duration
+
+	// requestsSent counts every physical HTTP attempt the discovery engines make.
+	// Handed to each per-target engine as its RequestCounter, so it accumulates
+	// across the whole target list and is readable while a crawl is running —
+	// which is what the phase's progress heartbeat needs. Outside the mutex on
+	// purpose: it is written from engine worker goroutines on the request hot path.
+	requestsSent atomic.Int64
+}
+
+// RequestsSent reports how many HTTP attempts the discovery engines have made so
+// far, retries included. Safe to call at any point in the source's life, from any
+// goroutine.
+//
+// It exists because deparos owns its own HTTP client: the runner's phase tracker
+// reads a delta on the SHARED requester, which a discovery phase barely touches,
+// so phase.started/progress/finished reported ≈0 requests for a crawl that had
+// sent tens of thousands.
+func (d *DeparosDiscoverySource) RequestsSent() int64 {
+	if d == nil {
+		return 0
+	}
+	return d.requestsSent.Load()
 }
 
 // Stats returns the discovery statistics (safe to call after the source is exhausted).
 func (d *DeparosDiscoverySource) Stats() DiscoveryStats {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.stats
+	out := d.stats
+	out.TargetErrors = slices.Clone(d.stats.TargetErrors)
+	return out
 }
 
-// NewDeparosDiscoverySource creates a new DeparosDiscoverySource.
-func NewDeparosDiscoverySource(cfg DeparosDiscoveryConfig) (*DeparosDiscoverySource, error) {
+// DefaultDiscoveryMaxDuration is the per-target wall-clock budget a discovery
+// target gets when nothing configures one. Exported because the runner's banner
+// and buildDeparosConfig have to report the same number this source will use;
+// when the literal lived only here, the banner printed 0 while targets ran for an
+// hour.
+const DefaultDiscoveryMaxDuration = 1 * time.Hour
+
+// defaultDiscoveryDrainTimeout bounds how long Close waits for the producer to
+// persist what it already collected before the phase gives up on it. Not exposed
+// as configuration: there is no measurement yet that would tell an operator what
+// to set it to.
+const defaultDiscoveryDrainTimeout = 30 * time.Second
+
+// defaultDiscoveryAbortGrace is how long Close waits after escalating from done
+// ("stop emitting") to abort ("stop reading the sitemap too"), and again before
+// it declares the producer abandoned.
+const defaultDiscoveryAbortGrace = 5 * time.Second
+
+// NewDeparosDiscoverySource creates a new DeparosDiscoverySource owned by ctx.
+// Cancelling ctx stops the running engine and skips the remaining targets; a nil
+// ctx means the source outlives every caller, which is only ever right in a test.
+func NewDeparosDiscoverySource(ctx context.Context, cfg DeparosDiscoveryConfig) (*DeparosDiscoverySource, error) {
 	if len(cfg.Targets) == 0 {
 		return nil, fmt.Errorf("at least one target is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = types.DefaultConcurrency
 	}
 	if cfg.MaxDuration <= 0 {
-		cfg.MaxDuration = 1 * time.Hour
+		cfg.MaxDuration = DefaultDiscoveryMaxDuration
+	}
+	if cfg.DrainTimeout <= 0 {
+		cfg.DrainTimeout = defaultDiscoveryDrainTimeout
 	}
 
 	return &DeparosDiscoverySource{
-		cfg:   cfg,
-		items: make(chan *work.WorkItem, 100),
-		done:  make(chan struct{}),
+		cfg:        cfg,
+		baseCtx:    ctx,
+		items:      make(chan *work.WorkItem, 100),
+		done:       make(chan struct{}),
+		finished:   make(chan struct{}),
+		abort:      make(chan struct{}),
+		abortGrace: defaultDiscoveryAbortGrace,
 	}, nil
 }
 
@@ -463,7 +594,13 @@ func (d *DeparosDiscoverySource) Next(ctx context.Context) (*work.WorkItem, erro
 	}
 	if !d.started {
 		d.started = true
-		go d.runDiscovery()
+		// The working context is derived and published HERE, under the same lock
+		// that sets started: if runDiscovery assigned d.cancel itself, a Close
+		// arriving first would read nil and leave the engine running on an
+		// uncancelled context, which is exactly the hang this is meant to end.
+		workCtx, cancel := context.WithCancel(d.baseCtx)
+		d.cancel = cancel
+		go d.runDiscovery(workCtx, cancel)
 	}
 	d.mu.Unlock()
 
@@ -474,7 +611,16 @@ func (d *DeparosDiscoverySource) Next(ctx context.Context) (*work.WorkItem, erro
 		if !ok {
 			d.mu.Lock()
 			err := d.runErr
+			if err != nil && !d.runErrReported {
+				d.runErrReported = true
+			} else {
+				err = nil
+			}
 			d.mu.Unlock()
+			// Report the run error exactly once, then EOF forever after. Both
+			// consumers (Executor.feedItems and ConcurrentMultiSource.readSource)
+			// treat a non-EOF error as "retry", so a sticky error here is an
+			// infinite loop rather than a failure report.
 			if err != nil {
 				return nil, err
 			}
@@ -485,27 +631,87 @@ func (d *DeparosDiscoverySource) Next(ctx context.Context) (*work.WorkItem, erro
 }
 
 // runDiscovery runs deparos for each target and pushes results to the channel.
-func (d *DeparosDiscoverySource) runDiscovery() {
+//
+// parentCtx is the working context Next derived from baseCtx, so cancelling the
+// phase stops the running engine rather than letting it finish the target's full
+// MaxDuration first. runDiscovery owns releasing it. It records what it did and
+// did not get to, because a run where every target failed used to be
+// indistinguishable from a run that legitimately found nothing.
+func (d *DeparosDiscoverySource) runDiscovery(parentCtx context.Context, cancel context.CancelFunc) {
+	// Registered first so it runs last: a waiter on finished must not wake until
+	// items is closed and the working context is released.
+	defer close(d.finished)
 	defer close(d.items)
-
-	parentCtx, cancel := context.WithCancel(context.Background())
-	d.mu.Lock()
-	d.cancel = cancel
-	d.mu.Unlock()
-
 	defer cancel()
 
-	for _, target := range d.cfg.Targets {
-		select {
-		case <-d.done:
-			return
-		default:
+	discover := d.discoverFn
+	if discover == nil {
+		discover = d.discoverTarget
+	}
+
+	var (
+		firstErr error
+		failed   int
+	)
+	for i, target := range d.cfg.Targets {
+		stop := parentCtx.Err() != nil
+		if !stop {
+			select {
+			case <-d.done:
+				stop = true
+			default:
+			}
+		}
+		if stop {
+			d.noteSkipped(len(d.cfg.Targets) - i)
+			break
 		}
 
-		if err := d.discoverTarget(parentCtx, target); err != nil {
-			zap.L().Warn("deparos discovery failed for target",
-				zap.String("target", target), zap.Error(err))
+		err := discover(parentCtx, target)
+		if err == nil {
+			continue
 		}
+		// A cancelled parent means we stopped it, not that the target failed. This
+		// target WAS attempted, so only the ones after it count as skipped.
+		if parentCtx.Err() != nil {
+			d.noteSkipped(len(d.cfg.Targets) - i - 1)
+			break
+		}
+		failed++
+		if firstErr == nil {
+			firstErr = err
+		}
+		d.noteTargetError(target, err)
+		zap.L().Warn("deparos discovery failed for target",
+			zap.String("target", target), zap.Error(err))
+	}
+
+	// Every target failing is a phase failure, not an empty result set. Anything
+	// less is partial coverage, which the stats already describe.
+	if failed > 0 && failed == len(d.cfg.Targets) {
+		d.mu.Lock()
+		d.runErr = fmt.Errorf("deparos discovery failed for all %d target(s): %w", failed, firstErr)
+		d.mu.Unlock()
+	}
+}
+
+// noteSkipped records targets the phase never attempted.
+func (d *DeparosDiscoverySource) noteSkipped(n int) {
+	if n <= 0 {
+		return
+	}
+	d.mu.Lock()
+	d.stats.TargetsSkipped += n
+	d.mu.Unlock()
+}
+
+// noteTargetError counts a per-target failure and keeps the first few messages.
+func (d *DeparosDiscoverySource) noteTargetError(target string, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stats.TargetsFailed++
+	if len(d.stats.TargetErrors) < maxReportedTargetErrors {
+		d.stats.TargetErrors = append(d.stats.TargetErrors, fmt.Sprintf("%s: %v", target, err))
 	}
 }
 
@@ -527,8 +733,16 @@ func (d *DeparosDiscoverySource) buildDiscoveryHeaders(target string) map[string
 	// scanner requester, which merges carried cookies into a request's own
 	// dynamic Cookie header (see http.applyCarriedSession).
 	if sess, ok := d.sessionForTarget(target); ok {
-		if sess.CookieHeader != "" && !hasHeaderCI(headers, "Cookie") {
-			headers["Cookie"] = sess.CookieHeader
+		// Evaluated for the target's ORIGIN, not blindly flattened: the engine
+		// takes one static header for the whole crawl, so there is no request
+		// path to match — but the scheme is known, and a Secure cookie must not
+		// be handed to an http crawl of the same host. Path is therefore ignored
+		// and the broadest copy of a duplicated name wins
+		// (CookieHeaderForOrigin). A harvest with no recorded attributes falls
+		// back to the flat header, as before.
+		scheme, host := targetSchemeHost(target)
+		if cookieHeader := sess.CookieHeaderForOrigin(scheme, host, time.Now()); cookieHeader != "" && !hasHeaderCI(headers, "Cookie") {
+			headers["Cookie"] = cookieHeader
 		}
 		if sess.UserAgent != "" && !hasHeaderCI(headers, "User-Agent") {
 			headers["User-Agent"] = sess.UserAgent
@@ -555,6 +769,17 @@ func (d *DeparosDiscoverySource) sessionForTarget(target string) (httpmsg.Carrie
 	return sess, ok
 }
 
+// targetSchemeHost splits a discovery target URL into its scheme and
+// port-stripped host for cookie evaluation. An unparseable target yields empty
+// strings, which match no cookie — the same outcome as an unknown host.
+func targetSchemeHost(target string) (scheme, host string) {
+	u, err := url.Parse(strings.TrimSpace(target))
+	if err != nil || u.Host == "" {
+		return "", ""
+	}
+	return u.Scheme, u.Hostname()
+}
+
 // hasHeaderCI reports whether m already contains name under any case.
 func hasHeaderCI(m map[string]string, name string) bool {
 	for k := range m {
@@ -569,6 +794,9 @@ func (d *DeparosDiscoverySource) buildDeparosConfig(target string) *deparosconfi
 	cfg := deparosconfig.NewDefaultConfig()
 	cfg.Target.StartURL = target
 	cfg.Engine.DiscoveryThreads = d.cfg.Concurrency
+	// Passed straight through, including 0: the engine reads 0 as "unpaced", and
+	// turning it into a default here would throttle every scan that never asked.
+	cfg.Engine.RequestsPerSecond = d.cfg.RateLimit
 
 	// Discovery mode
 	switch d.cfg.Mode {
@@ -661,6 +889,11 @@ func (d *DeparosDiscoverySource) buildDeparosConfig(target string) *deparosconfi
 	}
 	cfg.Engine.MaxConsecutiveErrors = d.cfg.MaxConsecutiveErrors
 	cfg.Engine.MaxConsecutiveWAFBlocks = d.cfg.MaxConsecutiveWAFBlocks
+	// Egress policy and the attempt counter. The counter is the SOURCE's, shared by
+	// every per-target engine, so RequestsSent reports the phase's whole crawl
+	// rather than whichever target happens to be running.
+	cfg.Engine.RequestFilter = d.cfg.RequestFilter
+	cfg.Engine.RequestCounter = &d.requestsSent
 	if d.cfg.ObservedMaxItems > 0 {
 		cfg.Engine.ObservedMaxItems = d.cfg.ObservedMaxItems
 	}
@@ -735,6 +968,8 @@ func (d *DeparosDiscoverySource) discoverTarget(parentCtx context.Context, targe
 	// Build deparos config from all settings
 	cfg := d.buildDeparosConfig(target)
 
+	var localStats DiscoveryStats
+
 	// Create ephemeral SQLite storage
 	storageCfg := deparosstorage.DefaultConfig()
 	storageCfg.SaveResponseBody = d.cfg.SaveResponseBody
@@ -781,16 +1016,21 @@ func (d *DeparosDiscoverySource) discoverTarget(parentCtx context.Context, targe
 	engine.FlushSecretFindings()
 	engine.Stop()
 
+	if targetExhaustedBudget(ctx, parentCtx) {
+		localStats.TargetsTimedOut++
+	}
+
 	// Collect all results into memory for in-memory hard dedup
 	var allRecords []collectedRecord
 	dedupMap := make(map[hardDedupKey]int) // key → index in allRecords
 
-	var localStats DiscoveryStats
-
 	err = siteMap.StreamAllResults(func(node *deparosstorage.DiscoveredNode) error {
+		// abort, not done: this reads the local temp SQLite file the requests
+		// already paid for. The consumer going away is no reason to throw it out —
+		// those records can still be persisted.
 		select {
-		case <-d.done:
-			return fmt.Errorf("source closed")
+		case <-d.abort:
+			return fmt.Errorf("source aborted")
 		default:
 		}
 
@@ -964,25 +1204,14 @@ func (d *DeparosDiscoverySource) discoverTarget(parentCtx context.Context, targe
 			len(referenced), terminal.Gray(target)))
 	}
 
-	localStats.Imported = len(crawled) + len(specEndpoints)
-	if localStats.Imported > 0 {
-		zap.L().Info("Deparos discovery results imported to DB",
-			zap.String("target", target),
-			zap.Int("discovered", localStats.TotalDiscovered),
-			zap.Int("hard_dedup_removed", localStats.HardDedupRemoved),
-			zap.Int("fuzzy_capped_removed", localStats.FuzzyCappedRemoved),
-			zap.Int("cluster_cap", localStats.ClusterCap),
-			zap.Int("referenced_preserved", len(referenced)),
-			zap.Int("imported", localStats.Imported))
-	}
-
-	// Update stats on the source
+	// Update the discovery counters now; Imported/ImportFailed are only known once
+	// the persistence loop below has run, so they are merged separately after it.
 	d.mu.Lock()
 	d.stats.TotalDiscovered += localStats.TotalDiscovered
 	d.stats.HardDedupRemoved += localStats.HardDedupRemoved
 	d.stats.FuzzyCappedRemoved += localStats.FuzzyCappedRemoved
 	d.stats.ClusterCap = localStats.ClusterCap
-	d.stats.Imported += localStats.Imported
+	d.stats.TargetsTimedOut += localStats.TargetsTimedOut
 	for i := range d.stats.AllCodes {
 		d.stats.AllCodes[i] += localStats.AllCodes[i]
 		d.stats.DedupedCodes[i] += localStats.DedupedCodes[i]
@@ -990,31 +1219,231 @@ func (d *DeparosDiscoverySource) discoverTarget(parentCtx context.Context, targe
 	}
 	d.mu.Unlock()
 
-	// Persist + emit each provenance group under its own source label, then the
-	// spec endpoints. Spec endpoints go out as request-only stubs (no response);
-	// the executor fetches a baseline for each and backfills the stored record so
-	// the route isn't left empty. recordUUIDByURL maps every saved record's target
-	// URL to its persisted UUID across all groups, so source-map artifacts can be
-	// mapped back regardless of which label carried the asset.
-	recordUUIDByURL := make(map[string]string)
-	for _, label := range sourceOrder {
-		records := bySource[label]
-		uuids, err := d.saveAndEmitWithUUIDs(ctx, records, label)
-		if err != nil {
-			return err
-		}
-		for i, rec := range records {
-			if rec != nil && i < len(uuids) && uuids[i] != "" {
-				recordUUIDByURL[rec.Target()] = uuids[i]
-			}
-		}
-	}
-	d.persistJSTangleSourceArtifacts(ctx, siteMap, recordUUIDByURL)
-	if err := d.saveAndEmit(ctx, specEndpoints, specRecordSource); err != nil {
+	acc, err := d.importCollected(ctx, siteMap, collectedGroups{
+		sourceOrder:   sourceOrder,
+		bySource:      bySource,
+		specEndpoints: specEndpoints,
+		sizeHint:      len(crawled) + len(specEndpoints),
+	})
+	if err != nil {
 		return err
 	}
 
+	localStats.Imported = acc.imported
+	localStats.ImportFailed = acc.failed
+	d.mu.Lock()
+	d.stats.Imported += localStats.Imported
+	d.stats.ImportFailed += localStats.ImportFailed
+	d.mu.Unlock()
+
+	if localStats.Imported > 0 || localStats.ImportFailed > 0 {
+		zap.L().Info("Deparos discovery results imported to DB",
+			zap.String("target", target),
+			zap.Int("discovered", localStats.TotalDiscovered),
+			zap.Int("hard_dedup_removed", localStats.HardDedupRemoved),
+			zap.Int("fuzzy_capped_removed", localStats.FuzzyCappedRemoved),
+			zap.Int("cluster_cap", localStats.ClusterCap),
+			zap.Int("referenced_preserved", len(referenced)),
+			zap.Int("imported", localStats.Imported),
+			zap.Int("import_failed", localStats.ImportFailed))
+	}
+
 	return nil
+}
+
+// collectedGroups is one target's surviving records, partitioned the way they
+// will be persisted: grouped by source label in a stable order, plus the API-spec
+// endpoints extracted from them.
+type collectedGroups struct {
+	sourceOrder   []string
+	bySource      map[string][]*httpmsg.HttpRequestResponse
+	specEndpoints []*httpmsg.HttpRequestResponse
+	sizeHint      int
+}
+
+// importCollected is discovery's last stage: write everything one target
+// collected, on a budget that survives an expired phase.
+//
+// The records handed in were paid for with real requests — they were sent, the
+// responses came back, and all that is left is a local write. So the write runs
+// under importContext rather than under ctx: when the phase was cancelled or the
+// target burned its MaxDuration, ctx is already dead and every save on it failed,
+// after which the executor re-saved the same requests under the "scanner" label
+// and the post-discovery cleanup (scoped to source='deparos') skipped them along
+// with the JSTangle artifacts keyed to them. See importContext.
+//
+// Only a hard abort stops persisting. The consumer going away (d.done) merely
+// turns emission off inside importGroup, because the records still belong in the
+// database whether or not anything is left to scan them.
+//
+// Separated from discoverTarget so this decision can be driven with an expired
+// context directly, rather than through a race between a real crawl's progress
+// and its own deadline.
+func (d *DeparosDiscoverySource) importCollected(
+	ctx context.Context,
+	siteMap *deparosstorage.SiteMap,
+	groups collectedGroups,
+) (*importAccum, error) {
+	importCtx, releaseImport := importContext(ctx, d.cfg.DrainTimeout)
+	defer releaseImport()
+
+	// Persist + emit each provenance group under its own source label, then the
+	// spec endpoints. Spec endpoints go out as request-only stubs (no response);
+	// the executor fetches a baseline for each and backfills the stored record so
+	// the route isn't left empty. acc.uuidByURL maps every saved record's target
+	// URL to its persisted UUID across all groups, so source-map artifacts can be
+	// mapped back regardless of which label carried the asset.
+	acc := newImportAccum(groups.sizeHint)
+	for _, label := range groups.sourceOrder {
+		if err := d.importGroup(importCtx, acc, groups.bySource[label], label); err != nil {
+			return acc, err
+		}
+		select {
+		case <-d.abort:
+			acc.aborted = true
+		default:
+		}
+		if acc.aborted {
+			return acc, nil
+		}
+	}
+	// siteMap is optional: a caller with no crawl storage (and nothing to map
+	// source-map artifacts against) still persists its groups.
+	if siteMap != nil {
+		d.persistJSTangleSourceArtifacts(importCtx, siteMap, acc.uuidByURL)
+	}
+	if err := d.importGroup(importCtx, acc, groups.specEndpoints, specRecordSource); err != nil {
+		return acc, err
+	}
+	return acc, nil
+}
+
+// importAccum accumulates the result of persisting one target's record groups.
+//
+// emit starts true and latches false the moment the consumer stops reading: the
+// remaining groups are still persisted (the requests are already paid for), they
+// just never become work items. aborted means the source was told to stop
+// entirely, which is the only thing that ends the loop early.
+type importAccum struct {
+	uuidByURL map[string]string
+	imported  int
+	failed    int
+	emit      bool
+	aborted   bool
+}
+
+func newImportAccum(sizeHint int) *importAccum {
+	return &importAccum{uuidByURL: make(map[string]string, sizeHint), emit: true}
+}
+
+// importGroup persists one source-labelled group of records, emitting them as
+// work items while the consumer is still reading, and counts the outcome.
+//
+// Imported counts records that actually landed (a non-empty UUID), not records
+// handed to the saver: SaveRecordBatch returns "" for a record it could not
+// convert or store, so counting the input over-reported every failure as a
+// success. With no repository configured there is nothing to persist to, so a
+// record that reached the scan counts as imported.
+func (d *DeparosDiscoverySource) importGroup(
+	ctx context.Context,
+	acc *importAccum,
+	records []*httpmsg.HttpRequestResponse,
+	label string,
+) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	var uuids []string
+	if acc.emit {
+		var err error
+		uuids, err = d.saveAndEmitWithUUIDs(ctx, records, label)
+		switch {
+		case errors.Is(err, errEmitStopped):
+			// Saved, but the hand-off stopped. Keep persisting the rest.
+			acc.emit = false
+		case err != nil:
+			return err
+		}
+	} else {
+		uuids = d.persistOnly(ctx, records, label)
+	}
+
+	noRepository := d.cfg.Repository == nil
+	for i, rr := range records {
+		if rr == nil {
+			continue
+		}
+		uuid := ""
+		if i < len(uuids) {
+			uuid = uuids[i]
+		}
+		switch {
+		case uuid != "":
+			acc.uuidByURL[rr.Target()] = uuid
+			acc.imported++
+		case noRepository:
+			acc.imported++
+		default:
+			acc.failed++
+		}
+	}
+	return nil
+}
+
+// targetExhaustedBudget distinguishes the two ways a target's context can end. A
+// deadline on the target's OWN child context means it used up its MaxDuration,
+// which is designed behavior (per-target time-boxing) and reported as timed out. A
+// cancelled parent means the phase stopped us, which runDiscovery counts as
+// skipped instead — conflating the two would report an operator's Ctrl-C as a
+// target that ran long.
+func targetExhaustedBudget(targetCtx, parentCtx context.Context) bool {
+	return errors.Is(targetCtx.Err(), context.DeadlineExceeded) && parentCtx.Err() == nil
+}
+
+// errEmitStopped reports that the consumer stopped reading mid-emission. It is
+// not a save failure: the records were persisted, they just never became work
+// items. The caller downgrades to persist-only rather than abandoning the rest.
+var errEmitStopped = errors.New("discovery consumer stopped reading")
+
+// importContext returns the context to persist a target's collected records
+// under.
+//
+// A live parent is used as-is. A cancelled parent — the phase was stopped, or the
+// target burned its own MaxDuration — yields a detached context with its own
+// drain budget, because the records are already in hand: the requests were sent,
+// the responses were received, and the only thing left is a local write. Running
+// that write on the expired context made every save fail, after which the
+// executor re-saved the items under the "scanner" label; the cleanup passes then
+// skipped them (they filter on source='deparos') and the JSTangle artifacts
+// keyed to them were lost.
+func importContext(parent context.Context, drain time.Duration) (context.Context, context.CancelFunc) {
+	if parent.Err() == nil {
+		return parent, func() {}
+	}
+	if drain <= 0 {
+		drain = defaultDiscoveryDrainTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), drain)
+}
+
+// persistOnly batch-saves records under the given source label and returns their
+// persisted UUIDs (an empty string where the save failed). It never emits, so it
+// is safe to call after the consumer has stopped reading.
+func (d *DeparosDiscoverySource) persistOnly(ctx context.Context, records []*httpmsg.HttpRequestResponse, recordSource string) []string {
+	if len(records) == 0 {
+		return nil
+	}
+	if d.cfg.Repository == nil {
+		return make([]string, len(records))
+	}
+	saved, err := d.cfg.Repository.SaveRecordBatch(ctx, records, recordSource, d.cfg.ProjectUUID)
+	if err != nil {
+		zap.L().Warn("Failed to batch save discovery results to DB",
+			zap.String("source", recordSource), zap.Error(err))
+		return make([]string, len(records)) // emit without UUIDs
+	}
+	return saved
 }
 
 // saveAndEmit batch-saves a set of discovery records under the given source
@@ -1031,19 +1460,7 @@ func (d *DeparosDiscoverySource) saveAndEmitWithUUIDs(ctx context.Context, recor
 		return nil, nil
 	}
 
-	var uuids []string
-	if d.cfg.Repository != nil {
-		saved, err := d.cfg.Repository.SaveRecordBatch(ctx, records, recordSource, d.cfg.ProjectUUID)
-		if err != nil {
-			zap.L().Warn("Failed to batch save discovery results to DB",
-				zap.String("source", recordSource), zap.Error(err))
-			uuids = make([]string, len(records)) // emit without UUIDs
-		} else {
-			uuids = saved
-		}
-	} else {
-		uuids = make([]string, len(records))
-	}
+	uuids := d.persistOnly(ctx, records, recordSource)
 
 	for i, rr := range records {
 		item := work.NewWithModules(rr, d.cfg.EnableModules)
@@ -1053,7 +1470,9 @@ func (d *DeparosDiscoverySource) saveAndEmitWithUUIDs(ctx context.Context, recor
 
 		select {
 		case <-d.done:
-			return uuids, fmt.Errorf("source closed")
+			// The records are saved; only the hand-off stopped. Say which it was
+			// so the caller can keep persisting the remaining groups.
+			return uuids, errEmitStopped
 		case d.items <- item:
 		}
 	}
@@ -1295,27 +1714,66 @@ func extractSpecEndpoints(records []*httpmsg.HttpRequestResponse) []*httpmsg.Htt
 	return allEndpoints
 }
 
-// Close releases resources and stops discovery.
+// Close stops discovery and joins the producer.
+//
+// The producer is given DrainTimeout to finish persisting what it already
+// collected — those records cost real requests, and throwing them away on a
+// cancel was the point of this change. If it has not exited by then, abort tells
+// it to stop reading the local sitemap too, and after a further grace period the
+// source reports the goroutine as abandoned rather than blocking the phase
+// forever.
+//
+// Idempotent, and never waits while holding d.mu: the producer takes that lock to
+// record stats, so waiting under it would deadlock the thing we are waiting for.
 func (d *DeparosDiscoverySource) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
 	if d.closed {
+		d.mu.Unlock()
 		return nil
 	}
 	d.closed = true
-
-	if d.started {
+	started := d.started
+	if started {
 		close(d.done)
 		if d.cancel != nil {
 			d.cancel()
 		}
-		// Drain channel to unblock goroutine
-		go func() {
-			for range d.items {
-			}
-		}()
+	}
+	d.mu.Unlock()
+
+	if !started {
+		return nil
 	}
 
+	abortGrace := d.abortGrace
+	if abortGrace <= 0 {
+		abortGrace = defaultDiscoveryAbortGrace
+	}
+	if d.waitFinished(d.cfg.DrainTimeout + abortGrace) {
+		return nil
+	}
+
+	d.abortOnce.Do(func() { close(d.abort) })
+	if d.waitFinished(abortGrace) {
+		return nil
+	}
+
+	d.mu.Lock()
+	d.stats.Abandoned = true
+	d.mu.Unlock()
+	zap.L().Warn("deparos discovery producer did not exit; abandoning it",
+		zap.Duration("waited", d.cfg.DrainTimeout+2*abortGrace))
 	return nil
+}
+
+// waitFinished reports whether the producer exited within d.
+func (d *DeparosDiscoverySource) waitFinished(timeout time.Duration) bool {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-d.finished:
+		return true
+	case <-timer.C:
+		return false
+	}
 }

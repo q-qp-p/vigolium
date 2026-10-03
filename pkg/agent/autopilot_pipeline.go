@@ -89,6 +89,9 @@ type AutopilotPipelineConfig struct {
 
 	// BrowserEnabled indicates whether agent-browser is available for the agent.
 	BrowserEnabled bool
+	// BrowserBinaryPath is agent.browser.binary_path for the typed browser_auth
+	// adapter; empty resolves agent-browser on PATH.
+	BrowserBinaryPath string
 	// BrowserRequested preserves explicit user intent even when heuristics are weak.
 	BrowserRequested bool
 	// RequiresBrowser means auth/setup should prefer browser assistance over HTTP-only preparation.
@@ -438,6 +441,7 @@ func (r *AutopilotPipelineRunner) RunAutonomous(ctx context.Context, cfg Autopil
 		SystemPrompt:         firstNonEmpty(cfg.SystemPrompt, oliumCfg.SystemPrompt),
 		InitialPrompt:        prompt,
 		BrowserAvailable:     cfg.BrowserEnabled,
+		BrowserBinaryPath:    cfg.BrowserBinaryPath,
 		PostHaltVerify:       cfg.PostHaltVerify && postHaltProbe != nil,
 		PostHaltGapThreshold: cfg.PostHaltGapThreshold,
 		SkillNames:           cfg.SkillNames,

@@ -79,99 +79,91 @@ func FillHidden(elem *browser.Element, value string) error {
 	return nil
 }
 
-// FillCheckbox sets a checkbox to checked or unchecked state.
-// If verification fails, logs warning but continues (doesn't block form submission).
-func FillCheckbox(elem *browser.Element, checked bool) error {
+// FillCheckbox sets a checkbox to checked or unchecked state and reports
+// whether the state stuck: FillVerified when the read-back matches,
+// FillRejected when a click did not change it, FillAttempted when the state
+// could not be read back after the click.
+func FillCheckbox(elem *browser.Element, checked bool) (FillOutcome, error) {
 	if elem == nil {
-		return fmt.Errorf("element is nil")
+		return "", fmt.Errorf("element is nil")
 	}
+	return fillCheckbox(elem, checked)
+}
 
-	// Get current checked state)
-	currentChecked, err := elem.Property("checked")
+func fillCheckbox(t fillTarget, checked bool) (FillOutcome, error) {
+	currentChecked, err := t.Property("checked")
 	if err != nil {
-		return fmt.Errorf("failed to get checkbox state: %w", err)
+		return "", fmt.Errorf("failed to get checkbox state: %w", err)
+	}
+	if asBool(currentChecked) == checked {
+		return FillVerified, nil
 	}
 
-	isChecked := false
-	if b, ok := currentChecked.(bool); ok {
-		isChecked = b
+	if err := t.Click(); err != nil {
+		return "", fmt.Errorf("failed to click checkbox: %w", err)
 	}
 
-	// Click to toggle if needed
-	if isChecked != checked {
-		if err := elem.Click(); err != nil {
-			return fmt.Errorf("failed to click checkbox: %w", err)
-		}
-
-		// Verify the state actually changed - warn if not, but don't block
-		afterChecked, err := elem.Property("checked")
-		if err != nil {
-			zap.L().Warn("Failed to verify checkbox state after click",
-				zap.Error(err))
-			return nil // Continue anyway
-		}
-
-		finalState := false
-		if b, ok := afterChecked.(bool); ok {
-			finalState = b
-		}
-
-		if finalState != checked {
-			zap.L().Warn("Checkbox state did not change as expected",
-				zap.Bool("expected", checked),
-				zap.Bool("actual", finalState))
-			// Don't return error - continue with form submission
-		}
+	afterChecked, err := t.Property("checked")
+	if err != nil {
+		zap.L().Debug("Could not read checkbox state after click", zap.Error(err))
+		return FillAttempted, nil
 	}
-
-	return nil
+	if asBool(afterChecked) != checked {
+		zap.L().Debug("Checkbox state did not change", zap.Bool("expected", checked))
+		return FillRejected, nil
+	}
+	return FillVerified, nil
 }
 
 // FillRadio clicks a radio button if value indicates it should be checked.
-// Value: "1"/"true"/"checked" = click to select, "0"/"false" = do nothing
-func FillRadio(elem *browser.Element, value string) error {
+// Value: "1"/"true"/"checked" = click to select (FillVerified/FillRejected by
+// read-back), anything else = do nothing (FillSkipped).
+func FillRadio(elem *browser.Element, value string) (FillOutcome, error) {
 	if elem == nil {
-		return fmt.Errorf("element is nil")
+		return "", fmt.Errorf("element is nil")
+	}
+	return fillRadio(elem, value)
+}
+
+func fillRadio(t fillTarget, value string) (FillOutcome, error) {
+	if value != "1" && value != "true" && value != "checked" {
+		return FillSkipped, nil
 	}
 
-	shouldCheck := value == "1" || value == "true" || value == "checked"
-
-	if !shouldCheck {
-		return nil
+	// An unreadable state is treated as unchecked, so the click still happens.
+	currentChecked, _ := t.Property("checked")
+	if asBool(currentChecked) {
+		return FillVerified, nil
 	}
 
-	// Get current state)
-	currentChecked, _ := elem.Property("checked")
-	isChecked := false
-	if b, ok := currentChecked.(bool); ok {
-		isChecked = b
+	if err := t.Click(); err != nil {
+		return "", fmt.Errorf("failed to click radio: %w", err)
 	}
 
-	// Only click if not already checked
-	if !isChecked {
-		if err := elem.Click(); err != nil {
-			return fmt.Errorf("failed to click radio: %w", err)
-		}
-
-		// Verify - warn only, don't block (matches checkbox behavior)
-		afterChecked, _ := elem.Property("checked")
-		if s, ok := afterChecked.(bool); !ok || !s {
-			zap.L().Warn("Radio was clicked but not selected")
-		}
+	afterChecked, err := t.Property("checked")
+	if err != nil {
+		zap.L().Debug("Could not read radio state after click", zap.Error(err))
+		return FillAttempted, nil
 	}
-
-	return nil
+	if !asBool(afterChecked) {
+		zap.L().Debug("Radio was clicked but not selected")
+		return FillRejected, nil
+	}
+	return FillVerified, nil
 }
 
 // FillSelect selects an option in a select element.
 // Uses a multi-step matching strategy: exact value > exact text > partial match.
-// Verifies the option was actually selected after setting.
-// If verification fails, logs warning but continues (doesn't block form submission).
-func FillSelect(elem *browser.Element, value string) error {
+// The script reads the select's value back after setting it; a mismatch, or a
+// value no option matches, is FillRejected.
+func FillSelect(elem *browser.Element, value string) (FillOutcome, error) {
 	if elem == nil {
-		return fmt.Errorf("element is nil")
+		return "", fmt.Errorf("element is nil")
 	}
+	return fillSelect(elem, value)
+}
 
+func fillSelect(t fillTarget, value string) (FillOutcome, error) {
 	// Multi-step matching with progressive strategy + verification:
 	// 1. Exact value match
 	// 2. Exact text content match (case-sensitive)
@@ -231,46 +223,51 @@ func FillSelect(elem *browser.Element, value string) error {
 		return { found: false, available: available.slice(0, 10) };
 	}`, value)
 
-	result, err := elem.EvalWithResult(script)
+	result, err := t.EvalWithResult(script)
 	if err != nil {
-		return fmt.Errorf("failed to select option: %w", err)
+		return "", fmt.Errorf("failed to select option: %w", err)
 	}
+	return selectOutcome(result, value), nil
+}
 
-	if resultMap, ok := result.(map[string]interface{}); ok {
-		if found, ok := resultMap["found"].(bool); ok && found {
-			// Check if value was verified - warn if not, but continue
-			if verified, ok := resultMap["verified"].(bool); ok && !verified {
-				actual, _ := resultMap["actual"].(string)
-				selected, _ := resultMap["selected"].(string)
-				zap.L().Warn("Select option was set but verification failed",
-					zap.String("target", value),
-					zap.String("expected", selected),
-					zap.String("actual", actual))
-				// Don't return error - continue with form submission
-			}
-			return nil
-		}
-		// Option not found - log warning and continue
-		if available, ok := resultMap["available"].([]interface{}); ok && len(available) > 0 {
-			zap.L().Warn("Select option not found",
-				zap.String("target", value),
-				zap.Any("available", available))
-		}
-		return nil // Continue anyway - don't block form submission
+// selectOutcome classifies FillSelect's script result. A result of an
+// unexpected shape is FillAttempted: the write ran, its read-back is unknown.
+func selectOutcome(result interface{}, target string) FillOutcome {
+	resultMap, ok := result.(map[string]interface{})
+	if !ok {
+		zap.L().Debug("Select fill returned no verification", zap.String("target", target))
+		return FillAttempted
 	}
-
-	zap.L().Warn("Select option not found",
-		zap.String("target", value))
-	return nil
+	if found, _ := resultMap["found"].(bool); !found {
+		zap.L().Debug("Select option not found",
+			zap.String("target", target),
+			zap.Any("available", resultMap["available"]))
+		return FillRejected
+	}
+	if verified, ok := resultMap["verified"].(bool); ok && !verified {
+		actual, _ := resultMap["actual"].(string)
+		selected, _ := resultMap["selected"].(string)
+		zap.L().Debug("Select option was set but did not stick",
+			zap.String("target", target),
+			zap.String("expected", selected),
+			zap.String("actual", actual))
+		return FillRejected
+	}
+	return FillVerified
 }
 
 // FillSelectMultiple selects multiple options in a multi-select element.
 // Uses same matching strategy as FillSelect: exact value > exact text > case-insensitive > partial.
-// Verifies that all options were actually selected.
-func FillSelectMultiple(elem *browser.Element, values []string) error {
+// FillVerified only when every requested value ended up selected; otherwise
+// FillRejected.
+func FillSelectMultiple(elem *browser.Element, values []string) (FillOutcome, error) {
 	if elem == nil {
-		return fmt.Errorf("element is nil")
+		return "", fmt.Errorf("element is nil")
 	}
+	return fillSelectMultiple(elem, values)
+}
+
+func fillSelectMultiple(t fillTarget, values []string) (FillOutcome, error) {
 
 	// Convert values to JS array literal
 	jsValues := "["
@@ -340,36 +337,30 @@ func FillSelectMultiple(elem *browser.Element, values []string) error {
 		};
 	}`, jsValues)
 
-	result, err := elem.EvalWithResult(script)
+	result, err := t.EvalWithResult(script)
 	if err != nil {
-		return fmt.Errorf("failed to select multiple options: %w", err)
+		return "", fmt.Errorf("failed to select multiple options: %w", err)
 	}
+	return selectMultipleOutcome(result, len(values)), nil
+}
 
-	if resultMap, ok := result.(map[string]interface{}); ok {
-		matched := 0
-		total := len(values)
-		verified := 0
-		if m, ok := resultMap["matched"].(float64); ok {
-			matched = int(m)
-		}
-		if v, ok := resultMap["verified"].(float64); ok {
-			verified = int(v)
-		}
-		if matched < total {
-			zap.L().Warn("Multi-select: only matched some options",
-				zap.Int("matched", matched),
-				zap.Int("total", total))
-			// Don't return error - continue with form submission
-		}
-		if verified < matched {
-			zap.L().Warn("Multi-select: verification failed",
-				zap.Int("set", matched),
-				zap.Int("verified", verified))
-			// Don't return error - continue with form submission
-		}
+// selectMultipleOutcome classifies FillSelectMultiple's script result against
+// the number of requested values.
+func selectMultipleOutcome(result interface{}, total int) FillOutcome {
+	resultMap, ok := result.(map[string]interface{})
+	if !ok {
+		return FillAttempted
 	}
-
-	return nil
+	matched, _ := resultMap["matched"].(float64)
+	verified, _ := resultMap["verified"].(float64)
+	if int(matched) < total || int(verified) < total {
+		zap.L().Debug("Multi-select: not every value was selected",
+			zap.Int("total", total),
+			zap.Int("matched", int(matched)),
+			zap.Int("verified", int(verified)))
+		return FillRejected
+	}
+	return FillVerified
 }
 
 // FillDate fills a date input.

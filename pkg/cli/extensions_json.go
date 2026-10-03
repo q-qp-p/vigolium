@@ -2,6 +2,7 @@ package cli
 
 import (
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/jsext"
 	"github.com/vigolium/vigolium/pkg/yamlext"
 )
@@ -41,7 +42,7 @@ type extensionView struct {
 
 // emitExtensionsJSON writes the extension catalog.
 func emitExtensionsJSON(opts *extensionOptions, filter string) error {
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
 		return err
 	}

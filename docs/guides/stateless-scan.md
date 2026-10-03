@@ -124,13 +124,21 @@ Human-readable colored output to the terminal:
 vigolium scan-url https://example.com/search?q=test
 ```
 
-### JSONL
+### Machine output: `-j` and `--format jsonl` are different things
 
-Machine-readable, one JSON object per line. Use `-j` or `--format jsonl`:
+They are two separate contracts and are not interchangeable:
+
+- **`-j`/`--json`** prints **one indented JSON document** for the whole
+  invocation — the result object (or, for several targets, one envelope whose
+  `items` are the per-target results). This is what you parse for triage.
+- **`--format jsonl`** writes the bulk `{"type":…,"data":{…}}` export, one
+  object per line, to the `-o` path. This is the archival stream. Without `-o`
+  it goes to stdout, which is why it conflicts with `-j` and with
+  `--events` — one protocol on stdout at a time.
 
 ```bash
-vigolium scan-url -j https://example.com/search?q=test
-vigolium scan-url --format jsonl https://example.com/search?q=test
+vigolium scan-url -j https://example.com/search?q=test               # one document
+vigolium scan-url -S --format jsonl -o results https://example.com/  # results.jsonl
 ```
 
 ### HTML
@@ -231,13 +239,23 @@ vigolium scan -S --include-response \
 
 ## Examples
 
-**Quick check on a single endpoint:**
+Every example below shows `-S` where the run is meant to leave nothing behind.
+Drop it and the same command persists into the project database instead — which
+is often what you want, but it is a choice, not the default of this page.
+
+**Quick check on a single endpoint (keep the results):**
 
 ```bash
 vigolium scan-url https://example.com/api/users?id=1
 ```
 
-**Full scan with JSON output in one shot:**
+**Same check, leaving no trace:**
+
+```bash
+vigolium scan-url -S https://example.com/api/users?id=1
+```
+
+**Full scan with a bulk export in one shot:**
 
 ```bash
 vigolium scan --stateless -t https://example.com --discover --format jsonl -o findings
@@ -246,7 +264,7 @@ vigolium scan --stateless -t https://example.com --discover --format jsonl -o fi
 **Scan a curl command from clipboard:**
 
 ```bash
-pbpaste | vigolium scan-url -j
+pbpaste | vigolium scan-url -S -j
 ```
 
 **Scan an API spec and export HTML report:**

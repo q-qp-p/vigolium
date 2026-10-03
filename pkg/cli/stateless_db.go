@@ -9,6 +9,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/uptrace/bun"
 	"go.uber.org/zap"
@@ -22,13 +23,47 @@ import (
 
 // globalGlobDB is the --glob-db flag: a glob pattern of local result files
 // (.sqlite/.jsonl exports, audit folders, archives) that are merged into one
-// throwaway in-memory DB and read with project scoping off. Registered on the
+// throwaway scratch SQLite FILE and read with project scoping off. Registered on the
 // read/query commands (finding, traffic, export) and on import. Providing it
 // implies stateless-read semantics, so -S is optional alongside it.
 var globalGlobDB string
 
+// globalGlobStrict is --glob-strict: fail the read on the first --glob-db source
+// that cannot be imported, instead of skipping it. The default stays
+// best-effort, because a glob over an engagement directory routinely matches a
+// half-written file from a run still in progress and failing the whole read over
+// it would be worse than reading the rest.
+var globalGlobStrict bool
+
+// globDBSkippedFiles records the --glob-db matches that did NOT make it into the
+// merge, in match order, with the reason. Reported on stderr as it happens and in
+// the -j envelope's glob_sources at the end, so "matched 40, loaded 37" is a
+// fact a consumer can read rather than three warnings it had to scrape.
+var globDBSkippedFiles []globSkippedFile
+
+// globDBMatchedCount is how many files the pattern expanded to, before any of
+// them were tried.
+var globDBMatchedCount int
+
+// globDBParseErrors totals the JSONL lines the merge could not read across every
+// loaded source. Those files ARE in the merge (minus those lines), so they are
+// not "skipped" — but a consumer deciding whether the corpus is complete needs
+// to know, and a stderr warning is not something a -j reader sees.
+var globDBParseErrors int
+
+// globSkippedFile is one --glob-db match that was not merged, and why.
+type globSkippedFile struct {
+	File  string `json:"file"`
+	Error string `json:"error"`
+}
+
+// globImportPath is the importer each --glob-db match is routed through. A
+// package var purely as a test seam: the rollback below only matters for a
+// source that fails PARTWAY, which no real fixture produces on demand.
+var globImportPath = dbimport.ImportPath
+
 // globDBSources records what each --glob-db source file contributed to the
-// merged in-memory DB, captured in match order by openGlobDB. The findings merge
+// merged scratch DB, captured in match order by openGlobDB. The findings merge
 // assigns fresh sequential autoincrement ids per file, so a finding whose id
 // falls in a file's (findingLo, findingHi] range came from that file — which lets
 // the finding tree show one db-path root per source file so an analyst sees
@@ -67,11 +102,14 @@ func globMergeOmittedRecords() bool {
 // the zero value merges everything, so a command that passes nothing — or a new
 // one that doesn't know about this — stays correct.
 //
-// This exists because openGlobDB merges into an *in-memory* SQLite before the
-// first WHERE runs, so anything copied is paid for in RAM. Over a large glob
-// (a few hundred result files is ~10 GB, ~98% of it raw request/response blobs)
-// an unskipped merge exceeds physical memory and collapses into swap, which
-// costs minutes of kernel time rather than seconds of work.
+// This exists because openGlobDB copies every source whole before the first
+// WHERE runs, so anything merged is paid for up front. Over a large glob (a few
+// hundred result files is ~10 GB, ~98% of it raw request/response blobs) that is
+// minutes of I/O and disk for rows the command will never look at. The merge
+// target is a scratch FILE rather than an in-memory database precisely so an
+// unskipped merge cannot exceed physical memory — it was in-memory once, and a
+// corpus this size collapsed into swap — but skipping what is not read is still
+// the difference between seconds and minutes.
 //
 // Each field is only safe when nothing downstream reads what it drops, and the
 // failure mode is silent wrong output rather than an error — so build one from an
@@ -340,10 +378,102 @@ func resolveGlobRecordSources(ctx context.Context, db *database.DB, records []*d
 // maxRowID returns the current MAX(col) of a table (0 when empty), used to
 // snapshot per-file id/rowid ranges around each glob merge. col is a fixed
 // literal ("id"/"rowid"), not user input.
+//
+// A failed probe reads as 0, which is right for its caller: attribution degrades
+// to "unattributable", the pre---glob-db rendering. Anything that would DELETE
+// relative to the answer must use maxRowIDStrict instead — there, 0 means
+// "remove every row in the table".
 func maxRowID(ctx context.Context, db *database.DB, table, col string) int64 {
-	var id int64
-	_ = db.SQLDB().QueryRowContext(ctx, fmt.Sprintf("SELECT COALESCE(MAX(%s), 0) FROM %s", col, table)).Scan(&id)
+	id, _ := maxRowIDStrict(ctx, db, table, col)
 	return id
+}
+
+// maxRowIDStrict is maxRowID with the error kept.
+func maxRowIDStrict(ctx context.Context, db *database.DB, table, col string) (int64, error) {
+	var id int64
+	if err := db.SQLDB().QueryRowContext(ctx, fmt.Sprintf("SELECT COALESCE(MAX(%s), 0) FROM %s", col, table)).Scan(&id); err != nil {
+		return 0, fmt.Errorf("read MAX(%s) of %s: %w", col, table, err)
+	}
+	return id, nil
+}
+
+// globMergeMarks is the scratch database's high-water mark in every table a
+// --glob-db merge writes to, taken immediately before one source is imported.
+//
+// It exists because ImportPath is not atomic: the JSONL importer flushes records
+// in batches as it parses, and the SQLite merge commits per table, so a source
+// that fails on its last line has already written everything before it. Without a
+// mark to undo back to, `--glob-db '*.jsonl'` over a directory with one truncated
+// file answered queries from a silently half-merged corpus — and reported the
+// file as "skipped", which said the opposite.
+//
+// projects is deliberately absent: a projects row is shared metadata that a later
+// source may legitimately reference, and the rows this would remove carry no scan
+// data. Leaving them costs an unreferenced row in a throwaway database.
+type globMergeMarks struct {
+	findings     int64
+	records      int64
+	agenticScans int64
+	scans        int64
+	oast         int64
+}
+
+// globMergeMarksAt snapshots the scratch database. Any probe failure is returned
+// rather than defaulted, because a 0 here would make the rollback below delete
+// the whole table.
+func globMergeMarksAt(ctx context.Context, db *database.DB) (globMergeMarks, error) {
+	var (
+		m   globMergeMarks
+		err error
+	)
+	for _, probe := range []struct {
+		dst   *int64
+		table string
+		col   string
+	}{
+		// findings/agentic_scans/oast_interactions have an AUTOINCREMENT integer
+		// id; scans and http_records are keyed by uuid, so their insertion order
+		// is only visible through the implicit rowid.
+		{&m.findings, "findings", "id"},
+		{&m.records, "http_records", "rowid"},
+		{&m.agenticScans, "agentic_scans", "id"},
+		{&m.scans, "scans", "rowid"},
+		{&m.oast, "oast_interactions", "id"},
+	} {
+		if *probe.dst, err = maxRowIDStrict(ctx, db, probe.table, probe.col); err != nil {
+			return globMergeMarks{}, err
+		}
+	}
+	return m, nil
+}
+
+// rollbackGlobMerge removes everything inserted into the scratch database after
+// marks were taken, undoing one failed source's partial merge.
+//
+// Not a transaction: ImportPath owns its own transactions (several, in the SQLite
+// merge) and runs on the shared connection, so wrapping it in an outer one is not
+// available. These statements are, which is why the marks are per-source rather
+// than a savepoint.
+func rollbackGlobMerge(ctx context.Context, db *database.DB, marks globMergeMarks) error {
+	for _, stmt := range []struct {
+		sql  string
+		mark int64
+	}{
+		// finding_records before findings: it is keyed by finding_id, and once the
+		// findings are gone the junction rows are orphans with nothing to identify
+		// them by.
+		{"DELETE FROM finding_records WHERE finding_id > ?", marks.findings},
+		{"DELETE FROM findings WHERE id > ?", marks.findings},
+		{"DELETE FROM http_records WHERE rowid > ?", marks.records},
+		{"DELETE FROM agentic_scans WHERE id > ?", marks.agenticScans},
+		{"DELETE FROM scans WHERE rowid > ?", marks.scans},
+		{"DELETE FROM oast_interactions WHERE id > ?", marks.oast},
+	} {
+		if _, err := db.ExecContext(ctx, stmt.sql, stmt.mark); err != nil {
+			return fmt.Errorf("%s: %w", stmt.sql, err)
+		}
+	}
+	return nil
 }
 
 // statelessReadRequested reports whether a read/query command should source its
@@ -393,54 +523,142 @@ func openReadDB(skip globDBSkipSet) (*database.DB, error) {
 	return getDB()
 }
 
+// readSourcePath names the SOURCE this read is about: the thing another
+// invocation could be pointed at, which is not always the file that was opened.
+//
+// Under a stateless read the opened database is a scratch file deleted on exit,
+// so the answer is the source that was loaded into it. Otherwise it is the path
+// clicommon recorded at open — the single resolution of
+// --db → VIGOLIUM_DB_PATH → config → default, already settled by the time any
+// caller asks. Re-deriving that tail is how a label ends up naming a file
+// nothing opened.
+func readSourcePath() string {
+	if statelessReadRequested() {
+		if raw := strings.TrimSpace(globalDB); raw != "" {
+			return raw
+		}
+	}
+	return strings.TrimSpace(clicommon.OpenedDBPath())
+}
+
 // displayDBPath returns a human-readable label for the database currently being
-// read, used as the root node of the traffic/finding --tree views. It reflects
-// the resolved source in precedence order: a --glob-db pattern, an explicit --db
-// path, otherwise the configured default SQLite path (home shortened to ~).
+// read, used as the root node of the traffic/finding --tree views (home
+// shortened to ~).
 func displayDBPath() string {
-	raw := config.DefaultDatabaseConfig().SQLite.Path
-	switch {
-	case strings.TrimSpace(globalGlobDB) != "":
-		// A glob is a pattern, not a single file — make the merged nature explicit.
-		pattern := strings.TrimSpace(globalGlobDB)
+	// A glob is a pattern, not a single file — make the merged nature explicit.
+	if pattern := strings.TrimSpace(globalGlobDB); pattern != "" {
 		if n := globDBMergedCount(); n > 0 {
 			return fmt.Sprintf("%s (%d databases merged)", terminal.ShortenHome(pattern), n)
 		}
-		raw = pattern
-	case strings.TrimSpace(globalDB) != "":
-		raw = strings.TrimSpace(globalDB)
-	default:
-		if settings, err := config.LoadSettings(globalConfig); err == nil {
-			if p := strings.TrimSpace(settings.Database.SQLite.Path); p != "" {
-				raw = p
-			}
-		}
+		return terminal.ShortenHome(pattern)
 	}
-	return terminal.ShortenHome(raw)
+	if src := readSourcePath(); src != "" {
+		return terminal.ShortenHome(src)
+	}
+	return terminal.ShortenHome(config.DefaultDatabaseConfig().SQLite.Path)
 }
 
-// effectiveProjectUUID is the project filter for read/query commands: empty (no
-// scoping, show every row) under -S/--stateless or --glob-db since a standalone
-// file carries its own foreign project_uuid, otherwise the active project.
+// explicitProjectSelected reports whether the operator named a project, by flag
+// or by the equivalent environment variable.
+//
+// It is the flags, not the resolution: resolveProjectUUID falls back to the
+// persisted active project and then to the default project, so a non-empty
+// result there says nothing about whether anyone asked. root.go folds
+// VIGOLIUM_PROJECT_UUID / VIGOLIUM_PROJECT_NAME into these globals before any
+// command body runs, so both ways of asking are covered here.
+func explicitProjectSelected() bool {
+	return strings.TrimSpace(globalProjectUUID) != "" || strings.TrimSpace(globalProjectName) != ""
+}
+
+// effectiveProjectUUID is the project filter for read/query commands.
+//
+// Default scoping for a standalone source (-S/--stateless, --glob-db, or a
+// VIGOLIUM_DB_PATH pin) is off, because the file carries whatever project_uuid
+// it was exported under and scoping to the local active project would show
+// nothing. But an operator who NAMES a project is asking for a filter, and
+// silently ignoring it meant `finding -S --db merged.jsonl --project-uuid X`
+// listed every project in the file while looking like it had narrowed.
+//
+// --project-name under a standalone source is the one case this rejects rather
+// than honors, and the reason is which store the name is looked up in.
+// resolveProjectUUID resolves a name through getDB, which is the --db path — so
+// for a standalone .sqlite (including a VIGOLIUM_DB_PATH pin) it hits the source
+// and is correct whenever it is called. A JSONL export and a --glob-db merge
+// have no project registry at all (projects are not an exported type), so the
+// lookup would silently resolve against the DEFAULT database and then filter the
+// standalone source by a UUID that matches nothing in it: an empty result that
+// reads exactly like "this file has no findings". The error names
+// --project-uuid, which needs no lookup and works on every source.
 func effectiveProjectUUID() (string, error) {
-	if statelessReadRequested() {
+	if !statelessReadRequested() {
+		return resolveProjectUUID()
+	}
+	if !explicitProjectSelected() {
 		return "", nil
 	}
-	return resolveProjectUUID()
+	if strings.TrimSpace(globalProjectUUID) == "" && statelessSourceLacksProjects() {
+		return "", usageErrorf(
+			"--project-name cannot be resolved against %s: a JSONL export and a --glob-db merge carry no project registry to look the name up in.\n\nUse --project-uuid %s, which needs no lookup",
+			statelessSourceLabel(), "<uuid>")
+	}
+	uuid, err := resolveProjectUUID()
+	if err != nil {
+		return "", err
+	}
+	noteEnvProjectFilter(uuid)
+	return uuid, nil
 }
+
+// statelessSourceLacksProjects reports whether the standalone source for this
+// read is one that carries no projects table rows — a JSONL export loaded into a
+// scratch database, or a --glob-db merge of them.
+func statelessSourceLacksProjects() bool {
+	if strings.TrimSpace(globalGlobDB) != "" {
+		return true
+	}
+	path := strings.TrimSpace(globalDB)
+	return path != "" && isJSONLSource(path)
+}
+
+// statelessSourceLabel names the standalone source for an error message.
+func statelessSourceLabel() string {
+	if pattern := strings.TrimSpace(globalGlobDB); pattern != "" {
+		return "--glob-db " + pattern
+	}
+	return "--db " + strings.TrimSpace(globalDB)
+}
+
+// noteEnvProjectFilter prints one line when the project filter applied to a
+// standalone read came from the environment rather than from the command line.
+//
+// A flag is visible in the command the operator just typed; an exported
+// VIGOLIUM_PROJECT_UUID is not, and "my export has 400 rows but vigolium shows
+// 3" is otherwise a long debugging session. Printed at most once per process,
+// and never in a machine-output mode.
+func noteEnvProjectFilter(uuid string) {
+	if !projectFromEnv || uuid == "" || machineOutputMode() {
+		return
+	}
+	envProjectNoticeOnce.Do(func() {
+		fmt.Fprintf(os.Stderr, "%s project filter %s from %s applied to a stateless read\n",
+			terminal.InfoSymbol(), terminal.BoldYellow(uuid), terminal.BoldCyan("$VIGOLIUM_PROJECT_*"))
+	})
+}
+
+var envProjectNoticeOnce sync.Once
 
 // openStatelessDB resolves the -S/--stateless data source named by --db. The
 // source may be either:
 //
 //   - a standalone .sqlite file — opened directly (read-only intent), or
 //   - a {"type":...,"data":{...}} JSONL export (e.g. from
-//     `vigolium scan --format jsonl`) — loaded into a throwaway in-memory
-//     SQLite so every existing filter / sort / display path runs unchanged.
+//     `vigolium scan --format jsonl`) — loaded into a throwaway scratch SQLite
+//     file so every existing filter / sort / display path runs unchanged.
 //
 // Callers query with ProjectUUID="" (project scoping off), so all rows in the
 // file are shown regardless of the project_uuid they were exported under.
 func openStatelessDB(skip globDBSkipSet) (*database.DB, error) {
-	// --glob-db expands to many files merged into one in-memory DB; it takes
+	// --glob-db expands to many files merged into one scratch DB; it takes
 	// precedence over a single --db source.
 	if pattern := strings.TrimSpace(globalGlobDB); pattern != "" {
 		return openGlobDB(pattern, skip)
@@ -461,8 +679,8 @@ func openStatelessDB(skip globDBSkipSet) (*database.DB, error) {
 	return clicommon.GetDB(globalConfig, path)
 }
 
-// loadStatelessJSONL parses a {type,data} JSONL export into a fresh in-memory
-// SQLite and returns it. The finding↔record linkage is preserved by the
+// loadStatelessJSONL parses a {type,data} JSONL export into a fresh scratch
+// SQLite file and returns it. The finding↔record linkage is preserved by the
 // importer, so finding --raw / --with-records resolves linked records too.
 func loadStatelessJSONL(path string) (*database.DB, error) {
 	ctx := context.Background()
@@ -483,9 +701,15 @@ func loadStatelessJSONL(path string) (*database.DB, error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	// projectUUID "" → rows import under the default project; the callers query
-	// with ProjectUUID="" (no project filter) so everything in the file shows.
-	res, err := dbimport.ImportJSONL(ctx, database.NewRepository(db), f, "", dbimport.Options{})
+	// PreserveProjectUUID: this scratch database is a read-only view of the file,
+	// so each row keeps the project it was exported under. Stamping the default
+	// project over them made the project_uuid in `finding -S -j` output a fact
+	// about the reader, and made an explicit --project-uuid filter over the source
+	// match either everything or nothing. The "" target still homes a row that
+	// carried no project of its own.
+	res, err := dbimport.ImportJSONL(ctx, database.NewRepository(db), f, "", dbimport.Options{
+		PreserveProjectUUID: true,
+	})
 	if err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to load JSONL from %q: %w", path, err)
@@ -501,8 +725,9 @@ func loadStatelessJSONL(path string) (*database.DB, error) {
 }
 
 // openGlobDB expands pattern to local result files and merges them all into a
-// single throwaway in-memory SQLite DB, which callers query with project
-// scoping off. Each match is imported by its own detected type via
+// single throwaway scratch SQLite FILE (not an in-memory database — a merge of
+// several exports does not have to fit in RAM), which callers query with
+// project scoping off. Each match is imported by its own detected type via
 // dbimport.ImportPath (SQLite→SQLite merge, JSONL export, audit folder, or
 // archive), so a glob can mix formats. A match that fails to import is skipped
 // with a warning rather than aborting the whole read. Returns an error when the
@@ -531,10 +756,16 @@ func openGlobDB(pattern string, skip globDBSkipSet) (*database.DB, error) {
 	}
 	repo := database.NewRepository(db)
 
-	// projectUUID "" → SQLite merges keep each row's original project and JSONL
-	// rows import under the default project; callers query with ProjectUUID=""
-	// (no project filter) so everything in every matched file shows.
+	// projectUUID "" plus PreserveProjectUUID → every source keeps each row's
+	// original project, which is what a SQLite merge already did. JSONL rows used
+	// to be re-homed onto the default project instead, so a glob of two projects'
+	// exports read back as one project and an explicit --project-uuid over the
+	// merge matched nothing. Callers query with ProjectUUID="" unless the operator
+	// named a project.
 	globDBSources = nil
+	globDBSkippedFiles = nil
+	globDBParseErrors = 0
+	globDBMatchedCount = len(matches)
 	globDBSkipped = skip
 	globRecordFile = make(map[string]string)
 	// Both decisions are properties of the skip set, not of any one file.
@@ -549,12 +780,58 @@ func openGlobDB(pattern string, skip globDBSkipSet) (*database.DB, error) {
 	var fMark, rMark int64
 	var loaded, totalRecords, totalFindings int
 	for _, m := range matches {
-		res, impErr := dbimport.ImportPath(ctx, repo, m, "", dbimport.Options{
-			SkipHTTPRecords:  skip.Records,
-			SkipRecordBodies: skip.RecordBodies,
-			SkipFindings:     skip.Findings,
+		marks, markErr := globMergeMarksAt(ctx, db)
+		if markErr != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("--glob-db: cannot snapshot the scratch database before %s: %w", m, markErr)
+		}
+		res, impErr := globImportPath(ctx, repo, m, "", dbimport.Options{
+			SkipHTTPRecords:     skip.Records,
+			SkipRecordBodies:    skip.RecordBodies,
+			SkipFindings:        skip.Findings,
+			PreserveProjectUUID: true,
 		})
+		// A source whose findings the scratch store refused is a source that did
+		// not fully load, even though ImportPath returns no error for it. Counting
+		// it as loaded would attribute a gap in the merged corpus to the source
+		// file rather than to this read.
+		if impErr == nil && res != nil && res.FindingsFailed > 0 {
+			impErr = fmt.Errorf("%d finding(s) could not be stored in the merge", res.FindingsFailed)
+		}
+		// Unparseable lines are different: the rest of the file is real data, and
+		// dropping a 40,000-line export over one truncated line would lose more
+		// than it protects. So a lenient read keeps it and SAYS so — under
+		// --glob-strict, where the caller has asked for no short answers, it is a
+		// failure like any other.
+		if impErr == nil && res != nil && res.ParseErrors > 0 {
+			globDBParseErrors += res.ParseErrors
+			if globalGlobStrict {
+				impErr = fmt.Errorf("%d line(s) could not be parsed", res.ParseErrors)
+			} else {
+				fmt.Fprintf(os.Stderr, "%s --glob-db: %s: %d line(s) could not be parsed and were dropped\n",
+					terminal.WarningSymbol(), terminal.Cyan(m), res.ParseErrors)
+			}
+		}
 		if impErr != nil {
+			// Undo whatever it managed to write. ImportPath commits as it goes, so
+			// "skipped" used to mean "partially merged and reported as absent" —
+			// the one outcome a merged read cannot survive, because nothing
+			// downstream can tell a truncated source from a short one.
+			if rbErr := rollbackGlobMerge(ctx, db, marks); rbErr != nil {
+				_ = db.Close()
+				// rbErr is the %w cause; impErr is flattened to its text on
+				// purpose. An import failure routinely wraps os.ErrNotExist, and
+				// adding that to the chain makes classifyErrorCode report
+				// source_missing — which names a missing file when what actually
+				// happened is an inconsistent scratch database.
+				return nil, fmt.Errorf("--glob-db: %s failed to import (%s) and its partial rows could not be removed, so the merge is inconsistent: %w",
+					m, impErr.Error(), rbErr)
+			}
+			if globalGlobStrict {
+				_ = db.Close()
+				return nil, fmt.Errorf("--glob-db: %s: %w", m, impErr)
+			}
+			globDBSkippedFiles = append(globDBSkippedFiles, globSkippedFile{File: m, Error: impErr.Error()})
 			fmt.Fprintf(os.Stderr, "%s --glob-db: skipped %s: %v\n", terminal.WarningSymbol(), terminal.Cyan(m), impErr)
 			continue
 		}
@@ -616,13 +893,48 @@ func openGlobDB(pattern string, skip globDBSkipSet) (*database.DB, error) {
 	if counts == "" {
 		counts = "metadata only"
 	}
-	fmt.Fprintf(os.Stderr, "%s Stateless: merged %d file(s) — %s — from %s\n",
-		terminal.InfoSymbol(), loaded, counts, terminal.Cyan(pattern))
+	// State the denominator. "merged 37 files" next to a pattern that matched 40
+	// reads as a complete answer unless the three warnings above happened to still
+	// be on screen.
+	skipNote := ""
+	if n := len(globDBSkippedFiles); n > 0 {
+		skipNote = fmt.Sprintf(" (%d of %d skipped)", n, globDBMatchedCount)
+	}
+	fmt.Fprintf(os.Stderr, "%s Stateless: merged %d file(s)%s — %s — from %s\n",
+		terminal.InfoSymbol(), loaded, skipNote, counts, terminal.Cyan(pattern))
 
 	// Cache it so the rest of the command (and closeDatabaseOnExit) reuse and
 	// close this connection rather than opening the default project DB.
 	clicommon.SetDBCache(db)
 	return db, nil
+}
+
+// attachGlobSources records, in the -j envelope, what the --glob-db pattern
+// matched and what actually made it into the merge.
+//
+// Without it the only account of a skipped source was a stderr warning, which a
+// driver consuming stdout never sees — so a merged read over a directory with one
+// unreadable file returned a short, well-formed, confident answer. `matched` and
+// `loaded` differing is the signal; `skipped` says which files and why.
+//
+// It is attached for every --glob-db read, including the clean one, so a consumer
+// can assert matched == loaded rather than infer completeness from an absent key.
+func attachGlobSources(env *agentEnvelope) {
+	pattern := strings.TrimSpace(globalGlobDB)
+	if env == nil || pattern == "" {
+		return
+	}
+	skipped := globDBSkippedFiles
+	if skipped == nil {
+		skipped = []globSkippedFile{}
+	}
+	env.With("glob_sources", map[string]any{
+		"pattern":      pattern,
+		"matched":      globDBMatchedCount,
+		"loaded":       globDBMergedCount(),
+		"skipped":      skipped,
+		"parse_errors": globDBParseErrors,
+	})
 }
 
 // openExportDB returns the database for `vigolium export`. It honors --glob-db

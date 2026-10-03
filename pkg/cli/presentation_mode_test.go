@@ -3,14 +3,16 @@ package cli
 import (
 	"errors"
 	"testing"
+
+	"github.com/spf13/pflag"
 )
 
 func resetPresentationFlags(t *testing.T) {
 	t.Helper()
-	globalJSON, globalSilent, globalSoftFail, globalCIOutput = false, false, false, false
-	t.Cleanup(func() {
-		globalJSON, globalSilent, globalSoftFail, globalCIOutput = false, false, false, false
-	})
+	swapGlobal(t, &globalJSON, false)
+	swapGlobal(t, &globalSilent, false)
+	swapGlobal(t, &globalSoftFail, false)
+	swapGlobal(t, &globalCIOutput, false)
 }
 
 // Flag ORDER used to decide whether a failed command answered in JSON at all:
@@ -99,5 +101,67 @@ func TestGateAndMatchRemainDistinct(t *testing.T) {
 
 	if classifyExitCode(gate) == classifyExitCode(match) {
 		t.Error("a severity gate (4) and a fuzz match (3) are different outcomes and must not collapse")
+	}
+}
+
+// A flag bound before the parse error must not stop the rest from being
+// recovered. The early return on machineOutputMode() did exactly that: cobra
+// set globalJSON while parsing `--json`, so by the time recovery ran the mode
+// "was already resolved" and --soft-fail was dropped.
+func TestPresentationModeRecoversTheRestAfterAnEarlyBinding(t *testing.T) {
+	resetPresentationFlags(t)
+	globalJSON = true // as cobra would have left it
+	resolvePresentationMode([]string{"traffic", "--json", "--definitely-invalid", "--soft-fail"})
+
+	if !globalJSON {
+		t.Error("an already-resolved presentation mode must be left alone")
+	}
+	if !globalSoftFail {
+		t.Error("--soft-fail must still be recovered when another flag parsed first")
+	}
+}
+
+// --ci-output-format is a BOOL at the root. Declared here as a String, pflag
+// consumed the next argument as its value, so `--ci-output-format --json`
+// swallowed --json and the caller that asked for JSON got none.
+func TestPresentationModeRecoversCIOutputWithoutEatingTheNextFlag(t *testing.T) {
+	resetPresentationFlags(t)
+	resolvePresentationMode([]string{"traffic", "--definitely-invalid", "--ci-output-format", "--json"})
+
+	if !globalCIOutput {
+		t.Error("--ci-output-format must be recovered")
+	}
+	if !globalJSON {
+		t.Error("--json after --ci-output-format must survive; a bool flag takes no value")
+	}
+}
+
+// The drift test: every recovered flag must carry its root counterpart's type,
+// because pflag decides whether a flag consumes the next argument from the type.
+func TestPresentationFlagsMatchRootTypes(t *testing.T) {
+	root := rootCmd
+	fs, _ := newPresentationFlagSet()
+	checked := 0
+	fs.VisitAll(func(recovered *pflag.Flag) {
+		checked++
+		actual := root.PersistentFlags().Lookup(recovered.Name)
+		if actual == nil {
+			actual = root.Flags().Lookup(recovered.Name)
+		}
+		if actual == nil {
+			t.Errorf("recovery declares --%s, which the root command does not", recovered.Name)
+			return
+		}
+		if actual.Value.Type() != recovered.Value.Type() {
+			t.Errorf("--%s is %s on the root command and %s in recovery; pflag parses the two differently",
+				recovered.Name, actual.Value.Type(), recovered.Value.Type())
+		}
+		if actual.Shorthand != recovered.Shorthand {
+			t.Errorf("--%s shorthand is %q on the root command and %q in recovery",
+				recovered.Name, actual.Shorthand, recovered.Shorthand)
+		}
+	})
+	if checked != 4 {
+		t.Fatalf("compared %d flags, want 4 — the recovery set changed without this test", checked)
 	}
 }

@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/terminal"
@@ -58,7 +57,7 @@ var trafficBodyCmd = &cobra.Command{
 	Short: "Extract one stored request or response body",
 	Long: "Write the body of a single stored HTTP message to stdout or to a file.\n\n" +
 		"Selects exactly one record by --uuid and one side (--response, the default, or --request). " +
-		"Always opens the source read-only and never re-sends the exchange; use `vigolium replay` for that.",
+		"Never re-sends the exchange — use `vigolium replay` for that; pass --read-only to open the source without modifying it.",
 	Args: cobra.NoArgs,
 	RunE: runTrafficBody,
 	Example: `  # Save a response body to a file
@@ -141,12 +140,23 @@ type extractedMessage struct {
 	Side    extractSide
 	Headers string
 	Body    []byte
+
+	// ProjectScope is the project filter the lookup actually applied, empty when
+	// none was. It is carried on the message rather than re-derived at envelope
+	// time so the receipt reports the scope the record was found under, not a
+	// second resolution that could differ.
+	ProjectScope string
 }
 
 // loadExtractTarget resolves --uuid to one record and isolates the selected
 // side, distinguishing "no such record" from "that side was never captured".
 // Collapsing those two into an empty result is what made a mistyped UUID look
 // like a bodiless response.
+//
+// Selection by UUID is still project-scoped. GetRecordByUUID is a bare primary
+// key read, so this command was the one way to pull a body out of a project the
+// invocation had not selected — the project boundary every listing and query
+// path enforces, bypassed by naming a row directly.
 func loadExtractTarget(ctx context.Context) (*extractedMessage, error) {
 	uuid := strings.TrimSpace(extractUUID)
 	if uuid == "" {
@@ -161,13 +171,29 @@ func loadExtractTarget(ctx context.Context) (*extractedMessage, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	notFound := func() error {
+		return codedErrorf(errCodeRecordNotFound,
+			"no stored record has uuid %q.\n\nList what is there with: vigolium traffic --compact --fields uuid,url -j", uuid)
+	}
+
 	record, err := database.NewRepository(db).GetRecordByUUID(ctx, uuid)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, codedErrorf(errCodeRecordNotFound,
-				"no stored record has uuid %q.\n\nList what is there with: vigolium traffic --compact --fields uuid,url -j", uuid)
+			return nil, notFound()
 		}
 		return nil, fmt.Errorf("read record %q: %w", uuid, err)
+	}
+
+	// Out-of-scope reads report the SAME error as a missing row, deliberately:
+	// "that record belongs to another project" confirms the UUID exists, which is
+	// exactly what a scoped reader must not learn. Same decision, same shape, as
+	// replay's record and finding lookups.
+	projectUUID, err := effectiveProjectUUID()
+	if err != nil {
+		return nil, err
+	}
+	if projectUUID != "" && record.ProjectUUID != projectUUID {
+		return nil, notFound()
 	}
 
 	side := selectedSide()
@@ -184,7 +210,13 @@ func loadExtractTarget(ctx context.Context) (*extractedMessage, error) {
 	}
 
 	headers, body := splitHeadersBody(raw)
-	return &extractedMessage{Record: record, Side: side, Headers: headers, Body: body}, nil
+	return &extractedMessage{
+		Record:       record,
+		Side:         side,
+		Headers:      headers,
+		Body:         body,
+		ProjectScope: projectUUID,
+	}, nil
 }
 
 func runTrafficBody(cmd *cobra.Command, args []string) error {
@@ -301,8 +333,8 @@ func deliverBody(cmd *cobra.Command, msg *extractedMessage, out []byte, complete
 		return err
 	}
 
-	if err := atomicfile.WriteBytes(dest, out); err != nil {
-		return fmt.Errorf("write %s: %w", dest, err)
+	if err := writeRequestedFile(dest, out); err != nil {
+		return err
 	}
 
 	if globalJSON {
@@ -324,9 +356,9 @@ func deliverBody(cmd *cobra.Command, msg *extractedMessage, out []byte, complete
 // reads these commands and the listings alike. total/offset/limit describe the
 // one message that was addressed.
 func newExtractEnvelope(cmd *cobra.Command, msg *extractedMessage, receipt map[string]any) *agentEnvelope {
-	env := newAgentEnvelope(commandPathWithoutRoot(cmd), "", receipt, 1, 0, 1).
-		With("db_path", resolvedReadDBPath())
+	env := newAgentEnvelope(commandPathWithoutRoot(cmd), "", receipt, 1, 0, 1)
 	env.DBPath = resolvedReadDBPath()
+	env.WithProjectScope(msg.ProjectScope)
 	return env.WithQuery("traffic", "--uuid", msg.Record.UUID, "--json", "--full-body")
 }
 
@@ -374,8 +406,8 @@ func runTrafficHeaders(cmd *cobra.Command, args []string) error {
 	}
 
 	if dest := strings.TrimSpace(extractOutput); dest != "" && dest != "-" {
-		if err := atomicfile.WriteBytes(dest, []byte(sb.String())); err != nil {
-			return fmt.Errorf("write %s: %w", dest, err)
+		if err := writeRequestedFile(dest, []byte(sb.String())); err != nil {
+			return err
 		}
 		fmt.Fprintf(os.Stderr, "%s Wrote %s %s headers to %s\n",
 			terminal.InfoSymbol(), terminal.Cyan(msg.Record.UUID), msg.Side, terminal.BoldCyan(dest))

@@ -1,0 +1,15 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.9.0.schema.json
+PackageIdentifier: Vigolium.Vigolium
+PackageVersion: '@VERSION@'
+PackageLocale: en-US
+Publisher: Vigolium
+PublisherUrl: https://vigolium.com
+PublisherSupportUrl: https://github.com/vigolium/vigolium/issues
+PackageName: Vigolium
+PackageUrl: https://vigolium.com
+License: MIT
+LicenseUrl: https://github.com/vigolium/vigolium/blob/@TAG@/LICENSE
+ShortDescription: Web vulnerability scanner and traffic analysis CLI
+ReleaseNotesUrl: https://github.com/vigolium/vigolium/releases/tag/@TAG@
+ManifestType: defaultLocale
+ManifestVersion: 1.9.0

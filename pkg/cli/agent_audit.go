@@ -367,10 +367,9 @@ func runAgentAudit(cmd *cobra.Command, args []string) error {
 	// --provider is now permissive — anthropic-* + openai-* both
 	// resolve via ResolveAuditDriverInvocation. Empty inherits olium config.
 
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// agent.audit.default_agent is a persistent pure agent selector for the

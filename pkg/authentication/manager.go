@@ -1,21 +1,41 @@
 package authentication
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 )
+
+// DefaultLoginBudget bounds the time ALL login flows together may take. It is a
+// total, not a per-request timeout (each request keeps its own 30s): a scan
+// configured with six sessions, each a three-step flow, could otherwise spend
+// nine minutes in setup before sending a single scan request, with no output and
+// no way to tell a slow login from a hung one. Two minutes is many times what a
+// working login needs and short enough that a wedged one is a visible delay
+// rather than an apparent hang.
+const DefaultLoginBudget = 2 * time.Minute
 
 // Manager loads, validates, and hydrates sessions for multi-session scanning.
 type Manager struct {
 	sessions   []*Session
 	primary    *Session
 	sessionDir string // resolved directory for session file lookup
+	// loginTransport is the RoundTripper login requests go out over. nil means
+	// http.DefaultTransport — which honours neither --proxy nor a self-signed
+	// target cert, so a scan that wants either must install one (see
+	// pkg/http.LoginTransport, the single owner of that policy).
+	loginTransport http.RoundTripper
+	// loginBudget caps the total hydration time across every session and step.
+	// <= 0 means DefaultLoginBudget.
+	loginBudget time.Duration
 }
 
 // ManagerOption configures optional Manager behavior.
@@ -25,6 +45,28 @@ type ManagerOption func(*Manager)
 func WithSessionDir(dir string) ManagerOption {
 	return func(m *Manager) {
 		m.sessionDir = dir
+	}
+}
+
+// WithLoginTransport routes login requests over rt. A login request targets the
+// host the scan is about to attack, so it belongs on the same proxy and the same
+// permissive TLS stance as the rest of the scan's traffic; pkg/http.LoginTransport
+// builds exactly that. A nil rt is ignored (Go's default transport stands).
+func WithLoginTransport(rt http.RoundTripper) ManagerOption {
+	return func(m *Manager) {
+		if rt != nil {
+			m.loginTransport = rt
+		}
+	}
+}
+
+// WithLoginBudget overrides the total time all login flows together may take.
+// A non-positive value keeps DefaultLoginBudget.
+func WithLoginBudget(d time.Duration) ManagerOption {
+	return func(m *Manager) {
+		if d > 0 {
+			m.loginBudget = d
+		}
 	}
 }
 
@@ -53,7 +95,7 @@ func NewManager(sessions []*Session, opts ...ManagerOption) (*Manager, error) {
 		sessions[0].Role = RolePrimary
 	}
 
-	m := &Manager{sessions: sessions}
+	m := &Manager{sessions: sessions, loginBudget: DefaultLoginBudget}
 	for _, o := range opts {
 		o(m)
 	}
@@ -67,18 +109,64 @@ func NewManager(sessions []*Session, opts ...ManagerOption) (*Manager, error) {
 	return m, nil
 }
 
-// HydrateSessions executes login flows for sessions that need them.
+// HydrateSessions executes login flows for sessions that need them on a
+// background context. It is the convenience wrapper for callers with no context
+// of their own; anything inside a scan should call HydrateSessionsContext so a
+// cancelled scan stops logging in.
 func (m *Manager) HydrateSessions() error {
+	return m.HydrateSessionsContext(context.Background())
+}
+
+// HydrateSessionsContext executes login flows for sessions that need them,
+// bounded by ctx AND by the manager's total login budget (whichever expires
+// first). The budget wraps the WHOLE loop rather than each session, so N
+// sessions cannot cost N × the budget; a flow that runs out mid-way reports
+// which session it died on.
+//
+// A cancelled or expired ctx is reported before the first request, so a
+// cancelled scan does not start a login it is about to abandon.
+func (m *Manager) HydrateSessionsContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	budget := m.loginBudget
+	if budget <= 0 {
+		budget = DefaultLoginBudget
+	}
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+
+	client := m.loginClient()
 	for _, s := range m.sessions {
-		if s.Login != nil && !s.IsHydrated() {
-			zap.L().Info("Executing login flow", zap.String("session", s.Name), zap.String("url", s.Login.URL))
-			if err := executeLogin(s); err != nil {
-				return err
-			}
-			zap.L().Info("Login successful", zap.String("session", s.Name))
+		if s.Login == nil || s.IsHydrated() {
+			continue
 		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("session %q: login not attempted: %w", s.Name, err)
+		}
+		zap.L().Info("Executing login flow", zap.String("session", s.Name), zap.String("url", s.Login.URL))
+		if err := executeLogin(ctx, s, client); err != nil {
+			return err
+		}
+		zap.L().Info("Login successful", zap.String("session", s.Name))
 	}
 	return nil
+}
+
+// loginClient builds the HTTP client the login flows share: the manager's
+// transport (proxy + target TLS policy), redirects followed so a login that
+// lands its Set-Cookie on a 302 still works, and a per-request timeout that
+// keeps one unanswered request from eating the whole budget.
+//
+// The cookie jar is per-flow, not shared here: executeLogin and
+// executeMultiStepLogin each need their own jar to read the cookies their own
+// login earned, and sharing one across sessions would let one session's cookies
+// satisfy another's extract rule.
+func (m *Manager) loginClient() *http.Client {
+	return &http.Client{
+		Timeout:   loginRequestTimeout,
+		Transport: m.loginTransport,
+	}
 }
 
 // Primary returns the primary session.

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"net/url"
+	"sync/atomic"
 	"time"
 )
 
@@ -190,6 +192,38 @@ type EngineConfig struct {
 	ProxyURL                string              `json:"proxy_url"`                                        // HTTP proxy URL for discovery requests
 	JSTangleConcurrency     int                 `yaml:"jstangle_concurrency" json:"jstangle_concurrency"` // Max concurrent jstangle analyses (0 = conservative default of 1)
 	PrefixBreaker           PrefixBreakerConfig `json:"prefix_breaker"`                                   // Per-prefix circuit breaker for soft-404 / trap directories
+
+	// RequestFilter is consulted before every request leaves the engine's HTTP
+	// client: returning false refuses it with deparos/http.ErrRequestFiltered
+	// instead of sending it. The engine also derives the spider's scope exclusion
+	// from it, so a refused URL is never queued in the first place.
+	//
+	// It carries the caller's EXPLICIT denials (an operator's scope.host.exclude /
+	// scope.path.exclude), not the scope mode — Target.ScopeMode still decides how
+	// wide the crawl goes. nil = no denials.
+	//
+	// Not serialized: a runtime policy hook, not configuration.
+	RequestFilter func(*url.URL) bool `json:"-"`
+
+	// RequestCounter, when set, is incremented once per physical HTTP attempt the
+	// engine makes, retries included. Owned by the caller; the engine only adds to
+	// it. It exists so the phase driving a crawl can report the traffic that crawl
+	// actually generated — the engine has its own client, so a caller watching a
+	// shared requester sees almost nothing.
+	//
+	// Not serialized: a runtime output channel, not configuration.
+	RequestCounter *atomic.Int64 `json:"-"`
+
+	// RequestsPerSecond caps the engine's outgoing request rate with a token
+	// bucket. 0 (the default) means unpaced, which is what discovery has always
+	// been — DiscoveryThreads was the only throttle. Set it only when the caller
+	// has an EXPLICIT rate to enforce: the bucket's own fallback turns a
+	// misconfigured value into 10 rps, which would silently crawl ~100x slower
+	// than the thread count implies.
+	//
+	// Not serialized: resolved from the caller's pace settings, which have their
+	// own config surface.
+	RequestsPerSecond int `json:"-"`
 }
 
 // PrefixBreakerConfig tunes the per-prefix discovery circuit breaker.

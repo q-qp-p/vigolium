@@ -1,9 +1,12 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +15,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/vigolium/vigolium/internal/atomicfile"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/output"
 )
@@ -197,4 +202,244 @@ func TestGenerateHTMLReportStreamingAtomic(t *testing.T) {
 	for _, n := range names {
 		assert.False(t, strings.HasSuffix(n, ".tmp"), "temp file leaked: %s", n)
 	}
+}
+
+// --- WP4: strict reads and atomic publication -------------------------------
+
+// A read failure anywhere in the stream must abort the export. The old code
+// warned on stderr and returned nil, so a database it could not read produced a
+// well-formed, successful, silently-incomplete artifact.
+func TestStreamExportFailsOnClosedDB(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	seedRecordWithBodies(t, db, "alpha")
+	seedFindingAndRecord(t, db, "", "bravo")
+
+	require.NoError(t, db.Close())
+
+	var buf bytes.Buffer
+	_, err := streamJSONLExport(ctx, db, &buf, false, "")
+	require.Error(t, err, "a closed database must fail the export, not produce an empty one")
+	assert.Contains(t, err.Error(), "export scans")
+}
+
+// The findings table specifically: an export whose findings cannot be read used
+// to publish records-only output that reads exactly like a clean scan.
+func TestStreamExportFailsOnUnreadableFindings(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	seedFindingAndRecord(t, db, "", "alpha")
+
+	_, err := db.NewRaw("DROP TABLE findings").Exec(ctx)
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	_, err = streamJSONLExport(ctx, db, &buf, false, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "findings")
+}
+
+// exportJSONL's -o path stages and renames, so a failed read leaves the previous
+// export intact instead of a truncated file with a plausible name.
+func TestExportJSONLKeepsPreviousFileOnFailure(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	seedRecordWithBodies(t, db, "alpha")
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "export.jsonl")
+	require.NoError(t, os.WriteFile(out, []byte("old\n"), 0o644))
+
+	require.NoError(t, db.Close())
+
+	r := &exportRun{db: db}
+	_, err := r.exportJSONL(ctx, out)
+	require.Error(t, err)
+
+	data, rerr := os.ReadFile(out)
+	require.NoError(t, rerr)
+	assert.Equal(t, "old\n", string(data), "a failed export must not replace the previous file")
+
+	entries, rerr := os.ReadDir(dir)
+	require.NoError(t, rerr)
+	for _, e := range entries {
+		assert.False(t, strings.HasSuffix(e.Name(), ".tmp"), "staging file leaked: %s", e.Name())
+	}
+}
+
+// A successful exportJSONL -o still publishes exactly one file with the content.
+func TestExportJSONLPublishesOutput(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	seedRecordWithBodies(t, db, "alpha")
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "export.jsonl")
+	r := &exportRun{db: db}
+	files, err := r.exportJSONL(ctx, out)
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+
+	counts := countEnvelopeTypes(t, mustReadFile(t, out))
+	assert.Equal(t, 1, counts["http_record"])
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "only the published file should remain")
+}
+
+// db export -o is atomic too: writeDBExport is the whole iteration, so a query
+// failure mid-run keeps the previous artifact.
+func TestDBExportAtomic(t *testing.T) {
+	origFormat, origOutput := exportFormat, exportOutput
+	t.Cleanup(func() { exportFormat, exportOutput = origFormat, origOutput })
+
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	seedRecordWithBodies(t, db, "alpha")
+
+	clicommon.ResetProjectResolutionForTest()
+	t.Cleanup(clicommon.ResetProjectResolutionForTest)
+	clicommon.PinProjectUUID("")
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "records.csv")
+	require.NoError(t, os.WriteFile(out, []byte("old\n"), 0o644))
+	exportFormat, exportOutput = "csv", out
+
+	t.Run("a good run publishes", func(t *testing.T) {
+		require.NoError(t, atomicfile.WriteFile(out, 0o666, func(w *bufio.Writer) error {
+			return writeDBExport(ctx, db, nil, nil, w)
+		}))
+		data := string(mustReadFile(t, out))
+		assert.Contains(t, data, "uuid,hostname")
+		assert.Contains(t, data, "alpha.example")
+	})
+
+	t.Run("a failed run keeps the published file", func(t *testing.T) {
+		before := mustReadFile(t, out)
+		require.NoError(t, db.Close())
+		err := atomicfile.WriteFile(out, 0o666, func(w *bufio.Writer) error {
+			return writeDBExport(ctx, db, nil, nil, w)
+		})
+		require.Error(t, err)
+		assert.Equal(t, string(before), string(mustReadFile(t, out)))
+	})
+}
+
+// A bundle without its HTML report is not the deliverable. The render failure
+// used to be a stderr warning next to a published archive and an exit code of 0.
+func TestExportBundleRequiresHTML(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	seedRecordWithBodies(t, db, "alpha")
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "bundle.tar.gz")
+	require.NoError(t, os.WriteFile(out, []byte("previous-archive"), 0o644))
+
+	orig := renderBundleHTML
+	t.Cleanup(func() { renderBundleHTML = orig })
+	renderBundleHTML = func([]any, output.HTMLReportMeta) ([]byte, error) {
+		return nil, errors.New("template blew up")
+	}
+
+	r := &exportRun{db: db}
+	_, err := r.exportBundle(ctx, out)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "report.html")
+
+	assert.Equal(t, "previous-archive", string(mustReadFile(t, out)),
+		"a bundle that could not be rendered must not replace the previous archive")
+}
+
+// The same guarantee for a failure that happens partway through the member
+// stream: an unreadable session directory aborts the archive, and the previous
+// bytes survive.
+func TestExportBundleKeepsPreviousOnSessionFailure(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory mode this test relies on")
+	}
+	origUUIDs := topExportScanUUIDs
+	t.Cleanup(func() { topExportScanUUIDs = origUUIDs })
+
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	seedRecordWithBodies(t, db, "alpha")
+
+	sessions := t.TempDir()
+	blocked := filepath.Join(sessions, "sess-1")
+	require.NoError(t, os.MkdirAll(blocked, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(blocked, "notes.txt"), []byte("x"), 0o600))
+	require.NoError(t, os.Chmod(blocked, 0o000))
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o700) })
+
+	dir := t.TempDir()
+	out := filepath.Join(dir, "bundle.tar.gz")
+	require.NoError(t, os.WriteFile(out, []byte("previous-archive"), 0o644))
+
+	topExportScanUUIDs = []string{"sess-1"}
+	items, err := queryExportData(ctx, db, false, "", "")
+	require.NoError(t, err)
+
+	_, err = writeBundleStream(io.Discard, "bundle", items, output.HTMLReportMeta{
+		GeneratedAt: "2026-06-15T00:00:00.000Z",
+	}, sessions, "")
+	require.Error(t, err, "an unreadable session directory must fail the bundle")
+
+	// And through the published path, which is what protects the artifact.
+	writeErr := atomicfile.WriteFile(out, 0o666, func(w *bufio.Writer) error {
+		_, werr := writeBundleStream(w, "bundle", items, output.HTMLReportMeta{
+			GeneratedAt: "2026-06-15T00:00:00.000Z",
+		}, sessions, "")
+		return werr
+	})
+	require.Error(t, writeErr)
+	assert.Equal(t, "previous-archive", string(mustReadFile(t, out)))
+}
+
+// --no-url-dedup emits every stored exchange; the default collapses same-URL
+// exchanges to the first one.
+func TestStreamHTTPRecordsNoURLDedup(t *testing.T) {
+	orig := topExportNoURLDedup
+	t.Cleanup(func() { topExportNoURLDedup = orig })
+
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	for _, suffix := range []string{"one", "two"} {
+		_, err := db.NewInsert().Model(&database.HTTPRecord{
+			UUID:        "rec-" + suffix,
+			Scheme:      "http",
+			Hostname:    "dup.example",
+			Port:        80,
+			Method:      "GET",
+			Path:        "/same",
+			URL:         "http://dup.example/same",
+			HTTPVersion: "HTTP/1.1",
+			RequestHash: "rhash-" + suffix,
+		}).Exec(ctx)
+		require.NoError(t, err)
+	}
+
+	count := func() int {
+		n := 0
+		require.NoError(t, streamHTTPRecords(ctx, db, false, "", "", func(string, any) error {
+			n++
+			return nil
+		}))
+		return n
+	}
+
+	topExportNoURLDedup = false
+	assert.Equal(t, 1, count(), "same-URL exchanges collapse by default")
+
+	topExportNoURLDedup = true
+	assert.Equal(t, 2, count(), "--no-url-dedup emits every stored exchange")
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return data
 }

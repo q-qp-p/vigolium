@@ -14,6 +14,52 @@ Vigolium searches for configuration in this order:
 
 If no config file is found, built-in defaults are used.
 
+### When a config file cannot be read
+
+The two cases are deliberately different:
+
+- **A file you named with `--config`** is load-bearing. If it is missing,
+  unreadable or unparseable, the command **fails** (exit 1) naming the file.
+  Commands used to fall back to built-in defaults here, so a typo in `--config`
+  ran the scan against the *default* database with the *default* scope and
+  exited 0 — a failure that looks exactly like success.
+- **A file found by discovery** is a convenience. An unreadable one prints one
+  stderr warning and the command continues on built-in defaults.
+
+`vigolium db clean --reset` is stricter still: it refuses on *any* config error,
+including a discovered one, because the config is what names the database it
+would delete.
+
+`vigolium doctor` never fails on a broken config — reporting it is its job. The
+config appears as its own check under **Core**, and every other check in that
+report then reflects built-in defaults rather than your settings.
+
+### Diagnostics
+
+Two non-fatal warnings print to stderr (once per process, and never under
+`--silent`):
+
+- **Unknown keys.** A key that matches no setting — a typo like
+  `default_stratgy`, or a key from a different vigolium version — is applied by
+  nobody and silently has no effect. The warning names the key and the file. The
+  rest of the file still loads.
+- **A shadowed `./vigolium-configs.yaml`.** Discovery is first-match-wins, so a
+  config dropped in a project directory does nothing whenever
+  `~/.vigolium/vigolium-configs.yaml` exists. Pass `--config
+  ./vigolium-configs.yaml` to use it.
+
+### Awkward database paths
+
+A SQLite path containing a space, a `#`, a `%` or non-ASCII characters now
+reaches the file it names, on both the read-write and the read-only open and on
+an `import` merge. A `#` used to truncate the path at the driver's URI parser,
+so vigolium opened — and created — a *different*, empty database beside the real
+one and reported success.
+
+A path containing a literal `?` is **rejected** with a clear error. The bundled
+SQLite driver cannot address one in any spelling; the previous behaviour was a
+silently empty database.
+
 ## Config Precedence
 
 Settings are resolved from highest to lowest precedence:
@@ -194,6 +240,59 @@ scanning_pace:
 > elapses) instead of each phase getting the full value sequentially. A single-phase
 > run (e.g. `vigolium run known-issue-scan`) therefore matches the value exactly.
 
+#### Unset, zero, and negative
+
+A duration setting reads differently depending on whether it is absent, zero, or
+negative. The three are not interchangeable:
+
+| Value | Meaning |
+|---|---|
+| unset / `""` | Use the default for that setting |
+| `0s` — `spidering.max_duration`, `--spider-max-time` | Use the 30m default. There is no "crawl forever": each target runs under a per-target deadline, so zero would mean *crawl nothing* |
+| `0s` — `scanning_pace.discovery.max_duration`, `--discover-max-time` | Use the 1h default, for the same reason |
+| `0s` — per-phase `max_duration` for dynamic-assessment / known-issue-scan | No phase deadline (unlimited); these phases are bounded by the total scan cap instead |
+| negative | **Rejected** at config validation and at flag parse (exit 2). A negative duration is an already-expired deadline, so the phase would silently do nothing |
+
+#### Rate limit precedence
+
+`rate_limit` is resolved once and both enforced and reported from the same value:
+**typed `--rate-limit` flag → scanning profile → `scanning_pace.rate_limit` →
+unlimited.** A rate limit set through the REST API (`rate_limit` in the scan
+request) applies to the native scan as well as to known-issue-scan.
+
+The banner's `Speed:` line and the scan's config snapshot both report this
+resolved value. `rate_limit_known_issue_scan` in the snapshot reports
+`scanning_pace.known-issue-scan.rate_limit`, the one phase that can legitimately
+run at a different rate.
+
+#### Which phase enforces which dial
+
+A pace section accepts all three dials for every phase, but each phase only
+applies the ones its transport has. A dial a phase cannot apply is **warned about
+on stderr** when you set it, and is **omitted** from the `scan.started` pace table
+and from the phase's own `Speed:` line — so nothing presents an unenforced number
+as effective.
+
+| Phase | `concurrency` | `rate_limit` | `max_per_host` |
+|---|---|---|---|
+| `discovery` | yes (engine threads) | yes, **explicit only** (see below) | no |
+| `spidering` | no | no | no |
+| `probe` | yes | yes | yes |
+| `dynamic-assessment` | yes (workers) | no (scan-wide limiter) | no (scan-wide semaphore) |
+| `known-issue-scan` | yes | yes | no |
+| `external-harvest` | yes | no | no |
+
+`spidering` applies none of them: it drives one browser, with a per-target
+`max_duration` as its only bound. Its entry is therefore absent from the
+`scan.started` pace table rather than reported as zeros.
+
+`discovery` is the one dial that does **not** inherit the global value. It is
+paced only when a rate is set explicitly — `scanning_pace.discovery.rate_limit`
+(equivalently `--rate-limit discovery=N`), or a typed `--rate-limit N` — because
+the global `rate_limit` carries a 100 rps default and adopting it would slow down
+every scan that merely loaded a config file. Unset means unpaced, and
+`concurrency` remains the throttle. The section value wins over the global flag.
+
 ### `discovery`
 
 Content discovery (directory/file brute-forcing).
@@ -281,21 +380,118 @@ spidering:
   max_duration: 30m
   max_consecutive_fails: 100
   headless: true
-  browser_count: 1
+  browser_count: 1           # >1 is clamped to 1 (single-threaded crawler)
   strategy: adaptive         # normal | random | oldest_first | shallow_first | adaptive
   include_response_body: true
   browser_engine: chromium   # chromium | ungoogled | fingerprint
   no_cdp: false              # disable CDP event listener detection
-  no_forms: false            # disable automatic form filling
-  self_register: false       # complete a signup form and crawl as that account
-  graph_output_dir: ""       # write the crawl graph here (one file per host)
+  no_forms: false            # legacy: interaction.edit_fields + submit_forms = false
+  self_register: false       # legacy: interaction.register_account = true
+  identity_email_domain: ""  # domain of generated emails; "" = example.com
+  require_auth: false        # fail a target whose configured auth cannot be applied
+  max_capture_body_bytes: 0  # dynamic body ceiling; 0 = 16 MiB, -1 = none
+  graph_output_dir: ""       # write crawl graphs here (one file per crawl)
+  graph_include_values: false  # keep credential-bearing values in graphs
+  interaction:               # what the browser may change; every key optional
+    edit_fields: true        # type into / toggle / select controls
+    submit_forms: true       # dispatch a form submit by any mechanism
+    upload_files: true       # attach the generated benign fixture to file inputs
+    download_files: false    # let the browser save downloads
+    register_account: false  # complete a signup form (never on by intensity)
+    login_attempts:          # unset: on at balanced/deep, off at quick/lite
+    dialogs: record-dismiss  # record-dismiss | accept-all
+  browser_compat:            # browser security exceptions; every key optional
+    no_sandbox: false        # sandbox on unless the host cannot provide one
+    ignore_tls_errors: true  # like the scanner's HTTP transport
+    allow_insecure_content: false
+    disable_web_security: false
 ```
+
+**Interaction policy.** (Full contract: [Browser policy](guides/browser-policy.md).)
+`spidering.interaction` is the one table of what a browser crawl is permitted
+to change. An omitted key keeps its default and
+survives a profile or project overlay that does not name it; an explicit key
+always wins — over the legacy `no_forms` / `self_register` keys (a conflict is
+logged once) and over the intensity. The resolved policy is printed under the
+Spidering phase header as a `Policy:` line, with the source of every value that
+is not the default (`config`, `no_forms`, `self_register`, `intensity`).
+Intensity only picks the default for `login_attempts` and sizes its credential
+list; it never authorizes an account to be created.
+
+What each switch enforces:
+
+- `submit_forms: false` (or `--no-forms`) is a no-submission guarantee for the
+  native crawl: submit controls and Enter actions are refused at dispatch
+  (counted as "prevented by policy" in the Spidering summary), GET/POST form
+  synthesis does not run, and every page gets a guard that stops native and
+  script-driven form submission (`form.submit()`, `requestSubmit()`, submit
+  events). It also withdraws the intensity default for `login_attempts`.
+  It cannot stop a page script that sends its own `fetch`/XHR from an ordinary
+  click handler — no browser crawl can promise a read-only website.
+- `login_attempts` / `register_account` are their own authorization: when set,
+  those submissions go through even with `submit_forms: false`.
+- `upload_files: true` (default) attaches a benign generated fixture (or the
+  configured value) to file inputs, so the upload surface is exercised.
+  `false` attaches no file and generates no fixture; the input is reported as
+  unsupported by policy. Uploads are field edits, so `edit_fields: false` (or
+  `--no-forms`) withdraws them too.
+- `download_files: false` (default) makes the browser deny downloads; when
+  allowed, files land in the run's own browser profile, never `~/Downloads`.
+- `edit_fields: false` leaves every control untouched.
+
+A click fills only the controls of the form it would submit (the clicked
+element's own form, honoring the `form=` attribute); a click outside any form
+— a link, or an SPA "form" made of loose inputs and a scripted button — still
+fills the page's inputs. Generated email addresses (signup, login, email
+fields) use `identity_email_domain`, `example.com` by default — reserved, with
+a null MX, so nothing is ever delivered — and never the target's own domain.
+A page-provided example address is still preferred.
+
+**Capture.** A dynamic (HTML/JS/JSON/API) response whose encoded body is
+larger than `max_capture_body_bytes` (16 MiB by default — above the API-spec
+ingest window, so spec parsing is unaffected) is still recorded, without its
+body; the capture counts these and logs how many at the end. Stored response
+times (`duration_ms`) measure request → response headers; the time spent
+pulling a body out of the browser is no longer included, so values are lower
+than in earlier versions for body-bearing responses.
 
 `max_depth` and `max_states` bound how the crawl spends its clock. With both
 unlimited, a link-dense site can sink the whole `max_duration` into one deep
 branch, and a template that mints a state per row (a paginated table, a
 calendar) can consume the budget on near-identical pages. Set either to `0` to
 lift the bound.
+
+**Browser security.** The crawler launches Chromium with its ordinary
+boundaries — process sandbox on, mixed content blocked, same-origin policy
+intact — and relaxes one only when `spidering.browser_compat` asks.
+Certificate errors are ignored by default, matching the scanner's HTTP
+transport (which does not verify either), so a self-signed target the rest of
+the scan reaches is crawlable too; set `ignore_tls_errors: false` to verify.
+The sandbox is dropped automatically, with one named warning, where the host
+cannot provide it (running as root, in a container, or with user namespaces
+disabled), and on Linux when a sandboxed launch fails and an unsandboxed retry
+works (Ubuntu 23.10+'s AppArmor user-namespace restriction is the usual cause).
+`--browser-insecure` turns all four exceptions on — for local test apps only.
+The effective posture is printed under the Spidering header as a
+`Browser security:` line.
+
+**Authentication in the browser.** The session cookies and auth headers the
+HTTP phases use (`--auth`, `--auth-file`, `-H`) are bridged into the crawl.
+Cookies keep their own `Domain`/`Path`, so the browser's jar decides where they
+go. Auth headers are page-wide in the browser (they ride on every request a
+page makes), so they are installed only while the crawl is on a host the
+operator scope admits — with no custom scope, the target host and its
+subdomains. When the start URL redirects to a host outside that (a relocated
+app the crawl adopts, or a login wall), the headers are cleared and not
+reinstalled; the host is logged and counted (never the header values). The
+browser cannot hold a header back from the redirect hop itself, nor from a
+third-party subresource on an in-scope page — that needs request
+interception, which the crawler does not do. The outcome is reported per
+target as `auth_state`: `not-requested`, `configured`, `applied` or `failed`
+— never "verified", because applying credentials does not prove the
+application accepted them. By default a `failed` target is still crawled
+(unauthenticated) and the Spidering summary says so; `require_auth: true` (or
+`--require-auth`) fails that target instead.
 
 **Reaching what nothing links to.** An interaction crawl can only find what a
 click leads to. Three sources run alongside it and are on by default:
@@ -315,8 +511,10 @@ click leads to. Three sources run alongside it and are on by default:
   signup form and continues as the account it creates, turning the authenticated
   surface from unreachable into ordinary crawlable content. Runs at most once
   per host, only submits to an in-scope host, and reuses the identity it creates
-  at any later login form. It is a write, so it stays opt-in; `--intensity deep`
-  enables it, and setting the key forces it on at any intensity.
+  at any later login form. It is a write, so it stays opt-in at every intensity:
+  set `interaction.register_account: true` (or the legacy `self_register: true`).
+  Before this policy existed `--intensity deep` turned it on implicitly; it no
+  longer does.
 
 **Extra sweeps.** After the action queue drains with budget left, the crawler
 re-visits known locations and re-extracts. Actions unlock state out of order — a
@@ -328,10 +526,23 @@ they guarded. Both stop immediately if the crawl ended on its budget or on a
 failure streak.
 
 **`graph_output_dir`** writes the finished crawl graph as JSON, one file per
-host. Captured traffic records *what* was requested; the graph records *how* the
-crawler got there — the source and target state of every transition, the
-selector for the element that was actioned, and the form values it carried. That
-is the difference between a list of URLs and a reproducible route.
+crawl: `crawl-graph-<host>-<run>-<seq>.json`, where `<run>` is the scan UUID
+and `<seq>` numbers the crawls of the process, so same-host seeds and repeat
+runs never overwrite each other. Captured traffic records *what* was
+requested; the graph records *how* the crawler got there — the source and target
+state of every transition, the selector for the element that was actioned, and
+the form values it carried. That is the difference between a list of URLs and a
+reproducible route. Each file also carries the run's manifest: the interaction
+policy and browser security posture in force, and the capture receipt.
+
+Graphs are written owner-only (`0600`) and atomically, and are **redacted by
+default**: password and hidden field values, fields and URL parameters whose
+names read as credentials (`token`, `secret`, `code`, `session`, …), URL
+userinfo, and element `value`/`data-*` attributes are replaced with
+`<redacted>`; the file says `"redacted": true`. `graph_include_values: true`
+keeps them and marks the file `"redacted": false`. Graph files written by
+earlier versions (`version` 1) were not redacted and should be treated as
+sensitive.
 
 ### `dynamic-assessment`
 

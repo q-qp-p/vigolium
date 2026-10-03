@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,13 +21,7 @@ import (
 // newExportTestDB returns a fresh schema-initialized SQLite DB in a temp dir.
 func newExportTestDB(t *testing.T) *database.DB {
 	t.Helper()
-	cfg := config.DefaultDatabaseConfig()
-	cfg.SQLite.Path = filepath.Join(t.TempDir(), "export.sqlite")
-	db, err := database.NewDB(cfg)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	require.NoError(t, db.CreateSchema(context.Background()))
-	return db
+	return newDBAtPath(t, filepath.Join(t.TempDir(), "export.sqlite"))
 }
 
 // seedFindingAndRecord inserts one finding + one http_record under project.
@@ -59,22 +52,6 @@ func seedFindingAndRecord(t *testing.T, db *database.DB, project, suffix string)
 		RequestHash: "rhash-" + suffix,
 	}).Exec(ctx)
 	require.NoError(t, err)
-}
-
-// captureStdout redirects os.Stdout for the duration of fn and returns what was
-// written, so the stdout-streaming export branch can be asserted.
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-	orig := os.Stdout
-	r, w, err := os.Pipe()
-	require.NoError(t, err)
-	os.Stdout = w
-	defer func() { os.Stdout = orig }()
-	fn()
-	require.NoError(t, w.Close())
-	var buf bytes.Buffer
-	_, _ = io.Copy(&buf, r)
-	return buf.String()
 }
 
 func countEnvelopeTypes(t *testing.T, data []byte) map[string]int {

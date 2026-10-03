@@ -292,3 +292,30 @@ func TestApplyProfile_KeyPreservingOverlayFromFile(t *testing.T) {
 			settings.Discovery.Engine.ObservedMaxItems, defaults.Engine.ObservedMaxItems)
 	}
 }
+
+// TestApplyProfile_OverwritesScanningPaceRateLimit documents why pkg/cli/scan.go
+// copies a typed --rate-limit into the pace AFTER ApplyProfile rather than
+// before. A profile carrying its own scanning_pace.rate_limit overwrites whatever
+// is there; done in the wrong order, known-issue-scan quietly paced itself at the
+// profile's rate while the native scan honored the operator's flag.
+func TestApplyProfile_OverwritesScanningPaceRateLimit(t *testing.T) {
+	settings := &Settings{}
+	settings.ScanningPace = *DefaultScanningPaceConfig()
+	settings.ScanningPace.RateLimit = 5 // stands in for the typed flag's value
+
+	path := filepath.Join(t.TempDir(), "profile.yaml")
+	if err := os.WriteFile(path, []byte("scanning_pace:\n  rate_limit: 200\n"), 0o600); err != nil {
+		t.Fatalf("write profile: %v", err)
+	}
+	profile, err := LoadProfile(path)
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	if err := ApplyProfile(settings, profile); err != nil {
+		t.Fatalf("ApplyProfile: %v", err)
+	}
+	if settings.ScanningPace.RateLimit != 200 {
+		t.Fatalf("profile rate_limit = %d, want 200 — the overwrite this ordering guards against is gone",
+			settings.ScanningPace.RateLimit)
+	}
+}

@@ -147,7 +147,14 @@ func registerListFlags(cmd *cobra.Command) {
 func runDBList(cmd *cobra.Command, args []string) error {
 	defer closeDatabaseOnExit()
 
-	db, err := getDB()
+	// openReadDB, not getDB: `db ls` is a read command, and it was the one that
+	// accepted -S without requiring a source. getDB opened the DEFAULT project
+	// database, and then effectiveProjectUUID — seeing a stateless read — dropped
+	// the project filter, so `db ls findings -S` listed every project's rows in
+	// the operator's own store while reading like a scoped read of a standalone
+	// file. Going through the shared opener also makes a JSONL export a valid
+	// source here, as it already is for finding and traffic.
+	db, err := openReadDB(globDBSkipSet{})
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -182,6 +189,13 @@ func runDBList(cmd *cobra.Command, args []string) error {
 		if err := validateAgentViewFlags(agentViewOptionsFromFlags(), findingViewFields); err != nil {
 			return err
 		}
+	}
+	// Outside the switch, because --max-output-bytes shapes every table's
+	// document, including the two whose --fields are validated elsewhere. The
+	// curated-view cases above check it too; running it twice costs nothing and
+	// is cheaper than a third place for a new table to forget.
+	if err := validateOutputBudgetFlag(globalJSON); err != nil {
+		return err
 	}
 	if err := validateJSONOutputFlag(cmd); err != nil {
 		return err
@@ -479,17 +493,7 @@ func runListScans(ctx context.Context, db *database.DB) error {
 	tbl := terminal.NewTableWithMaxWidth(globalWidth, "NAME", "TARGET", "TYPE", "SOURCE", "STATUS", "MODULES", "REQUESTS", "C/H/M/L/I/S", "DURATION")
 	for _, v := range views {
 		s := v.Scan
-		status := s.Status
-		switch status {
-		case "completed":
-			status = terminal.Green(status)
-		case "running":
-			status = terminal.Cyan(status)
-		case "failed":
-			status = terminal.Red(status)
-		case "cancelled":
-			status = terminal.Yellow(status)
-		}
+		status := scanStatusCell(s)
 
 		counts := fmt.Sprintf("%s/%s/%s/%s/%s/%s",
 			terminal.BoldMagenta(fmt.Sprintf("%d", s.CriticalCount)),
@@ -521,6 +525,34 @@ func runListScans(ctx context.Context, db *database.DB) error {
 	tbl.Print()
 	fmt.Println()
 	return nil
+}
+
+// scanStatusCell renders the STATUS column for a scan listing.
+//
+// A partial run reads "completed (partial)": the status is still completed — the
+// scan reached its end and the vocabulary has not changed — but a listing that
+// shows nothing but "completed" for a run that covered two of seven phases is
+// how a curtailed scan gets mistaken for a clean baseline. An empty
+// completeness is unknown (an older binary wrote the row) and renders as before.
+func scanStatusCell(s *database.Scan) string {
+	if s == nil {
+		return ""
+	}
+	status := s.Status
+	if status == "completed" && s.Completeness == database.CompletenessPartial {
+		return terminal.Yellow("completed (partial)")
+	}
+	switch status {
+	case "completed":
+		return terminal.Green(status)
+	case "running":
+		return terminal.Cyan(status)
+	case "failed":
+		return terminal.Red(status)
+	case "cancelled":
+		return terminal.Yellow(status)
+	}
+	return status
 }
 
 // buildScanViews wraps each scan with display-friendly fields: renders

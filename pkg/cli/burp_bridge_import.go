@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 
@@ -25,23 +24,22 @@ func importBurpTrafficToDB(
 	return burpbridge.ImportIntoRepository(ctx, client, repo, query, projectUUID)
 }
 
-func writeBurpImportResult(
-	w io.Writer,
-	bridgeURL string,
-	result burpbridge.ImportResult,
-	jsonOutput bool,
-) {
-	if jsonOutput {
-		// ImportResult already carries the resolved source, so it is not
-		// restated here — one `source` key, written from the vendor that
-		// actually answered rather than from a compile-time constant.
-		output := struct {
-			BridgeURL string `json:"bridge_url"`
-			burpbridge.ImportResult
-		}{BridgeURL: bridgeURL, ImportResult: result}
-		_ = json.NewEncoder(w).Encode(output)
-		return
-	}
+// burpImportResultJSON builds the -j document for a live-bridge import.
+//
+// ImportResult already carries the resolved source, so it is not restated here
+// — one `source` key, written from the vendor that actually answered rather
+// than from a compile-time constant.
+func burpImportResultJSON(bridgeURL string, result burpbridge.ImportResult) any {
+	return struct {
+		BridgeURL string `json:"bridge_url"`
+		burpbridge.ImportResult
+	}{BridgeURL: bridgeURL, ImportResult: result}
+}
+
+// writeBurpImportResult renders the human summary of a live-bridge import. The
+// -j document is built by burpImportResultJSON and written through the shared
+// stdout encoder, which is also what latches the one-document contract.
+func writeBurpImportResult(w io.Writer, result burpbridge.ImportResult) {
 	_, _ = fmt.Fprintf(w, "%s Imported %s traffic: %d selected, %d inserted, %d updated, %d unchanged",
 		terminal.SuccessSymbol(), burpbridge.VendorNameForSource(result.Source),
 		result.Selected, result.Inserted, result.Updated, result.Unchanged)

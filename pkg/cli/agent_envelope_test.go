@@ -3,9 +3,12 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 )
 
 func marshalEnvelope(t *testing.T, env *agentEnvelope) map[string]any {
@@ -194,5 +197,62 @@ func TestEnvelopeDoesNotEscapeHTML(t *testing.T) {
 		if strings.Contains(string(raw), escape) {
 			t.Errorf("escaped %s: %s", escape, raw)
 		}
+	}
+}
+
+// query is shell-quoted for a human to read; query_argv is the same command as
+// a vector, so a consumer that wants to RUN it does not have to re-split a
+// string whose quoting was the point.
+func TestEnvelopeQueryArgv(t *testing.T) {
+	resetReadContext(t)
+	clicommon.SetOpenedDBPath("/engagements/db with space.sqlite")
+
+	env := newAgentEnvelope("finding", "findings", []any{}, 0, 0, 10)
+	env.WithQuery("finding", "--id", "5", "--json")
+	got := marshalEnvelope(t, env)
+
+	rawArgv, ok := got["query_argv"].([]any)
+	if !ok {
+		t.Fatalf("query_argv missing or not an array: %#v", got["query_argv"])
+	}
+	argv := make([]string, len(rawArgv))
+	for i, v := range rawArgv {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("query_argv[%d] is not a string: %#v", i, v)
+		}
+		argv[i] = s
+	}
+	if argv[0] != "vigolium" {
+		t.Errorf("query_argv must start with the binary name, got %v", argv)
+	}
+	// The unquoted path is what exec needs; the display string quotes it.
+	if !slices.Contains(argv, "/engagements/db with space.sqlite") {
+		t.Errorf("query_argv must carry the raw path, got %v", argv)
+	}
+	query, _ := got["query"].(string)
+	if !strings.Contains(query, "'/engagements/db with space.sqlite'") {
+		t.Errorf("query must stay shell-quoted, got %q", query)
+	}
+	if got, want := strings.Join(argv, " "), followUpQuery("finding", "--id", "5", "--json"); want == got {
+		t.Errorf("the two forms must differ in quoting for a path with a space: %q", got)
+	}
+}
+
+// Both forms are absent together: a consumer finding one but not the other has
+// to guess whether the read is reproducible.
+func TestEnvelopeQueryArgvAbsentWithQuery(t *testing.T) {
+	resetReadContext(t)
+	globalGlobDB = "/scans/*.sqlite"
+
+	env := newAgentEnvelope("finding", "findings", []any{}, 0, 0, 10)
+	env.WithQuery("finding", "--id", "5")
+	got := marshalEnvelope(t, env)
+
+	if _, ok := got["query"]; ok {
+		t.Error("an unreproducible read must omit query")
+	}
+	if _, ok := got["query_argv"]; ok {
+		t.Error("an unreproducible read must omit query_argv")
 	}
 }

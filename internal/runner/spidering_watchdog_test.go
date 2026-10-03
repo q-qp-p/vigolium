@@ -3,8 +3,11 @@ package runner
 import (
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/spitolas"
 )
 
 // These guard the spidering watchdog — the hard guarantee that a wedged RunSpider
@@ -134,5 +137,91 @@ func TestCrawlOutcomeCarriesWedgedSeparatelyFromErr(t *testing.T) {
 	timedOut := crawlOutcome{err: errors.New("timed out"), wedged: true}
 	if !timedOut.wedged {
 		t.Error("wedged must survive alongside err")
+	}
+}
+
+// fakeRespiderSession stands in for a SpiderSession in the teardown path. Close
+// blocks for closeDelay, so a test can make it outlast the watchdog.
+type fakeRespiderSession struct {
+	closeDelay time.Duration
+	closeErr   error
+	closes     atomic.Int64
+	kills      atomic.Int64
+}
+
+func (f *fakeRespiderSession) Close() error {
+	f.closes.Add(1)
+	time.Sleep(f.closeDelay)
+	return f.closeErr
+}
+
+func (f *fakeRespiderSession) Kill() { f.kills.Add(1) }
+
+func (f *fakeRespiderSession) Receipt() spitolas.CaptureReceipt { return spitolas.CaptureReceipt{} }
+
+// withShortTeardownGrace shortens the watchdog budget for one test. The
+// production value is 90s, which no unit test can wait out.
+func withShortTeardownGrace(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := spideringTeardownGrace
+	spideringTeardownGrace = d
+	t.Cleanup(func() { spideringTeardownGrace = orig })
+}
+
+// TestCloseReSpiderSessionKillsAWedgedBrowser: when the teardown watchdog fires,
+// nothing will ever close the session, so its Chromium process and profile used
+// to survive the rest of the scan — one per wedged host.
+func TestCloseReSpiderSessionKillsAWedgedBrowser(t *testing.T) {
+	withShortTeardownGrace(t, 100*time.Millisecond)
+	sess := &fakeRespiderSession{closeDelay: 5 * time.Second}
+
+	start := time.Now()
+	_ = closeReSpiderSession(sess, nil)
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("the teardown watchdog did not return promptly: %v", elapsed)
+	}
+	// Kill runs in its own goroutine (the launcher's kill waits for the process),
+	// so give it a moment to land.
+	deadline := time.Now().Add(2 * time.Second)
+	for sess.kills.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := sess.kills.Load(); got != 1 {
+		t.Fatalf("a wedged teardown killed the browser %d time(s), want 1", got)
+	}
+}
+
+// TestCloseReSpiderSessionDoesNotKillOnACleanClose is the control: a teardown
+// that completes must not reach for the kill, which would make every normal
+// re-spider teardown pay the launcher's built-in wait.
+func TestCloseReSpiderSessionDoesNotKillOnACleanClose(t *testing.T) {
+	withShortTeardownGrace(t, 2*time.Second)
+	sess := &fakeRespiderSession{}
+
+	_ = closeReSpiderSession(sess, nil)
+
+	if got := sess.closes.Load(); got != 1 {
+		t.Fatalf("Close called %d time(s), want 1", got)
+	}
+	// Give any stray kill goroutine a chance to run before asserting none did.
+	time.Sleep(50 * time.Millisecond)
+	if got := sess.kills.Load(); got != 0 {
+		t.Fatalf("a clean teardown killed the browser %d time(s), want 0", got)
+	}
+}
+
+// TestCloseReSpiderSessionLostRecordsStillCloseCleanly: a Close that reports lost
+// records completed — the browser is gone — so it must not be killed.
+func TestCloseReSpiderSessionLostRecordsStillCloseCleanly(t *testing.T) {
+	withShortTeardownGrace(t, 2*time.Second)
+	sess := &fakeRespiderSession{closeErr: errors.New("3 records dropped")}
+
+	_ = closeReSpiderSession(sess, nil)
+
+	time.Sleep(50 * time.Millisecond)
+	if got := sess.kills.Load(); got != 0 {
+		t.Fatalf("a completed close that lost records killed the browser %d time(s), want 0", got)
 	}
 }

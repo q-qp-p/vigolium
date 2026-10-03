@@ -8,6 +8,7 @@ import (
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
+	"github.com/vigolium/vigolium/pkg/dbimport"
 )
 
 // writeFindingGlobFixture writes a standalone .sqlite result file holding one
@@ -310,4 +311,9 @@ func resetDBCacheForTest() {
 	globDBSources = nil
 	globRecordFile = nil
 	globDBSkipped = globDBSkipSet{}
+	globDBSkippedFiles = nil
+	globDBMatchedCount = 0
+	globDBParseErrors = 0
+	globalGlobStrict = false
+	globImportPath = dbimport.ImportPath
 }

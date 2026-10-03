@@ -1,8 +1,9 @@
 # Installation
 
-Vigolium ships as a single, statically-linked Go binary with no runtime
-dependencies. Pick whichever install method fits your
-environment — all of them give you the same `vigolium` binary.
+Vigolium ships as a single Go executable with embedded helper programs. The Go
+executable is statically linked; the Linux helpers require a glibc-based runtime.
+Browser features need a compatible browser. Pick whichever install method fits
+your environment — all of them give you the same `vigolium` binary.
 
 ## Quick install (recommended)
 
@@ -38,6 +39,36 @@ npm install -g @vigolium/vigolium
 # Or run once without installing
 npx @vigolium/vigolium scan -h
 ```
+
+## Nix
+
+The [official binary flake](https://github.com/vigolium/nix-vigolium) supports
+Linux and macOS on x86_64 and aarch64:
+
+```bash
+nix run github:vigolium/nix-vigolium -- version
+nix profile install github:vigolium/nix-vigolium
+```
+
+Nix flakes and `nix-command` must be enabled. Linux requires working user
+namespaces for the embedded helpers' FHS runtime. Use `nix profile list` to find
+the installed entry name, then `nix profile upgrade <entry-name>` to upgrade.
+
+## Scoop (Windows)
+
+With [Scoop](https://scoop.sh/) installed, add the official bucket:
+
+```powershell
+scoop bucket add vigolium https://github.com/vigolium/scoop-bucket
+scoop install vigolium
+```
+
+This installs the Windows x64 release. Upgrade with `scoop update vigolium` and
+remove with `scoop uninstall vigolium`.
+
+The Nix flake and Scoop bucket check new stable GitHub Releases hourly and update
+after their installation checks pass. They are distributed directly from these
+repositories; central nixpkgs/Scoop main-bucket inclusion is separate.
 
 ## Build from source
 
@@ -129,6 +160,15 @@ Set `VIGOLIUM_DISABLE_UPDATE_CHECK=1` to suppress that notice, or
 
 > npm and Docker installs are upgraded through their own tooling
 > (`npm update -g @vigolium/vigolium` / `docker pull`), not `vigolium update`.
+
+Packages produced by the additional distribution recipes record their package
+manager. Releases containing this support disable binary self-updates for those
+installs and direct you to the package manager instead. Template-only updates
+remain available with `vigolium update --skip-binary`.
+
+AUR, DEB/RPM, Scoop, WinGet, Nix, and Snap packages are built from the templates in
+`build/packaging/`. Availability in each registry depends on completing that
+channel's publishing setup.
 
 ## Where Vigolium stores data
 

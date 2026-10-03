@@ -17,6 +17,7 @@ import (
 	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/internal/ingestor"
 	"github.com/vigolium/vigolium/internal/runner"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/core"
 	"github.com/vigolium/vigolium/pkg/core/network"
 	hostlimit "github.com/vigolium/vigolium/pkg/core/ratelimit"
@@ -31,7 +32,6 @@ import (
 	"github.com/vigolium/vigolium/pkg/input/formats/wsdl"
 	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/notify/webhook"
-	"github.com/vigolium/vigolium/pkg/storagesig"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/types"
 	"go.uber.org/zap"
@@ -160,39 +160,154 @@ func runIngestCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	// Branch: remote vs local mode
+	remote := ingestOpts.ServerURL != ""
 	run := runLocalIngest
-	if ingestOpts.ServerURL != "" {
+	if remote {
 		if globalScanOnReceive {
 			zap.L().Warn("--scan-on-receive/-S is ignored in remote mode; the server handles scanning independently")
 		}
 		run = runRemoteIngest
 	}
 
-	if len(sources) <= 1 {
-		return run(cmd, args)
-	}
-
 	// Multi-source: run the same path once per source, swapping only the input.
 	// A failing source does not discard its siblings — the point of a batch is
 	// that one bad HAR in fifty does not cost the other forty-nine — but the
 	// command still exits non-zero and names how many failed.
-	announceIngestBatch(sources)
-	failed := 0
+	//
+	// A single source keeps ingestOpts.Input exactly as resolved above, which
+	// may be "-" or "" for stdin; ingestInputSources drops both, so an empty
+	// list is a stdin run, not an empty batch.
+	if len(sources) <= 1 {
+		sources = []string{ingestOpts.Input}
+	} else {
+		announceIngestBatch(sources)
+	}
+
+	// The summary is emitted ONCE, here, from the accumulated outcome. It used
+	// to be printed by each per-source run, so a batch of fifty HARs with -j
+	// wrote fifty top-level JSON documents to stdout — a stream no single
+	// json.Unmarshal can read.
+	started := time.Now()
+	var total ingestOutcome
+	failedSources := 0
 	for _, src := range sources {
 		ingestOpts.Input = src
-		if err := run(cmd, args); err != nil {
-			failed++
+		out, err := run(cmd, args)
+		total.add(out)
+		if err != nil {
+			if len(sources) == 1 {
+				return err
+			}
+			failedSources++
 			fmt.Fprintf(os.Stderr, "%s ingest %s: %v\n", terminal.WarnPrefix(), src, err)
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("%d of %d ingest source(s) failed", failed, len(sources))
+	return reportIngest(total, remote, failedSources, len(sources), time.Since(started))
+}
+
+// reportIngest emits the one completion document for the whole invocation and
+// decides the exit code.
+//
+// What it reports is what the database HOLDS. The old line printed
+// `executor.Processed() + directSaved` — items attempted — so an ingest whose
+// every fetch failed announced "30 records ingested" and exited 0 over a table
+// with no rows in it. A run that could not store everything it read now says so
+// and exits non-zero.
+func reportIngest(out ingestOutcome, remote bool, failedSources, totalSources int, elapsed time.Duration) error {
+	if remote {
+		return reportRemoteIngest(out, failedSources, totalSources, elapsed)
+	}
+
+	if globalJSON {
+		// items is [] rather than nil: the envelope's contract is that `items`
+		// is the canonical collection, and a JSON null breaks every consumer
+		// that iterates or measures it.
+		env := newAgentEnvelope("ingest", "", []any{}, out.Stored, 0, 0)
+		env.DBPath = resolvedReadDBPath()
+		env.With("records_ingested", out.Stored).
+			With("records_failed", out.Failed).
+			With("records_skipped", out.Skipped).
+			With("duration_ms", elapsed.Milliseconds()).
+			With("input_format", strings.Join(out.Formats, ",")).
+			With("record_source", database.RecordSourceIngestCLI).
+			// The obvious next step after an ingest is to look at what landed.
+			WithQuery(ingestFollowUpQuery()...)
+		if err := writeAgentJSON(env); err != nil {
+			return err
+		}
+	} else if !globalSilent {
+		fmt.Fprintf(os.Stderr, "\n%s\n", ingestSummaryLine(out, elapsed))
+	}
+
+	if out.Failed > 0 {
+		return codedErrorf(errCodeIngestIncomplete,
+			"stored %d of %d record(s); %d could not be stored (no response to store, or the write was refused) — run with --debug for the per-record reason",
+			out.Stored, out.Stored+out.Failed, out.Failed)
+	}
+	if failedSources > 0 {
+		return fmt.Errorf("%d of %d ingest source(s) failed", failedSources, totalSources)
+	}
+	return nil
+}
+
+// ingestSummaryLine renders the human completion line. A run that stored
+// everything keeps the wording it has always had; one that did not leads with
+// the shortfall rather than burying it after a success symbol.
+func ingestSummaryLine(out ingestOutcome, elapsed time.Duration) string {
+	suffix := ""
+	if globalDisableFetchResponse {
+		suffix = " (no response fetch)"
+	}
+	if out.Skipped > 0 {
+		suffix += fmt.Sprintf(", %d skipped by scope/static filters", out.Skipped)
+	}
+	if out.Failed > 0 {
+		return fmt.Sprintf("%s %s (%.1fs)",
+			terminal.ErrorSymbol(),
+			terminal.Red(fmt.Sprintf("Ingestion incomplete: %d of %d records stored, %d failed%s",
+				out.Stored, out.Stored+out.Failed, out.Failed, suffix)),
+			elapsed.Seconds())
+	}
+	return fmt.Sprintf("%s %s (%.1fs)",
+		terminal.SuccessSymbol(),
+		terminal.Green(fmt.Sprintf("Ingestion completed: %d records ingested%s", out.Stored, suffix)),
+		elapsed.Seconds())
+}
+
+// reportRemoteIngest keeps remote mode's established output shape — it counts
+// HTTP submissions, not rows, because the server owns the store — while still
+// emitting exactly one document for the whole invocation.
+func reportRemoteIngest(out ingestOutcome, failedSources, totalSources int, elapsed time.Duration) error {
+	if globalJSON {
+		doc := map[string]interface{}{
+			"records_submitted": out.Submitted,
+			"errors":            out.Errors,
+			"duration_ms":       elapsed.Milliseconds(),
+		}
+		encoder := json.NewEncoder(os.Stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(doc); err != nil {
+			return err
+		}
+		jsonResultEmitted = true
+	} else {
+		rate := float64(0)
+		if secs := elapsed.Seconds(); secs > 0 {
+			rate = float64(out.Submitted) / secs
+		}
+		fmt.Printf("\nSubmitted: %d | Errors: %d | Elapsed: %.1fs | Rate: %.1f/s\n",
+			out.Submitted, out.Errors, elapsed.Seconds(), rate)
+	}
+	if failedSources > 0 {
+		return fmt.Errorf("%d of %d ingest source(s) failed", failedSources, totalSources)
 	}
 	return nil
 }
 
 // runRemoteIngest sends requests to a remote vigolium server (existing behavior).
-func runRemoteIngest(_ *cobra.Command, _ []string) error {
+func runRemoteIngest(_ *cobra.Command, _ []string) (ingestOutcome, error) {
+	var outcome ingestOutcome
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -206,33 +321,18 @@ func runRemoteIngest(_ *cobra.Command, _ []string) error {
 
 	stats, err := ingestor.Run(ctx, ingestOpts)
 	if err != nil {
-		return err
+		return outcome, err
 	}
-
-	if globalJSON {
-		out := map[string]interface{}{
-			"records_submitted": stats.Submitted,
-			"errors":            stats.Errors,
-			"duration_ms":       stats.Elapsed.Milliseconds(),
-		}
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(out)
-	}
-
-	elapsed := stats.Elapsed.Seconds()
-	rate := float64(0)
-	if elapsed > 0 {
-		rate = float64(stats.Submitted) / elapsed
-	}
-	fmt.Printf("\nSubmitted: %d | Errors: %d | Elapsed: %.1fs | Rate: %.1f/s\n",
-		stats.Submitted, stats.Errors, elapsed, rate)
-	return nil
+	outcome.Submitted = stats.Submitted
+	outcome.Errors = stats.Errors
+	return outcome, nil
 }
 
-// runLocalIngest fetches HTTP responses and stores request/response pairs in the database.
-func runLocalIngest(cmd *cobra.Command, _ []string) error {
-	startTime := time.Now()
+// runLocalIngest fetches HTTP responses and stores request/response pairs in
+// the database, and reports what it actually stored. The caller owns the
+// summary; see reportIngest.
+func runLocalIngest(cmd *cobra.Command, _ []string) (ingestOutcome, error) {
+	var outcome ingestOutcome
 
 	// --- 1. Auto-detect format ---
 	inputFormat := ingestOpts.InputFormat
@@ -270,8 +370,12 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 		// to. A read that failed must stop the run and say why, not continue to
 		// a streaming source that can only report an empty pipe.
 		if preloadErr != nil {
-			return fmt.Errorf("failed to read ingest input: %w", preloadErr)
+			return outcome, fmt.Errorf("failed to read ingest input: %w", preloadErr)
 		}
+	}
+	outcome.noteFormat(inputFormat)
+	if detectedFormat != "" {
+		outcome.Formats = []string{string(detectedFormat)}
 	}
 
 	if len(preloadedItems) > 0 && detectedFormat != detect.FormatURLs {
@@ -299,7 +403,7 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 			BufferSize: 100,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to create input source: %w", err)
+			return outcome, fmt.Errorf("failed to create input source: %w", err)
 		}
 		inputSource = built
 	}
@@ -313,7 +417,7 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 			BufferSize: 100,
 		})
 		if tfErr != nil {
-			return fmt.Errorf("failed to create target-file source: %w", tfErr)
+			return outcome, fmt.Errorf("failed to create target-file source: %w", tfErr)
 		}
 		inputSource = source.NewMultiSource(inputSource, tfSrc)
 	}
@@ -342,10 +446,9 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	}
 
 	// --- 4. Initialize database ---
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return outcome, err
 	}
 
 	// Override scope origin mode if --scope-origin flag is set
@@ -359,12 +462,12 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	}
 
 	if err := settings.Database.Validate(); err != nil {
-		return fmt.Errorf("invalid database configuration: %w", err)
+		return outcome, fmt.Errorf("invalid database configuration: %w", err)
 	}
 
 	db, err := database.NewDB(&settings.Database)
 	if err != nil {
-		return fmt.Errorf("failed to create database connection: %w", err)
+		return outcome, fmt.Errorf("failed to create database connection: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 
@@ -372,7 +475,7 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	defer cancel()
 
 	if err := db.CreateSchema(ctx); err != nil {
-		return fmt.Errorf("failed to create database schema: %w", err)
+		return outcome, fmt.Errorf("failed to create database schema: %w", err)
 	}
 
 	repo := database.NewRepository(db)
@@ -390,7 +493,7 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	opts.NoWafPacing = globalNoWafPacing
 
 	if err := network.Init(opts); err != nil {
-		return fmt.Errorf("failed to initialize network: %w", err)
+		return outcome, fmt.Errorf("failed to initialize network: %w", err)
 	}
 
 	dedupMgr := dedup.NewManager()
@@ -412,7 +515,7 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 
 	httpRequester, err := http.NewRequester(opts, svc)
 	if err != nil {
-		return fmt.Errorf("failed to create HTTP requester: %w", err)
+		return outcome, fmt.Errorf("failed to create HTTP requester: %w", err)
 	}
 
 	// --- 6. Signal handling ---
@@ -434,145 +537,62 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 	// invisible to every project-scoped read (scan feed, findings, exports).
 	ingestProjectUUID, projErr := resolveProjectUUID()
 	if projErr != nil {
-		return projErr
+		return outcome, projErr
+	}
+
+	// One saver for every record that arrives with its response already
+	// attached, whichever path it came in on: the auto-detected preload below,
+	// and — through preloadedResponseSource — the format parsers, which used to
+	// hand their captured responses to the executor to be discarded and
+	// re-fetched.
+	saver := &ingestSaver{
+		repo:          repo,
+		projectUUID:   ingestProjectUUID,
+		staticMatcher: staticMatcher,
+	}
+	if settings.Scope.AppliedOnIngest {
+		saver.scopeMatcher = config.NewScopeMatcher(settings.Scope, globalTargets...)
 	}
 
 	// Auto-skip refetch: items that already carry a response (Burp pair, etc.)
 	// are written straight to the database so the user-supplied response is
 	// preserved verbatim.
-	directSaved := 0
-	if len(preloadedWithResp) > 0 {
-		var ingestScopeMatcher *config.ScopeMatcher
-		if settings.Scope.AppliedOnIngest {
-			ingestScopeMatcher = config.NewScopeMatcher(settings.Scope, globalTargets...)
-		}
-		for _, rr := range preloadedWithResp {
-			if staticMatcher.IsStaticFile(rr.Request().Path()) {
-				var hg storagesig.HeaderGetter
-				if rr.HasResponse() && rr.Response() != nil {
-					hg = rr.Response()
-				}
-				if !storagesig.KeepStaticAsMeta(rr.Request().Path(), hg) {
-					continue
-				}
-				if rr.Response() != nil {
-					rr.Response().TruncateBody(0) // metadata-only: keep headers, drop body
-				}
-			}
-			if ingestScopeMatcher != nil {
-				if !ingestScopeMatcher.InScopeRequest(
-					rr.Service().Host(),
-					rr.Request().Path(),
-					rr.Request().Header("Content-Type"),
-					string(rr.Request().Raw()),
-				) {
-					continue
-				}
-			}
-			if _, saveErr := repo.SaveRecord(ctx, rr, "ingest-cli", ingestProjectUUID); saveErr != nil {
-				zap.L().Debug("Failed to save preloaded record", zap.Error(saveErr))
-				continue
-			}
-			directSaved++
-		}
-		if !globalSilent && directSaved > 0 {
-			fmt.Fprintf(os.Stderr, "%s Saved %d record(s) with attached response (no refetch)\n",
-				terminal.InfoSymbol(), directSaved)
-		}
+	for _, rr := range preloadedWithResp {
+		saver.save(ctx, rr)
 	}
 
 	// If everything was preloaded with responses, there is nothing left for
 	// the executor or the no-fetch branch to do.
 	if len(preloadedItems) > 0 && len(preloadedNeedFetch) == 0 {
-		if globalJSON {
-			out := map[string]interface{}{
-				"records_ingested": directSaved,
-				"duration_ms":      time.Since(startTime).Milliseconds(),
-				"source":           string(detectedFormat),
-			}
-			encoder := json.NewEncoder(os.Stdout)
-			encoder.SetIndent("", "  ")
-			return encoder.Encode(out)
-		}
-		elapsed := time.Since(startTime).Seconds()
-		if !globalSilent {
-			fmt.Fprintf(os.Stderr, "\n%s %s (%.1fs)\n",
-				terminal.SuccessSymbol(),
-				terminal.Green(fmt.Sprintf("Ingestion completed: %d records ingested", directSaved)),
-				elapsed)
-		}
+		outcome.add(saver.result())
+		noteIngestNoRefetch(outcome.Stored)
 		if globalScanOnReceive {
-			return runLocalIngestScan(settings, db, repo, "")
+			return outcome, runLocalIngestScan(settings, db, repo, "")
 		}
-		return nil
+		return outcome, nil
 	}
 
 	if globalDisableFetchResponse {
-		// Save requests directly without fetching responses
-		var scopeMatcher *config.ScopeMatcher
-		if settings.Scope.AppliedOnIngest {
-			scopeMatcher = config.NewScopeMatcher(settings.Scope, globalTargets...)
-		}
-
-		var count int
+		// Store what the input carries without fetching anything: the same
+		// filters and the same accounting as the direct-save path, because it
+		// is the same write.
 		for {
 			item, nextErr := inputSource.Next(ctx)
 			if nextErr != nil {
 				break
 			}
-			// Always filter static files (keep object-storage assets as
-			// metadata-only; request-only ingest has no body to strip).
-			if staticMatcher.IsStaticFile(item.Request.Request().Path()) {
-				if !storagesig.KeepStaticAsMeta(item.Request.Request().Path(), nil) {
-					continue
-				}
-			}
-			// Request-only scope check (no response available)
-			if scopeMatcher != nil {
-				rr := item.Request
-				if !scopeMatcher.InScopeRequest(
-					rr.Service().Host(),
-					rr.Request().Path(),
-					rr.Request().Header("Content-Type"),
-					string(rr.Request().Raw()),
-				) {
-					continue
-				}
-			}
-			if _, saveErr := repo.SaveRecord(ctx, item.Request, "ingest-cli", ingestProjectUUID); saveErr != nil {
-				zap.L().Debug("Failed to save record", zap.Error(saveErr))
+			if item == nil || item.Request == nil {
 				continue
 			}
-			count++
+			saver.save(ctx, item.Request)
+			item.Complete()
 		}
-
-		total := count + directSaved
-		if globalJSON {
-			// items is [] rather than nil: the envelope's contract is that `items`
-			// is the canonical collection, and a JSON null breaks every consumer
-			// that iterates or measures it.
-			env := newAgentEnvelope("ingest", "", []any{}, int64(total), 0, 0)
-			env.DBPath = resolvedReadDBPath()
-			env.With("records_ingested", total).
-				With("duration_ms", time.Since(startTime).Milliseconds()).
-				With("input_format", inputFormat).
-				With("record_source", database.RecordSourceIngestCLI).
-				WithQuery(ingestFollowUpQuery()...)
-			return writeAgentJSON(env)
-		}
-
-		elapsed := time.Since(startTime).Seconds()
-		if !globalSilent {
-			fmt.Fprintf(os.Stderr, "\n%s %s (%.1fs)\n",
-				terminal.SuccessSymbol(),
-				terminal.Green(fmt.Sprintf("Ingestion completed: %d records ingested (no response fetch)", total)),
-				elapsed)
-		}
-
+		outcome.add(saver.result())
+		noteIngestNoRefetch(outcome.Stored)
 		if globalScanOnReceive {
-			return runLocalIngestScan(settings, db, repo, "")
+			return outcome, runLocalIngestScan(settings, db, repo, "")
 		}
-		return nil
+		return outcome, nil
 	}
 
 	executorCfg := core.ExecutorConfig{
@@ -590,43 +610,64 @@ func runLocalIngest(cmd *cobra.Command, _ []string) error {
 		executorCfg.ScopeOnIngest = true
 	}
 
-	executor := core.NewExecutor(executorCfg, inputSource, nil, nil)
+	// Records that already carry a response never reach the executor: a capture
+	// is ingested as captured, so ingesting one does not require every origin in
+	// it to still resolve.
+	executor := core.NewExecutor(executorCfg,
+		&preloadedResponseSource{inner: inputSource, save: saver.save}, nil, nil)
 	_, err = executor.Execute(ctx)
 	if err != nil {
-		return fmt.Errorf("ingestion failed: %w", err)
+		outcome.add(saver.result())
+		return outcome, fmt.Errorf("ingestion failed: %w", err)
 	}
 
-	// --- 8. Print summary ---
-	totalIngested := executor.Processed() + int64(directSaved)
-	summarySource := inputFormat
-	if detectedFormat != "" {
-		summarySource = string(detectedFormat)
-	}
-	if globalJSON {
-		env := newAgentEnvelope("ingest", "", []any{}, totalIngested, 0, 0)
-		env.DBPath = resolvedReadDBPath()
-		env.With("records_ingested", totalIngested).
-			With("duration_ms", time.Since(startTime).Milliseconds()).
-			With("input_format", summarySource).
-			With("record_source", database.RecordSourceIngestCLI).
-			// The obvious next step after an ingest is to look at what landed.
-			WithQuery(ingestFollowUpQuery()...)
-		return writeAgentJSON(env)
-	}
-
-	elapsed := time.Since(startTime).Seconds()
-	if !globalSilent {
-		fmt.Fprintf(os.Stderr, "\n%s %s (%.1fs)\n",
-			terminal.SuccessSymbol(),
-			terminal.Green(fmt.Sprintf("Ingestion completed: %d records ingested", totalIngested)),
-			elapsed)
-	}
+	// --- 8. Account for what was stored ---
+	outcome.add(saver.result())
+	noteIngestNoRefetch(outcome.Stored)
+	outcome.add(executorIngestOutcome(executor))
 
 	if globalScanOnReceive {
-		return runLocalIngestScan(settings, db, repo, "")
+		return outcome, runLocalIngestScan(settings, db, repo, "")
 	}
 
-	return nil
+	return outcome, nil
+}
+
+// executorIngestOutcome reads one executor's run as rows rather than attempts.
+//
+// Stored and StoreFailed are the executor's own tallies. The rest is a
+// partition of what it processed: an item that never got a response stored
+// nothing and is a failure; one that answered and was neither stored nor
+// refused was dropped by a policy filter (static-asset carve-out, body-size
+// gate, out-of-scope) and is a skip. Items the executor's PRE-fetch filters
+// dropped never reach a worker, so they are outside this accounting entirely.
+func executorIngestOutcome(executor *core.Executor) ingestOutcome {
+	stored := executor.Stored()
+	storeFailed := executor.StoreFailed()
+	unreached := nonNegative(executor.Processed() - executor.Responded())
+	return ingestOutcome{
+		Stored:  stored,
+		Failed:  storeFailed + unreached,
+		Skipped: nonNegative(executor.Responded() - stored - storeFailed),
+	}
+}
+
+func nonNegative(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
+}
+
+// noteIngestNoRefetch reports how many records were stored with the response
+// they arrived with. Written once per source, on stderr, and only when it
+// happened.
+func noteIngestNoRefetch(stored int64) {
+	if globalSilent || stored <= 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s Saved %d record(s) with attached response (no refetch)\n",
+		terminal.InfoSymbol(), stored)
 }
 
 // tryPreloadAutoDetect peeks at stdin or file content to recognize a single

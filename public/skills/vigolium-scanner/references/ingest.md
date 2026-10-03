@@ -59,14 +59,12 @@ failed.
 An empty `--dir` match is a **hard error**: "ingested 0 records" for a typo'd
 path is indistinguishable from an empty capture.
 
-> **Under `-j`, a batch emits one JSON object per source - not one envelope for
-> the run.** `ingest -i a.har -i b.har -j` prints two objects, each with that
-> source's own `records_ingested`. A caller doing `... -j | jq .records_ingested`
-> reads only the **last** source's count and silently undercounts the batch. Sum
-> the objects (`jq -s 'map(.records_ingested) | add'`), or count for real
-> afterwards with `vigolium traffic -j --compact` and read `total`. The human
-> console has the same shape - one "Ingestion completed" line per source, under a
-> single `ingesting N source(s) in one process` header.
+> **A batch emits ONE document for the whole run.** `ingest -i a.har -i b.har -j`
+> prints a single envelope whose `records_ingested` covers every source, so
+> `... -j | jq .records_ingested` is the batch total. (It used to print one
+> object per source, which made that same `jq` read only the last source's count
+> and silently undercount.) The human console prints one "Ingestion completed"
+> line for the run, under the `ingesting N source(s) in one process` header.
 
 > Concurrent `vigolium ingest` processes against one SQLite file are safe (every
 > open sets `busy_timeout`, WAL, and an immediate write lock, so writers
@@ -79,9 +77,9 @@ path is indistinguishable from an empty capture.
 |------|-------------|
 | `-t <url>` | Base URL / target for the ingested data (required for specs that carry only paths) |
 | `-i <file>` | Input file path (`-` for stdin). Repeatable here - see [Batch ingest](#batch-ingest--n-files-one-process) |
-| `-I <format>` | Input format (`urls`, `openapi`, `swagger`, `wsdl`, `burp`, `curl`, `har`, `postman`, `nuclei`, `burpscope`). `vigolium --list-input-mode` prints them with examples |
+| `-I <format>` | Input format. Canonical: `urls`, `nuclei`, `openapi`, `wsdl`, `postman`, `curl`, `burpraw`, `burpxml`, `burpscope`, `har`, `deparos`. Old spellings remain as aliases (`swagger`→`openapi`, `burp`→`burpxml`, `raw`→`burpraw`). `vigolium --list-input-mode` prints them with aliases and examples |
 | `-T <file>` | Target-file: one target URL per line (for `urls`/`burpscope` only - a spec goes through `-i`). Repeatable; a comma in the path is literal |
-| `--input-read-timeout` | Deadline for reading stdin or a file (default `3m`, `0` disables). Raise it when piping a multi-GB export through stdin, where the read itself can outlast the default |
+| `--input-read-timeout` | Deadline for reading stdin (default `3m`; `0` really does disable it now, and a negative value is exit `2`). Raise it when piping a multi-GB export through stdin, where the read itself can outlast the default |
 | `--scan-on-receive` | After ingesting, scan the records (local mode only). `-S` is a **deprecated alias** here and warns — everywhere else `-S` means `--stateless`. |
 | `--spec-url` | Use server URLs from the OpenAPI/Swagger spec |
 | `--spec-header` | HTTP header(s) for OpenAPI/WSDL requests (repeatable) |
@@ -226,14 +224,28 @@ fields, not a row array):
 
 ```jsonc
 {
-  "schema_version": 1, "command": "ingest", "items": [], "total": 1,
-  "records_ingested": 1,
+  "schema_version": 1, "command": "ingest", "items": [], "total": 30,
+  "records_ingested": 30,         // rows the database now HOLDS
+  "records_failed": 0,            // read, but not stored — see below
+  "records_skipped": 0,           // dropped on purpose (static asset, out of scope)
   "input_format": "har",          // what was PARSED  (har, burp, openapi, urls…)
   "record_source": "ingest-cli",  // what was STORED in http_records.source
   "duration_ms": 336,
   "query": "vigolium traffic --json -n 20"
 }
 ```
+
+**`records_ingested` is what the database holds**, not what was attempted.
+`select count(*) from http_records` after the run equals it. It used to count
+items the executor *attempted*, so a capture replayed against a host that no
+longer resolved reported "30 records ingested" and exited `0` over an empty
+table.
+
+**`records_failed > 0` exits `1`** with `error.code: "ingest_incomplete"` — a
+record was read and could not be stored, either because the write was refused
+or because there was no response to store. `records_skipped` is NOT a failure:
+those records were dropped by the static-asset carve-out or by
+`scope.applied_on_ingest`, which is the configuration doing its job.
 
 **`input_format` and `record_source` are two different vocabularies** and must
 not be crossed: `--source` on a read filters by the *record source*, so

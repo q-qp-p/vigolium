@@ -1,0 +1,78 @@
+name: Update release
+
+# Only upstream stable releases change package versions. Ordinary commits do not.
+on:
+  schedule:
+    - cron: '@MINUTE@ * * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable upstream tag (leave empty for latest)
+        required: false
+        type: string
+      force:
+        description: Validate the current version again
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      validate: ${{ steps.prepare.outputs.validate }}
+      version: ${{ steps.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Download and verify upstream release
+        id: prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          args=()
+          if [ "$FORCE" = true ]; then args+=(--force); fi
+          python3 .github/packaging/channel_release.py prepare \
+            --channel @CHANNEL@ --tag "$RELEASE_TAG" "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        if: steps.prepare.outputs.validate == 'true'
+        with:
+          name: candidate
+          path: .candidate/
+          if-no-files-found: error
+          include-hidden-files: true
+
+@VALIDATE_JOB@
+
+  publish:
+    if: needs.prepare.outputs.validate == 'true' && github.ref == 'refs/heads/main'
+    needs: [prepare, validate]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate
+          path: .
+      - name: Publish validated recipe without downgrading or replacing tags
+        run: python3 .github/packaging/channel_release.py publish --channel @CHANNEL@

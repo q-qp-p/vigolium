@@ -27,10 +27,18 @@ type ConcurrentMultiSource struct {
 	once    sync.Once
 }
 
-// NewConcurrentMultiSource creates a ConcurrentMultiSource that reads from
-// all provided sources concurrently.
-func NewConcurrentMultiSource(sources ...InputSource) *ConcurrentMultiSource {
-	ctx, cancel := context.WithCancel(context.Background())
+// NewConcurrentMultiSource creates a ConcurrentMultiSource that reads from all
+// provided sources concurrently.
+//
+// The reader goroutines are owned by ctx, so cancelling the caller's phase stops
+// them without waiting for Close; a nil ctx means they outlive every caller,
+// which is only ever right in a test. Close still cancels them and closes the
+// children, so a caller that does not own a child source must not call it.
+func NewConcurrentMultiSource(parent context.Context, sources ...InputSource) *ConcurrentMultiSource {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 
 	bufSize := len(sources) * 10
 	if bufSize < 64 {

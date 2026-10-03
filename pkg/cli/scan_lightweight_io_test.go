@@ -24,6 +24,7 @@ func resetLightweightIOGlobals() {
 	scanPhaseSpider = false
 	scanPhaseExternalHarvest = false
 	scanPhaseKnownIssueScan = false
+	scanOpts.Events = ""
 }
 
 // The lightweight scan-url / scan-request commands gained -o/--output,
@@ -95,6 +96,9 @@ func TestNeedsRunnerScan(t *testing.T) {
 		"--format jsonl":       func() { globalFormat = "jsonl" },
 		"--discover (phase)":   func() { scanPhaseDiscover = true },
 		"--spider (phase)":     func() { scanPhaseSpider = true },
+		// The event stream is emitted by the scan phases, which only run under
+		// the Runner. On the direct path the flag described nothing.
+		"--events": func() { scanOpts.Events = "ndjson" },
 	}
 	for name, set := range triggers {
 		t.Run(name+" routes to the Runner", func(t *testing.T) {

@@ -243,11 +243,17 @@ func createZip(srcDir, archivePath string) error {
 	})
 }
 
-// uploadImportSource bundles (if a folder) and uploads the import source to
-// cloud storage under the active project. If explicitKey is empty, a key under
-// imports/ is auto-derived. Folder bundles default to .tar.gz unless
+// uploadImportSource is the seam `vigolium import --upload` calls. It is a
+// package var so a test can drive the command's post-import stages — the
+// ordering of the report, the upload and the single -j document — without a
+// cloud storage client.
+var uploadImportSource = uploadImportSourceToStorage
+
+// uploadImportSourceToStorage bundles (if a folder) and uploads the import
+// source to cloud storage under the active project. If explicitKey is empty, a
+// key under imports/ is auto-derived. Folder bundles default to .tar.gz unless
 // explicitKey ends in .zip. Returns the resulting gs:// URL.
-func uploadImportSource(ctx context.Context, srcPath, explicitKey string) (string, error) {
+func uploadImportSourceToStorage(ctx context.Context, srcPath, explicitKey string) (string, error) {
 	sc, err := requireStorageClient()
 	if err != nil {
 		return "", err

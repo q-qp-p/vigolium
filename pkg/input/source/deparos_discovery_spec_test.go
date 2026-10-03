@@ -59,9 +59,12 @@ func (c *captureSaver) SaveAnalysisArtifact(_ context.Context, recordUUID, kind,
 
 func newTestDiscoverySource(saver RecordSaver) *DeparosDiscoverySource {
 	return &DeparosDiscoverySource{
-		cfg:   DeparosDiscoveryConfig{Repository: saver, ProjectUUID: "proj"},
-		items: make(chan *work.WorkItem, 64),
-		done:  make(chan struct{}),
+		cfg:      DeparosDiscoveryConfig{Repository: saver, ProjectUUID: "proj"},
+		baseCtx:  context.Background(),
+		items:    make(chan *work.WorkItem, 64),
+		done:     make(chan struct{}),
+		finished: make(chan struct{}),
+		abort:    make(chan struct{}),
 	}
 }
 

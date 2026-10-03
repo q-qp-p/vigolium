@@ -57,6 +57,7 @@ Run a full vulnerability scan pipeline. Supports multiple targets, input formats
 | `--fail-on` | — | string | — | Exit non-zero when a finding at/above this severity is present (`info`,`suspect`,`low`,`medium`,`high`,`critical`); output written first, `--soft-fail` overrides |
 | `--split-by-host` | — | bool | `false` | Stateless multi-target (`-S -T file`): write per-host output files (`base-<host>.<ext>`); required for `-P > 1` **in this mode** (the `--db-isolate -T` fan-out needs no per-host files); no-op for `--format fs` |
 | `--stateless` | — | bool | `false` | Use a temporary database, export results to `--output`, then discard |
+| `--keep-db-on-error` | — | bool | `false` | On a **failed** `-S` run, move the throwaway database to `~/.vigolium/recovered/` instead of deleting it, so partial results survive (requires `-S`) |
 | `--upload-results` | — | bool | `false` | Upload scan results to cloud storage after completion (requires storage config) |
 
 Stateless mode creates a temp SQLite file, runs the full scan against it, writes
@@ -69,6 +70,12 @@ sidecars). Mutually exclusive with `--db`. Combine with `--format jsonl`,
 discarded with the temp DB and continues. The warning is suppressed under
 `--silent`, `--split-by-host`, `-j`, and `--ci-output` — the last two stream
 every record to stdout as it is written, so nothing is actually lost.
+
+**A failed stateless run normally takes its findings with it.** `--keep-db-on-error`
+moves the working database to `~/.vigolium/recovered/` instead (mode `0600`),
+names the path in the error, and exits non-zero. Read it back with
+`vigolium finding -S --db <path>`. A failed `--db-isolate` merge lands there too,
+printing the exact `vigolium import --db <dest> <path>` command to recover it.
 
 **Reach for `-S` for isolation, not just for CI.** The other half of what it buys
 you is an empty database. A scan against the persisted DB resolves its work set
@@ -100,8 +107,8 @@ to read as "what this target looks like".
 | `--target` | `-t` | []string | — | Target URL. **Repeat the flag** for several targets - commas are *literal*, so a query like `?ids=1,2,3` stays one target instead of splitting into three |
 | `--target-file` | `-T` | []string | — | File of target URLs, one per line. Repeatable for several files; commas in the path are literal too |
 | `--input` | `-i` | string | `-` (stdin) | Spec / export to expand into requests (see `-i` vs `-T` below). A **single** value on `scan`/`run` - repeating it overwrites. Only `vigolium ingest` accumulates repeated `-i` |
-| `--input-mode` | `-I` | string | `urls` | Input format: `urls`, `openapi`, `swagger`, `wsdl`, `burp`, `curl`, `nuclei`, `har` (also `postman`, `burpscope`). `vigolium --list-input-mode` prints the list with examples |
-| `--input-read-timeout` | — | duration | `3m` | Deadline for reading input from stdin or a file; `0` disables it. Raise it when piping a very large export through stdin |
+| `--input-mode` | `-I` | string | `urls` | Input format. Canonical names: `urls`, `nuclei`, `openapi`, `wsdl`, `postman`, `curl`, `burpraw`, `burpxml`, `burpscope`, `har`, `deparos`. Old spellings still work as aliases (`swagger`→`openapi`, `burp`→`burpxml`, `raw`→`burpraw`). `vigolium --list-input-mode` prints the table with aliases and examples |
+| `--input-read-timeout` | — | duration | `3m` | Deadline for reading input from stdin; `0` disables it, a negative value is exit `2`. Also on `scan-url`/`scan-request`. Raise it when piping a very large export through stdin |
 | `--required-only` | — | bool | `false` | Parse only required fields from input format (ignore optional) |
 | `--skip-format-validation` | — | bool | `false` | Skip validation of input file format |
 
@@ -230,10 +237,12 @@ probe phase warn that they are inert rather than doing nothing silently.
 | `--spider` | — | bool | `false` | Enable browser-based spidering phase before scanning |
 | `--spider-max-time` | — | duration | `30m` | Max time for spidering per target |
 | `--browser-engine` | `-E` | string | `chromium` | Browser engine: chromium, ungoogled, fingerprint |
-| `--browsers` | `-b` | int | `1` | Number of parallel browser instances for spidering |
+| `--browsers` | `-b` | int | `1` | Browser instances to launch for spidering (currently clamped to 1 — the crawler is single-threaded) |
 | `--headless` | — | bool | `true` | Run browser in headless mode |
 | `--no-cdp` | — | bool | `false` | Disable Chrome DevTools Protocol event listener detection |
-| `--no-forms` | — | bool | `false` | Disable automatic form detection and filling during spidering |
+| `--no-forms` | — | bool | `false` | Disable form filling and submission during spidering (sets `spidering.interaction` `edit_fields` and `submit_forms` off; an explicit interaction key wins) |
+| `--browser-insecure` | — | bool | `false` | Spider with every browser security exception on: no sandbox, TLS errors ignored, mixed content allowed, same-origin policy off. For local test apps only |
+| `--require-auth` | — | bool | `false` | Fail a target's spidering instead of crawling anonymously when configured authentication (session cookies/auth headers) cannot be applied to the browser (sets spidering.require_auth) |
 | `--headed` | — | bool | `false` | Show the browser window during spidering (sugar for `--headless=false`; wins when both are set) |
 | `--no-carry-browser-session` | — | bool | `false` | Do not carry the spidering browser's cleared session (cookies + UA) into discovery/scanning (on by default when `--spider` runs; scoped to the same host, respects `-H`) |
 

@@ -26,7 +26,24 @@ type TrafficEntry struct {
 	// the response arriving. Zero means NOT MEASURED (an entry rebuilt from a
 	// stored capture has no pending timer), never "instant".
 	DurationMs int64 `json:"-"`
+	// BodyFetchMs is the time spent pulling the body over CDP after the response
+	// arrived — the crawler's overhead, kept out of DurationMs.
+	BodyFetchMs int64 `json:"-"`
+	// BodySource says where Response.Body came from, so a missing body is never
+	// mistaken for an empty one (one of the BodySource* values; "" when the
+	// entry has no response).
+	BodySource string `json:"-"`
 }
+
+// Response body provenance (TrafficEntry.BodySource).
+const (
+	BodySourceCDP           = "cdp"            // fetched over CDP and kept
+	BodySourceOmittedPolicy = "omitted-policy" // fetched for metrics, not kept (include_response_body off)
+	BodySourceSkippedStatic = "skipped-static" // a static asset not worth fetching
+	BodySourceTooLarge      = "too-large"      // over the fetch ceiling; ContentLength carries the encoded size
+	BodySourceFailed        = "failed"         // the CDP fetch errored
+	BodySourceUnavailable   = "unavailable"    // no body to fetch (redirect hop, closed page)
+)
 
 // RequestData contains HTTP request information.
 type RequestData struct {

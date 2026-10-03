@@ -4,6 +4,72 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.5.2] - 2026-10-03
+
+### Added
+
+- Scan completeness: `completeness`, `stop_reason` and `phase_outcomes` on the scan row, in the REST object and in `--format jsonl`.
+- `reasons` / `limits` on `phase.finished` and `scan.finished`, plus `stop_reason` on the scan line.
+- `--require-auth` / `spidering.require_auth` — a failed login is fatal for that target.
+- `--keep-db-on-error` — a failed `-S` run's database is kept under `~/.vigolium/recovered/`.
+- `--glob-strict` for `--glob-db` reads, with `glob_sources` accounting naming every skipped file.
+- `--max-output-bytes` (opt-in) on `finding`, `traffic` and `db ls`.
+- `--json-legacy-keys` — restores the per-command row arrays replaced by `items`.
+- `make test-browser-conformance` — browser conformance suite with a launch precheck.
+- `spidering.interaction.*`, `spidering.identity_email_domain`, `spidering.graph_include_values`, `spidering.max_capture_body_bytes`.
+
+### Changed
+
+- **BREAKING** The browser crawler no longer creates accounts, uploads or downloads files, and now cancels `confirm()` dialogs; `spidering.interaction.*` restores each.
+- **BREAKING** Crawl graphs are now `crawl-graph-<host>-<scan>-<seq>.json`, redacted and owner-only; widen any glob on the old name.
+- **BREAKING** `-j` emits one document per invocation with `items` as the only row array; `--json-legacy-keys` restores the old names.
+- Cookies are evaluated per request, so fewer are sent — host-only, path-scoped, `Secure` and expired cookies are no longer sent everywhere.
+- SIGTERM now cancels a scan like Ctrl-C.
+- `--events ndjson` owns stdout exclusively; events carry `seq` and a terminal event written after finalization.
+- A requested output that cannot be written exits 1 with `error.code: "export_failed"` instead of warning.
+- Single-file `-o` outputs publish atomically; a failure leaves the previous file intact.
+- `--format fs` re-exports replace the tree instead of merging into it.
+- A broken `--config` exits 1 instead of silently falling back to defaults.
+- `spidering.max_duration: 0s` now means the 30m default; negative durations exit 2.
+- All login flows together are bounded by a 2-minute budget.
+- Record delivery is at-least-once: a curtailed phase leaves its cursor behind unfinished records.
+- The browser sandbox is on by default; `--browser-insecure` restores the old posture.
+- Generated identities use `example.com`.
+- `FormsSubmitted` is a real count rather than structurally 0.
+- Stored `duration_ms` for browser-captured responses excludes the CDP body fetch, so values shrink.
+- `-I` and `--list-input-mode` are generated from the parser registry; all old aliases still work.
+- `version`, `help` and `completion` no longer create `~/.vigolium`.
+- First-run setup and `doctor --fix` write to stderr, so a cold-`$HOME` NDJSON run stays clean.
+- Agent tool contracts: `web_fetch`/`browser_probe` capture fields and `browser_auth` cookie fields renamed; `agent-browser` pinned to `>=0.26.0 <1.0.0`.
+
+### Fixed
+
+- `vigolium ingest` reported records it never persisted, and discarded the captured response on every HAR/Burp/Postman entry to re-fetch it live.
+- A stored login flow could never be reloaded — double-encoded `ExtractRules` failed validation and killed session init for the whole scan.
+- `session.use_in_discovery: false` made the entire scan anonymous, including DynamicAssessment and KnownIssueScan.
+- Compare-session requesters carried the primary session's credentials, so authorization-differential checks read "same as primary".
+- A cancelled scan acked unprocessed work, advancing the DB cursor past records a later run then skipped permanently.
+- `scope.host.exclude` / `scope.path.exclude` were not enforced before a discovery request left.
+- `requests_sent` for Discovery was effectively 0 rather than the real count.
+- A browser crawl that lost its corpus recorded `completed`; capture loss and browser auth failure now reach the scan row.
+- Login flows ignored `--proxy` and rejected the target's certificate, unlike every other request.
+- `-P --fail-on` exited 0 unless every child tripped the gate; it now exits 4 when any does.
+- A raw request's declared `Content-Length` disagreed with its body when the source file ended in a newline.
+- A SQLite path containing `#`, `%`, a space or non-ASCII did not reach the file it named.
+- `--stateless=false` dropped a `VIGOLIUM_DB_PATH` pin, and `--project-uuid` did not filter a stateless read.
+- JSONL and SQLite re-imports failed on a UNIQUE constraint; a lossy import now exits 1.
+- `scan-url --events ndjson` emitted nothing, and `| head` killed the scan with SIGPIPE.
+- A `--format fs` re-export with a narrower filter left the previous run's files behind.
+- `--input-read-timeout 0` did not disable the deadline; a negative value now exits 2.
+- A dynamic-assessment round that errored printed "all rounds completed" and carried on.
+- A phase stopped by its own `max_duration` reported `completed`.
+- Discovery cleanup deleted records that findings referenced, and grouped by hostname rather than origin.
+- `scanning_pace.discovery.rate_limit` was accepted and ignored.
+- The per-module finding cap restarted every feedback round instead of spanning the phase.
+- Writer shutdown was unbounded and could take 3× `flush_timeout`.
+- A failed browser launch stranded a Chromium profile directory, and an abandoned crawl left its browser running.
+- `module ls` printed the default config path while `module enable/disable` wrote the resolved one.
+
 ## [v0.5.1] - 2026-09-24
 
 ### Added

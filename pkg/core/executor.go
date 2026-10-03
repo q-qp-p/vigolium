@@ -167,6 +167,45 @@ type findingAdmission struct {
 	allowed bool
 }
 
+// FindingAdmission is the state behind the per-module finding cap: how many
+// findings each module has had admitted, and which root-cause identities have
+// already been admitted.
+//
+// It is a separate type so it can OUTLIVE one Executor. The dynamic-assessment
+// phase builds a fresh executor per feedback round, so this state used to reset
+// between rounds: a cap documented as holding "for the remainder of the scan"
+// actually restarted every round, and a root cause re-found in round 2 re-fired
+// every callback and notification for a finding already reported in round 1.
+// Sharing one admission across the phase's rounds is what makes the documented
+// contract true (triage C7: per dynamic-assessment phase, shared across rounds;
+// other phases are uncapped).
+//
+// The zero value is ready to use, so an Executor built without a shared one gets
+// its own by construction and a literal &Executor{cfg: …} in a test still works.
+// Safe for concurrent use: both fields are sync.Maps.
+type FindingAdmission struct {
+	// counts is module ID → *moduleFindingTracker.
+	counts sync.Map
+	// ids tracks final post-hook root-cause identities and their admission
+	// decisions. Repeated evidence is still persisted so the repository can merge
+	// it, but only the first distinct finding consumes caps, stats, callbacks and
+	// notifications.
+	ids sync.Map
+}
+
+// NewFindingAdmission returns admission state a caller can share across several
+// executors — one per dynamic-assessment phase, covering all of its rounds.
+func NewFindingAdmission() *FindingAdmission { return &FindingAdmission{} }
+
+// admission returns the state the cap decisions read: the caller's shared one
+// when configured, otherwise this executor's own.
+func (e *Executor) admission() *FindingAdmission {
+	if e.cfg.FindingAdmission != nil {
+		return e.cfg.FindingAdmission
+	}
+	return &e.caches.admission
+}
+
 // HookRunner transforms requests before scanning and filters results after scanning.
 type HookRunner interface {
 	RunPreHooks(req *httpmsg.HttpRequestResponse) (*httpmsg.HttpRequestResponse, error)
@@ -224,11 +263,18 @@ type ExecutorConfig struct {
 	// RecordSource is the http_records.source label this executor stamps. Empty
 	// means "scanner", which is what every phase used before the label became
 	// configurable — so a phase that says nothing is unchanged.
-	RecordSource          string
-	OASTProvider          modkit.OASTProvider                                                                                                 // Optional: OAST callback URL generator for blind vuln detection
-	OASTService           OASTFlusher                                                                                                         // Optional: OAST service to flush after scanning
-	PauseCtrl             *PauseController                                                                                                    // Optional: cooperative pause/resume controller
-	MaxFindingsPerModule  int                                                                                                                 // When > 0, suppress findings after this many per module
+	RecordSource         string
+	OASTProvider         modkit.OASTProvider // Optional: OAST callback URL generator for blind vuln detection
+	OASTService          OASTFlusher         // Optional: OAST service to flush after scanning
+	PauseCtrl            *PauseController    // Optional: cooperative pause/resume controller
+	MaxFindingsPerModule int                 // When > 0, suppress findings after this many per module
+	// FindingAdmission optionally shares the per-module cap and the
+	// already-admitted identity set with other executors. nil = executor-local,
+	// which is right for a phase that runs exactly one Execute. The
+	// dynamic-assessment phase passes ONE admission to every feedback round, so
+	// the cap spans the phase and a root cause re-found in a later round does not
+	// re-fire its callbacks. See FindingAdmission.
+	FindingAdmission      *FindingAdmission
 	MaxDuration           time.Duration                                                                                                       // When > 0, cancel execution after this duration
 	FeedbackDrainTimeout  time.Duration                                                                                                       // Idle timeout for draining feedback after source EOF (default: 100ms)
 	FeedbackDrainMaxStall time.Duration                                                                                                       // Hard cap on draining with workers in-flight but making no progress (0 = 2x active module timeout). Guards against a module that ignores cancellation.
@@ -337,6 +383,21 @@ type Executor struct {
 	// confirmed-clean one — re-confirmation never truncates silently.
 	suppressedFindings atomic.Int64
 
+	// stored and storeFailed count what became of each item's PRIMARY record:
+	// stored is one that is in the database when the item is done with (newly
+	// written, or matched to the row it came from), storeFailed is one whose
+	// write returned an error. Redirect hops and finding evidence are not
+	// counted — the question these answer is "how many of my inputs are in the
+	// store", and a chain is one input.
+	//
+	// They exist because neither Processed() nor Responded() can answer it, and
+	// `vigolium ingest` reported Processed() as "records ingested": against a
+	// host that no longer resolves that printed a full count over an empty
+	// table. Attempted, answered and stored are three different numbers and the
+	// only honest one for an ingest is the third.
+	stored      atomic.Int64
+	storeFailed atomic.Int64
+
 	// responded counts input items for which an HTTP response was actually
 	// received - one per item, not per redirect hop or retry.
 	//
@@ -372,6 +433,63 @@ type Executor struct {
 	// (not an unbounded sync.Map) so a long-lived executor can't accumulate one
 	// entry per distinct storage-fronting host for the process lifetime.
 	storageHosts *lru.Cache[string, struct{}]
+
+	// report records whether this Execute call covered its whole input. Written
+	// only by the Execute goroutine (the drain loop and the shutdown sequence all
+	// run there), read by Report() after Execute returns — so the return itself is
+	// the synchronisation. unacked is the exception: workers write it, so it is
+	// atomic and lives outside the struct.
+	report  ExecutionReport
+	unacked atomic.Int64
+}
+
+// ExecutionReport says whether one Execute call processed its whole input, and
+// what it gave up on if not.
+//
+// Execute returns (bool, error) where the bool is "produced findings" and the
+// error is nil on every one of these paths: a cancelled feed, an abandoned
+// drain, abandoned workers, a skipped deferred flush. Each of those silently
+// reduces coverage, and the caller had no way to learn about any of them — a
+// scan whose workers were abandoned mid-flight reported exactly what a clean one
+// did. This is that missing channel.
+type ExecutionReport struct {
+	// StoppedEarly — the input source was not read to EOF (cancelled, deadline,
+	// or a paused scan that was stopped while waiting).
+	StoppedEarly bool
+	// DrainStalled — the feedback drain was abandoned with workers still in
+	// flight and making no progress.
+	DrainStalled bool
+	// WorkersAbandoned — one or more workers did not exit within the shutdown
+	// grace and were leaked.
+	WorkersAbandoned bool
+	// DeferredFlushSkipped — the end-of-run passive flush was skipped because a
+	// worker was abandoned, so deferred findings (secret detection, anomaly
+	// ranking) may be incomplete.
+	DeferredFlushSkipped bool
+	// Unacked counts work items a worker dequeued but deliberately did NOT
+	// acknowledge, because the context was already cancelled when it got them.
+	// Not acknowledging is what keeps the durable cursor behind them so a later
+	// run re-serves them; this number is how many that was.
+	Unacked int64
+}
+
+// Clean reports whether the run covered its whole input with nothing abandoned.
+//
+// A convenience for callers and tests that want the one-line question. The
+// runner's own consumer (phaseTracker.noteExecution) deliberately does not use
+// it: each flag maps to a distinct outcome reason code, so it has to read them
+// individually.
+func (r ExecutionReport) Clean() bool {
+	return !r.StoppedEarly && !r.DrainStalled && !r.WorkersAbandoned &&
+		!r.DeferredFlushSkipped && r.Unacked == 0
+}
+
+// Report returns this executor's coverage self-report. Call it after Execute has
+// returned; before that the fields are still being written.
+func (e *Executor) Report() ExecutionReport {
+	rep := e.report
+	rep.Unacked = e.unacked.Load()
+	return rep
 }
 
 // markStorageHost records that host fronts object storage.
@@ -436,15 +554,10 @@ type scanCaches struct {
 	// (for linking findings). Key: request hash, value: database record UUID.
 	requestUUIDs *shardedMap
 
-	// moduleFindingCount enforces the per-module finding cap.
-	// Key: module ID → *moduleFindingTracker.
-	moduleFindingCount sync.Map
-
-	// emittedFindingIDs tracks final post-hook root-cause identities and their
-	// admission decisions. Repeated evidence is still persisted so the repository
-	// can merge it, but only the first distinct finding consumes caps, stats,
-	// callbacks, and notifications.
-	emittedFindingIDs sync.Map
+	// admission holds the per-module finding cap and the set of already-admitted
+	// root-cause identities. Executor-local unless the caller supplies a shared
+	// one through ExecutorConfig.FindingAdmission — see FindingAdmission.
+	admission FindingAdmission
 
 	// perHostActiveClaimed / perHostPassiveClaimed ensure per-host modules run
 	// exactly once per (module, host) pair even with concurrent workers.
@@ -707,6 +820,22 @@ func (e *Executor) SuppressedFindings() int64 {
 // always <= Processed(). Use this, not Processed(), to report how many targets
 // answered: Processed() counts attempts, including the ones that never reached
 // a server. See the responded field for why the two differ.
+// Stored returns the number of input items whose primary record is in the
+// database when this executor finished with them. Use this, not Processed(),
+// to report how many records a run PERSISTED: Processed() counts attempts, and
+// an attempt that never reached a host, or whose write failed, stores nothing.
+func (e *Executor) Stored() int64 {
+	return e.stored.Load()
+}
+
+// StoreFailed returns the number of input items whose primary record could not
+// be written. Distinct from an item that was never stored because it got no
+// response (Processed() minus Responded()) or because a filter dropped it: this
+// one reached the database and the database refused it.
+func (e *Executor) StoreFailed() int64 {
+	return e.storeFailed.Load()
+}
+
 func (e *Executor) Responded() int64 {
 	return e.responded.Load()
 }
@@ -737,6 +866,12 @@ func (e *Executor) Execute(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("executor already running")
 	}
 	defer e.running.Store(false)
+
+	// Fresh report per run. An executor is normally single-use (dynamic
+	// assessment builds one per feedback round), but a reused one must not
+	// inherit a previous run's abandonment.
+	e.report = ExecutionReport{}
+	e.unacked.Store(0)
 
 	// Observe server-error probe responses so a leaked database error surfaced by
 	// ANY module's probe is corroborated even when the sending module didn't check
@@ -857,7 +992,7 @@ func (e *Executor) Execute(ctx context.Context) (bool, error) {
 		go e.workerController(controllerCtx, itemCh, &wg)
 	}
 
-	e.feedItems(ctx, itemCh)
+	e.report.StoppedEarly = !e.feedItems(ctx, itemCh)
 
 	// After source EOF, drain remaining feedback items from in-flight workers.
 	// Wait until all workers finish (inFlight == 0) and the feedback channel is empty.
@@ -911,6 +1046,7 @@ drainLoop:
 						zap.Int64("in_flight", cur),
 						zap.Int("feedback_queued", len(e.pool.feedbackCh)),
 						zap.Duration("stall_timeout", stallTimeout))
+					e.report.DrainStalled = true
 					break drainLoop
 				}
 				continue
@@ -969,6 +1105,7 @@ drainLoop:
 		}
 	case <-time.After(exitGrace):
 		workersExited = false
+		e.report.WorkersAbandoned = true
 		zap.L().Warn("abandoning scan worker(s) that did not exit within the shutdown grace to avoid hanging the scan; leaking goroutine(s)",
 			zap.Int64("in_flight", e.pool.inFlight.Load()),
 			zap.Duration("worker_exit_grace", exitGrace))
@@ -1015,6 +1152,7 @@ drainLoop:
 		// goroutines, so draining before they exit could race a live append.
 		e.drainProbeCorroboration(ctx)
 	} else {
+		e.report.DeferredFlushSkipped = true
 		zap.L().Warn("skipping passive-module flush after abandoning workers; deferred findings (e.g. secret detection, anomaly ranking) may be incomplete")
 	}
 
@@ -1048,7 +1186,13 @@ func (e *Executor) logInsertionPointCacheStats() {
 		zap.Int64("size_rejections", s.Rejected))
 }
 
-func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) {
+// feedItems pumps the input source into itemCh. It returns whether the source
+// was EXHAUSTED — true only on io.EOF. Every other way out (cancellation, a
+// deadline, a stop while paused, a blocked send) means items were left unread,
+// which is the one fact the caller needs to know and could not previously learn:
+// the function returned nothing, so a cancelled feed and a fully consumed one
+// were the same event.
+func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) (exhausted bool) {
 	// Sources report per-item failures by returning a non-EOF error from Next();
 	// we log and skip the bad item, then keep reading. This must NOT abort the
 	// feed: e.g. TargetSource advances its cursor before validating a URL, so a
@@ -1068,7 +1212,7 @@ func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) 
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		default:
 		}
 
@@ -1078,17 +1222,17 @@ func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) 
 		// Block feeding while paused
 		if e.cfg.PauseCtrl != nil {
 			if !e.cfg.PauseCtrl.WaitIfPaused(ctx) {
-				return
+				return false
 			}
 		}
 
 		item, err := e.source.Next(ctx)
 		if err != nil {
 			if source.IsEOF(err) {
-				return
+				return true
 			}
 			if ctx.Err() != nil {
-				return
+				return false
 			}
 			consecutiveErrors++
 			zap.L().Warn("Error reading from source",
@@ -1100,7 +1244,7 @@ func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) 
 			if consecutiveErrors >= spinGuardThreshold {
 				select {
 				case <-ctx.Done():
-					return
+					return false
 				case <-time.After(50 * time.Millisecond):
 				}
 			}
@@ -1109,7 +1253,7 @@ func (e *Executor) feedItems(ctx context.Context, itemCh chan<- *work.WorkItem) 
 		consecutiveErrors = 0
 
 		if !e.sendItem(ctx, item, itemCh) {
-			return
+			return false
 		}
 	}
 }
@@ -1189,17 +1333,38 @@ func (e *Executor) worker(ctx context.Context, _ int, itemCh <-chan *work.WorkIt
 			if e.cfg.PauseCtrl != nil {
 				e.cfg.PauseCtrl.AcquireWorker()
 			}
-			e.processItem(ctx, item)
+			panicked := e.processItem(ctx, item)
 			if e.cfg.PauseCtrl != nil {
 				e.cfg.PauseCtrl.ReleaseWorker()
 			}
 			e.pool.inFlight.Add(-1)
-			item.Complete()
+			e.finishItem(ctx, item, panicked)
 			if e.statsTracker != nil {
 				e.statsTracker.Increment()
 			}
 		}
 	}
+}
+
+// finishItem acknowledges an item only if it was actually processed.
+//
+// The worker's select can win a dequeue in the same instant the context is
+// cancelled, and processItem's first act is to bail out on a cancelled context —
+// so the item came off the queue, did no work, and was then acknowledged anyway.
+// For a DB-backed source an ack is a durable cursor advance: the scan's cursor
+// moved past records nothing ever looked at, and because a curtailed scan still
+// recorded "completed", the next scan-on-receive run inherited that cursor and
+// skipped them permanently. Withholding the ack is what makes those records get
+// re-served.
+//
+// force is for a recovered panic: a poison item that keeps failing must still be
+// acknowledged, or it comes back every run and the cursor never moves past it.
+func (e *Executor) finishItem(ctx context.Context, item *work.WorkItem, force bool) {
+	if !force && ctx.Err() != nil {
+		e.unacked.Add(1)
+		return
+	}
+	item.Complete()
 }
 
 // workerController monitors queue depth and scales workers up or down.
@@ -1240,18 +1405,23 @@ func (e *Executor) workerController(ctx context.Context, itemCh chan *work.WorkI
 	}
 }
 
-func (e *Executor) processItem(ctx context.Context, item *work.WorkItem) {
-	defer e.recoverFromPanic("processItem")
+// processItem runs one work item through the fetch, passive and active stages.
+// It returns whether a panic was recovered, which the caller needs in order to
+// acknowledge the item anyway: a poison item that is never acknowledged is
+// re-served on every subsequent run and freezes the cursor behind it.
+func (e *Executor) processItem(ctx context.Context, item *work.WorkItem) (panicked bool) {
+	// Registered first so it unwinds LAST, after the buffer-return defer below.
+	defer e.recoverFromPanicInto("processItem", &panicked)
 
 	// Bail out early if context is cancelled (graceful shutdown)
 	select {
 	case <-ctx.Done():
-		return
+		return false
 	default:
 	}
 
 	// Track pooled response buffer for deferred return.
-	// Must be declared before recoverFromPanic defer so it runs first (LIFO).
+	// Must be declared before the panic-recovery defer so it runs first (LIFO).
 	//
 	// guard withholds the buffer from the pool when a module call was abandoned
 	// (per-module timeout or phase cancellation) and may still be reading it. See
@@ -1425,6 +1595,7 @@ func (e *Executor) processItem(ctx context.Context, item *work.WorkItem) {
 	if !skipActive {
 		e.runActiveStage(ctx, req, &filter, &elig)
 	}
+	return false
 }
 
 // fetchStaticMetaResponse fetches headers-only metadata for an object-storage
@@ -1662,7 +1833,7 @@ func (e *Executor) runActiveStage(ctx context.Context, req *httpmsg.HttpRequestR
 	}
 
 	// conc.WaitGroup automatically catches panics per goroutine and re-panics
-	// on Wait(), which is caught by the top-level recoverFromPanic("processItem").
+	// on Wait(), which is caught by processItem's top-level panic recovery.
 	var g conc.WaitGroup
 	e.runActivePerHost(ctx, reqClient, req, filter, elig, &g)
 	e.runActivePerRequest(ctx, reqClient, req, filter, elig, &g)
@@ -1677,7 +1848,10 @@ func (e *Executor) saveToDatabase(ctx context.Context, item *work.WorkItem, req 
 	}
 	if item.RecordUUID != "" {
 		// Item maps to an existing DB record — reuse its UUID (skip insert) so
-		// findings link to it instead of creating a duplicate record.
+		// findings link to it instead of creating a duplicate record. Counted as
+		// stored: the question Stored() answers is "is this input in the store",
+		// and for a record that CAME from the store the answer is yes.
+		e.stored.Add(1)
 		e.caches.requestUUIDs.Store(req.Request().ID(), item.RecordUUID)
 
 		// Backfill the response for records stored as request-only stubs (e.g.
@@ -1724,9 +1898,11 @@ func (e *Executor) saveToDatabase(ctx context.Context, item *work.WorkItem, req 
 		ChainTruncated: req.Response() != nil && httpmsg.IsRedirectStatus(req.Response().StatusCode()),
 	})
 	if err != nil {
+		e.storeFailed.Add(1)
 		zap.L().Debug("Failed to save record to database", zap.Error(err))
 		return
 	}
+	e.stored.Add(1)
 	e.caches.requestUUIDs.Store(req.Request().ID(), recordUUID)
 }
 

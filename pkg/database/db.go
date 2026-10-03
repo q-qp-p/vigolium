@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -238,6 +240,60 @@ func NewDBFromBun(bunDB *bun.DB, driver string) *DB {
 	return &DB{DB: bunDB, driver: driver}
 }
 
+// sqliteFileURIPath renders a filesystem path as the path component of a SQLite
+// `file:` URI: absolute, slash-separated, and percent-encoded.
+//
+// Encoding is what makes the URI address the file it names. The driver parses
+// everything after the first '?' as query parameters and everything after '#' as
+// a fragment, so an unencoded path containing either silently became a DIFFERENT
+// database — `/tmp/a#b/run.sqlite` attached `/tmp/a`, and `/tmp/a?b/run.sqlite`
+// lost every parameter after it, including mode=ro. A literal '%' is encoded for
+// the same reason in reverse: `%41` in a real directory name would otherwise be
+// decoded back to 'A'.
+//
+// Made absolute first: a URI filename resolves against the process working
+// directory, not against anything the caller may assume.
+//
+// A '?' is rejected rather than encoded. Measured against the modernc driver in
+// go.mod: it parses the encoded form's %3F back out before SQLite sees it, so
+// the parameters are still lost, and there is no spelling of such a path that
+// works. An error is strictly better than the silent empty database that was
+// there before. (See attachSpec, which hit the same wall from the ATTACH side.)
+func sqliteFileURIPath(path string) (string, error) {
+	if strings.Contains(path, "?") {
+		return "", fmt.Errorf("cannot open %q: the SQLite driver cannot address a path containing '?'", path)
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve database path %q: %w", path, err)
+	}
+	if runtime.GOOS == "windows" {
+		// A Windows URI path is "/C:/dir/file", with forward slashes.
+		abs = "/" + filepath.ToSlash(abs)
+	}
+	return (&url.URL{Path: abs}).EscapedPath(), nil
+}
+
+// sqliteDSNFilename renders path for the read-WRITE DSN, which the driver reads
+// as a bare filename unless it begins with "file:".
+//
+// Only a path carrying '?', '#' or '%' is promoted to a URI; everything else is
+// returned untouched. That asymmetry is deliberate: a bare filename needs no
+// encoding and is what every existing deployment's DSN already looks like, so
+// promoting all of them would change behaviour for millions of paths to fix the
+// handful that were broken. ":memory:" is likewise passed through — it is not a
+// path and a URI form of it means something else entirely.
+func sqliteDSNFilename(path string) (string, error) {
+	if path == ":memory:" || !strings.ContainsAny(path, "?#%") {
+		return path, nil
+	}
+	uri, err := sqliteFileURIPath(path)
+	if err != nil {
+		return "", err
+	}
+	return "file:" + uri, nil
+}
+
 // openSQLiteReadOnly opens an existing SQLite file without modifying it.
 //
 // Three things are deliberately omitted relative to the read-write path, because
@@ -270,9 +326,13 @@ func openSQLiteReadOnly(path string, cfg *config.SQLiteConfig) (*sql.DB, error) 
 		return nil, fmt.Errorf("database file not readable: %w", err)
 	}
 
+	uri, err := sqliteFileURIPath(path)
+	if err != nil {
+		return nil, err
+	}
 	dsn := fmt.Sprintf(
 		"file:%s?mode=ro&_pragma=busy_timeout(%d)&_pragma=query_only(1)&_pragma=cache_size(%d)&_pragma=temp_store(memory)&_pragma=mmap_size(%d)",
-		path, cfg.BusyTimeout, cfg.CacheSize, sqliteMmapSize,
+		uri, cfg.BusyTimeout, cfg.CacheSize, sqliteMmapSize,
 	)
 	sqldb, err := sql.Open(sqliteshim.ShimName, dsn)
 	if err != nil {
@@ -380,9 +440,19 @@ func openSQLite(cfg *config.SQLiteConfig) (*sql.DB, error) {
 	// matching the deparos sitemap driver. Without wal_autocheckpoint the main
 	// ingest DB ran on the SQLite default with no periodic reclaim path of its
 	// own; the WAL could balloon to GB over a multi-day server run.
+	//
+	// The filename half is left exactly as it was unless it contains a character
+	// the driver would misread — see sqliteDSNFilename. Every other DSN this
+	// process builds therefore stays byte-identical to the one it built before,
+	// which keeps the blast radius of the encoding fix on the paths that were
+	// already broken.
+	dsnPath, err := sqliteDSNFilename(path)
+	if err != nil {
+		return nil, err
+	}
 	dsn := fmt.Sprintf(
 		"%s?_pragma=busy_timeout(%d)&_pragma=journal_mode(%s)&_pragma=synchronous(%s)&_pragma=cache_size(%d)&_pragma=wal_autocheckpoint(%d)&_pragma=temp_store(memory)&_pragma=mmap_size(%d)&_txlock=immediate",
-		path,
+		dsnPath,
 		cfg.BusyTimeout,
 		cfg.JournalMode,
 		cfg.Synchronous,
@@ -1151,6 +1221,13 @@ var columnMigrations = []columnMigration{
 	{"scopes", "last_matched_at", "TIMESTAMP"},
 	{"authentication_hostnames", "session_token", "TEXT"},
 	{"authentication_hostnames", "hydrated_at", "TIMESTAMP"},
+	// Scan completeness. Nullable with NO default on purpose: an empty value
+	// means "unknown", which is what a row written by an older binary — or by a
+	// caller that has no outcome data — honestly is. A DEFAULT of 'complete'
+	// would retroactively declare every historical scan fully covered.
+	{"scans", "completeness", "TEXT"},
+	{"scans", "stop_reason", "TEXT"},
+	{"scans", "phase_outcomes", "TEXT"},
 }
 
 func init() {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -80,6 +81,14 @@ func (r *Runner) emitSpiderDOMXssFindings(ctx context.Context, scanUUID string, 
 func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error {
 	phaseStart := time.Now()
 
+	// phaseCtx owns everything this phase starts: the deparos producer goroutine,
+	// the concurrent-source readers and the executor. Cancelling it after Execute
+	// returns is what stops the producer from burning the rest of a target's
+	// MaxDuration on work nobody will read. ctx itself stays live for the
+	// post-phase bookkeeping below.
+	phaseCtx, phaseCancel := context.WithCancel(ctx)
+	defer phaseCancel()
+
 	var sources []source.InputSource
 	var discoveryTargets []string
 
@@ -144,12 +153,33 @@ func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error
 
 		discoveryTargets = dedupTargets(r.options.Targets, additionalTargets)
 		deparosCfg := r.buildDeparosConfig(additionalTargets)
-		src, srcErr := source.NewDeparosDiscoverySource(deparosCfg)
+		// The egress seam. Deparos has its own HTTP client, so the executor's scope
+		// check (which runs on records it has already fetched) could only ever
+		// discard an excluded host's response AFTER contacting it. An explicit
+		// exclusion is a request not to contact it, so it is enforced here: the
+		// engine refuses the request before sending, and never queues the link.
+		//
+		// Explicit denials only — see ScopeMatcher.ExplicitlyExcluded and triage
+		// C12. Include lists and origin mode stay with ScopeMode, which already
+		// decides how wide the crawl goes.
+		if matcher := infra.scopeMatcher; matcher != nil {
+			deparosCfg.RequestFilter = func(u *neturl.URL) bool {
+				if u == nil {
+					return true
+				}
+				return !matcher.ExplicitlyExcluded(u.Hostname(), u.Path)
+			}
+		}
+		src, srcErr := source.NewDeparosDiscoverySource(phaseCtx, deparosCfg)
 		if srcErr != nil {
 			zap.L().Warn("Failed to initialize deparos discovery", zap.Error(srcErr))
 		} else {
 			discoverSrc = src
 			sources = append(sources, discoverSrc)
+			// Deparos' traffic does not pass through the shared requester, so without
+			// this the phase reported ≈0 requests for the crawl that produced every
+			// record it emitted.
+			r.currentPhase.Load().addCounter(discoverSrc.RequestsSent)
 		}
 	} else {
 		discoveryTargets = r.options.Targets
@@ -161,14 +191,23 @@ func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error
 	if len(sources) == 1 {
 		compositeSource = sources[0]
 	} else {
-		compositeSource = source.NewConcurrentMultiSource(sources...)
+		compositeSource = source.NewConcurrentMultiSource(phaseCtx, sources...)
 	}
 
 	r.printPhaseStart("Discovery", "ingest inputs and discover directories, files, and hidden endpoints via Deparos content discovery")
 
-	speedDetail := fmt.Sprintf("Speed: concurrency=%s, max-per-host=%s",
-		terminal.HiBlue(fmt.Sprintf("%d", r.options.Concurrency)),
-		terminal.HiBlue(fmt.Sprintf("%d", r.options.MaxPerHost)))
+	// Only the dials discovery actually applies (config.phasePaceSupport): the
+	// engine's thread count and, when one is explicitly configured, its request
+	// rate. max-per-host used to be printed here and has never been enforced on
+	// this phase — deparos has its own HTTP client and no host semaphore — and the
+	// concurrency printed was the global value rather than the section's.
+	rateDetail := "unlimited"
+	if rate := r.discoveryRateLimit(); rate > 0 {
+		rateDetail = fmt.Sprintf("%d/s", rate)
+	}
+	speedDetail := fmt.Sprintf("Speed: threads=%s, rate-limit=%s",
+		terminal.HiBlue(fmt.Sprintf("%d", r.discoveryConcurrency())),
+		terminal.HiBlue(rateDetail))
 	// The option is what buildDeparosConfig hands the phase, so it is what gets
 	// reported.
 	if budget := PhaseSpeedDetail(r.settings, "discovery", r.options.DiscoverMaxDuration); budget != "" {
@@ -185,6 +224,10 @@ func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error
 
 	if r.autoFuzzDiscovery && !r.options.Silent {
 		reason := fmt.Sprintf("spidering found little content (%d records)", r.spidering.records)
+		if !r.spidering.complete {
+			reason = fmt.Sprintf("spidering kept little content (%d records; capture incomplete, %d lost)",
+				r.spidering.records, r.spidering.lost)
+		}
 		if r.spidering.sawSSO {
 			reason = "spidering hit an SSO/login wall"
 		}
@@ -294,10 +337,24 @@ func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error
 	}
 
 	executor := core.NewExecutor(executorCfg, compositeSource, nil, discoveryPassive)
-	_, err := executor.Execute(ctx)
-	if discoveryRecordWriter != nil {
-		discoveryRecordWriter.Close()
+	_, err := executor.Execute(phaseCtx)
+	r.currentPhase.Load().noteExecution(executor.Report())
+
+	// Shut down in producer-then-writer order: phaseCancel stops the deparos
+	// engine and the concurrent readers, Close joins the producer so the records
+	// it already collected are persisted (bounded by DrainTimeout), and only then
+	// is the record writer drained — it is what those records are written through.
+	//
+	// compositeSource is deliberately NOT closed: when more than one source was
+	// merged it wraps r.inputSource, whose lifetime belongs to releaseResources,
+	// and closing it here would tear down an input later phases still read.
+	phaseCancel()
+	if discoverSrc != nil {
+		if closeErr := discoverSrc.Close(); closeErr != nil {
+			zap.L().Warn("Discovery: failed to close deparos source", zap.Error(closeErr))
+		}
 	}
+	r.shutdownWriters("discovery", discoveryRecordWriter)
 	if err != nil {
 		return err
 	}
@@ -334,9 +391,61 @@ func (r *Runner) runDiscoveryPhase(ctx context.Context, infra *phaseInfra) error
 				terminal.HiTeal(fmt.Sprintf("%d", stats.ClusterCap)),
 				formatStatusCodeArray(stats.CappedCodes)))
 		}
+		r.reportDiscoveryCoverage(stats)
 	}
 
 	return nil
+}
+
+// reportDiscoveryCoverage reports what the phase did NOT get to, on both
+// channels: an operator-facing stderr line, and a structured reason on the
+// phase's outcome.
+//
+// Discovery used to log per-target failures at warn level and move on, so a run
+// where every target errored, timed out, or was cancelled before it started
+// looked exactly like a run that honestly found nothing. Both channels carry it
+// because they answer different questions: the stderr line tells the operator
+// watching the scan, the reason tells the scan row and the event stream — and a
+// driver reading `--events` has no stderr to scrape.
+//
+// Timed-out targets are a LIMIT, not a reason: a per-target time box doing its
+// job is configured behaviour, and marking it as degraded coverage would flag
+// every properly bounded discovery run.
+func (r *Runner) reportDiscoveryCoverage(stats source.DiscoveryStats) {
+	tracker := r.currentPhase.Load()
+
+	if stats.TargetsFailed > 0 {
+		msg := fmt.Sprintf("%s target(s) failed discovery",
+			terminal.Orange(fmt.Sprintf("%d", stats.TargetsFailed)))
+		if len(stats.TargetErrors) > 0 {
+			msg += " — " + terminal.Gray(stats.TargetErrors[0])
+		}
+		r.printPhaseFeedback("Discovery", msg)
+		tracker.markPartial(database.ReasonTargetsFailed)
+	}
+	if stats.TargetsTimedOut > 0 {
+		r.printPhaseFeedback("Discovery", fmt.Sprintf(
+			"%s target(s) hit their discovery time budget — coverage is partial",
+			terminal.Orange(fmt.Sprintf("%d", stats.TargetsTimedOut))))
+		tracker.noteLimit(database.LimitTargetBudget)
+	}
+	if stats.TargetsSkipped > 0 {
+		r.printPhaseFeedback("Discovery", fmt.Sprintf(
+			"%s target(s) never attempted — the phase stopped first",
+			terminal.Orange(fmt.Sprintf("%d", stats.TargetsSkipped))))
+		tracker.markPartial(database.ReasonTargetsSkipped)
+	}
+	if stats.ImportFailed > 0 {
+		r.printPhaseFeedback("Discovery", fmt.Sprintf(
+			"%s discovered record(s) could not be stored",
+			terminal.Orange(fmt.Sprintf("%d", stats.ImportFailed))))
+		tracker.markPartial(database.ReasonPersistence)
+	}
+	if stats.Abandoned {
+		r.printPhaseFeedback("Discovery", terminal.Orange(
+			"the discovery producer did not exit in time and was abandoned; some discovered records may be missing"))
+		tracker.markPartial(database.ReasonProducerAbandoned)
+	}
 }
 
 // printDiscoveryStatusLines prints the Discovery phase's content-discovery status
@@ -512,6 +621,7 @@ func (r *Runner) seedCLITargets(ctx context.Context, infra *phaseInfra) error {
 
 	executor := core.NewExecutor(executorCfg, r.inputSource, nil, nil)
 	_, err := executor.Execute(ctx)
+	r.currentPhase.Load().noteExecution(executor.Report())
 	if err != nil {
 		return err
 	}
@@ -559,7 +669,10 @@ func spideringPhaseCeiling(maxDuration time.Duration, numTargets int) time.Durat
 // close, record-writer drain) is bounded and quick; this only fires on a true
 // hang — e.g. an unresponsive/anti-bot browser, or a rod CDP call without a
 // bound — guaranteeing the spidering phase can never block the scan forever.
-const spideringTeardownGrace = 90 * time.Second
+//
+// A var, not a const, only so a test can shorten it: a wedged-teardown test at
+// the production value would take 90 seconds.
+var spideringTeardownGrace = 90 * time.Second
 
 // runWithWatchdog runs work in a goroutine and returns its result, or — if work
 // does not finish within timeout — calls onTimeout and returns that instead,
@@ -598,6 +711,39 @@ type crawlOutcome struct {
 	res    *spitolas.SpiderResult
 	err    error
 	wedged bool
+}
+
+// capture is the receipt a phase total should fold in for this crawl.
+//
+// A wedged crawl has no trustworthy receipt — the watchdog abandoned it with the
+// writer still open — so it contributes an explicitly incomplete one. An
+// ordinary failure does have a receipt: RunSpider returns a partial result
+// carrying it alongside the error, deliberately, so a failed crawl's account is
+// not lost. A crawl with neither contributes nothing.
+func (oc crawlOutcome) capture() spitolas.CaptureReceipt {
+	switch {
+	case oc.wedged:
+		return spitolas.IncompleteCaptureReceipt()
+	case oc.res != nil:
+		return oc.res.Capture
+	default:
+		return spitolas.CaptureReceipt{}
+	}
+}
+
+// sessionCapture is the receipt a phase total should fold in for a shared
+// SpiderSession, and the one place that decides whether to close it.
+//
+// A session abandoned after a wedged crawl is left to the process to reclaim,
+// exactly as the per-target watchdog does — closing a browser that did not
+// answer would hang the phase we are trying to protect — so its running
+// snapshot (never complete) is the account. A live session is closed, which
+// yields its final receipt.
+func sessionCapture(sess respiderSession, rw *database.RecordWriter, abandoned bool) spitolas.CaptureReceipt {
+	if abandoned {
+		return sess.Receipt()
+	}
+	return closeReSpiderSession(sess, rw)
 }
 
 // dumpWedgedGoroutines logs the watchdog's diagnosis: which operation hung, and
@@ -655,22 +801,115 @@ func runReSpiderSessionCrawl(ctx context.Context, sess *spitolas.SpiderSession, 
 	return oc
 }
 
+// respiderSession is what closeReSpiderSession needs of a SpiderSession: drain
+// it, give up on it, and report what its capture got.
+//
+// An interface purely so the teardown-watchdog path is testable without a
+// browser — and specifically so the kill-on-wedge escalation is. That branch only
+// runs when a real Chromium has stopped answering, which no unit test can arrange.
+// *spitolas.SpiderSession is the only production implementation.
+type respiderSession interface {
+	Close() error
+	Kill()
+	Receipt() spitolas.CaptureReceipt
+}
+
 // closeReSpiderSession flushes and tears down a shared SpiderSession (and its
 // backing RecordWriter) under a teardown watchdog, so a wedged browser close
-// can't hang the phase.
-func closeReSpiderSession(sess *spitolas.SpiderSession, rw *database.RecordWriter) {
-	_, _ = runWithWatchdog(
+// can't hang the phase. It returns the session's capture receipt: final when
+// the close completed, the running snapshot (never complete) when the watchdog
+// abandoned it.
+func closeReSpiderSession(sess respiderSession, rw *database.RecordWriter) spitolas.CaptureReceipt {
+	rc, _ := runWithWatchdog(
 		spideringTeardownGrace,
-		func() struct{} {
-			_ = sess.Close()
+		func() spitolas.CaptureReceipt {
+			if err := sess.Close(); err != nil {
+				zap.L().Warn("Spider session closed with lost records", zap.Error(err))
+			}
 			rw.Close()
-			return struct{}{}
+			return sess.Receipt()
 		},
-		func() struct{} {
-			zap.L().Error("Re-spider session-close watchdog fired — browser teardown wedged; leaking until exit")
-			return struct{}{}
+		func() spitolas.CaptureReceipt {
+			zap.L().Error("Re-spider session-close watchdog fired — browser teardown wedged; killing the browser process")
+			// The abandoned Close goroutine still holds the browser's and the
+			// pool's locks, so Kill deliberately takes neither (see
+			// SpiderSession.Kill). In its own goroutine because the launcher's kill
+			// has a built-in wait and this path exists to return promptly.
+			go sess.Kill()
+			return sess.Receipt()
 		},
 	)
+	return rc
+}
+
+// captureOutcome maps a browser capture receipt onto the persistence vocabulary
+// the scan row and the event stream report.
+//
+// The two types stay separate deliberately — see spitolas.CaptureReceipt. The
+// receipt distinguishes Refused (known turned away) from the writer's Unknown
+// (may have landed), and a spec-ingested endpoint can legitimately push
+// Persisted past Accepted; collapsing them would lose the first distinction and
+// produce negative counts on the second. This is the translation, not a merge.
+func captureOutcome(rc spitolas.CaptureReceipt) database.PersistenceOutcome {
+	if !rc.Enabled {
+		return database.PersistenceOutcome{}
+	}
+	o := database.PersistenceOutcome{
+		Writer:    database.PersistenceWriterRecords,
+		Accepted:  int64(rc.Accepted),
+		Committed: int64(rc.Persisted),
+		// Refused and Failed are both "captured and did not reach the database",
+		// which is what Failed means on this side; Unknown is reserved for the
+		// entries an abandoned drain never resolved either way.
+		Failed: int64(rc.Lost()),
+	}
+	if !rc.DrainComplete {
+		o.TimedOut = true
+		// Clamped: Persisted counts spec-ingested rows the capture never
+		// accepted, so the difference can be negative without anything being
+		// wrong.
+		if unknown := o.Accepted - o.Committed - o.Failed; unknown > 0 {
+			o.Unknown = unknown
+		}
+	}
+	return o
+}
+
+// recordCapture folds a phase's total browser-capture receipt into its outcome,
+// so a crawl that lost records says so where every other lost write does — on
+// the phase outcome, hence in phase_outcomes and on scan.finished.
+//
+// Spidering and re-spider were the only phases left whose writer loss reached
+// nothing but a yellow suffix on a stderr line: they close their RecordWriter
+// fire-and-forget rather than through shutdownWriters, so a crawl that lost its
+// entire corpus to a failing database still wrote state: "completed".
+//
+// Both halves are needed. addPersistence marks the phase partial on Failed or
+// Unknown; a receipt abandoned before its writer drained carries NO counts at
+// all (IncompleteCaptureReceipt), so it is clean by that rule and lost by the
+// receipt's own. The receipt is the authority on whether capture is accounted
+// for, so its verdict is applied directly. markPartial is idempotent per code,
+// so the overlapping case records one reason.
+func recordCapture(t *phaseTracker, rc spitolas.CaptureReceipt) {
+	if !rc.Enabled {
+		return
+	}
+	t.addPersistence(captureOutcome(rc))
+	if !rc.Clean() {
+		t.markPartial(database.ReasonPersistence)
+	}
+}
+
+// captureIncompleteNote is the completion-line suffix for a phase whose
+// capture lost records or never finished draining; "" when nothing was lost.
+func captureIncompleteNote(rc spitolas.CaptureReceipt) string {
+	if rc.Clean() {
+		return ""
+	}
+	if lost := rc.Lost(); lost > 0 {
+		return fmt.Sprintf(" (%d failed — run incomplete)", lost)
+	}
+	return " (capture did not finish draining — run incomplete)"
 }
 
 // groupByHost groups items by the host their key function returns, preserving
@@ -709,7 +948,9 @@ func groupByHost[T any](items []T, host func(T) string) [][]T {
 // decision, and keeping two copies is how a field added to one phase silently
 // goes missing from the other.
 func (r *Runner) buildSpiderConfig(target string, settingsCfg config.SpideringConfig, maxDuration time.Duration, infra *phaseInfra) spitolas.SpiderConfig {
-	loginCredsAttempts, loginCredsFull := loginCredsPolicy(r.options.Intensity)
+	rp := resolveBrowserPolicy(settingsCfg, r.options.Intensity)
+	policy := rp.policy
+	compat := resolveBrowserCompat(settingsCfg)
 	// Bridge the operator's session/custom headers into the browser so the crawl
 	// explores authenticated content, not just the login shell.
 	browserCookies, browserHeaders := browserAuthFromHeaders(r.options.Headers)
@@ -730,24 +971,30 @@ func (r *Runner) buildSpiderConfig(target string, settingsCfg config.SpideringCo
 		BrowserEngine:       settingsCfg.BrowserEngine,
 		BrowserPath:         settingsCfg.BrowserPath,
 		NoCDP:               settingsCfg.NoCDP,
-		NoForms:             settingsCfg.NoForms,
 		ProxyURL:            r.options.ProxyURL,
 		ProjectUUID:         r.options.ProjectUUID,
-		// Common-credential login attempts against confirmed local login forms:
-		// on at balanced (minimal list) and deep (full list), off at quick/lite
-		// (lockout/authorization risk).
-		LoginCredentialAttempts: loginCredsAttempts,
-		LoginCredentialFullList: loginCredsFull,
-		// Completing a signup creates an account, so it rides the same intensity
-		// gate as the credential pass but only at deep — unless the operator asked
-		// for it explicitly in config.
-		SelfRegister:   settingsCfg.SelfRegister || strings.EqualFold(r.options.Intensity, "deep"),
-		InitialCookies: browserCookies,
-		ExtraHeaders:   browserHeaders,
+		// The resolved interaction policy is authoritative; the legacy switches
+		// below mirror it so a reader of either sees the same decision.
+		// Credential attempts default on at balanced (minimal list) and deep
+		// (full list), off at quick/lite; registration is off unless configured
+		// at any intensity. See resolveAccountActions.
+		Policy:                  &policy,
+		BrowserCompat:           &compat,
+		NoForms:                 !policy.EditFields && !policy.SubmitForms,
+		LoginCredentialAttempts: policy.LoginAttempts,
+		LoginCredentialFullList: rp.fullList,
+		SelfRegister:            policy.RegisterAccount,
+		IdentityEmailDomain:     settingsCfg.IdentityEmailDomain,
+		MaxCaptureBodyBytes:     settingsCfg.MaxCaptureBodyBytes,
+		InitialCookies:          browserCookies,
+		ExtraHeaders:            browserHeaders,
+		RequireAuth:             settingsCfg.RequireAuth,
 		// A directory, not a path: the crawl names its own file from the target it
 		// actually runs against, so a session reusing this config across a host's
 		// seeds still writes each graph under the right name.
-		GraphOutputDir: settingsCfg.GraphOutputDir,
+		GraphOutputDir:     settingsCfg.GraphOutputDir,
+		GraphIncludeValues: settingsCfg.GraphIncludeValues,
+		RunID:              infra.scanUUID,
 	}
 
 	if infra.scopeMatcher != nil && !infra.scopeMatcher.IsPassAll() {
@@ -840,7 +1087,14 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 	if utils.EnvTruthy(spitolas.EnvBrowserHeaded) {
 		settingsCfg.Headless = false
 	}
+	// Each target runs under context.WithTimeout(phaseCtx, maxDuration), so a
+	// non-positive budget here is an already-expired deadline, not "unlimited".
+	// MaxDurationParsed guarantees a positive value; this catches the nil-settings
+	// path, which would otherwise crawl nothing without saying so.
 	maxDuration := SpideringBudget(r.settings, r.options)
+	if maxDuration <= 0 {
+		maxDuration = config.DefaultSpideringConfig().MaxDurationParsed()
+	}
 
 	targets := r.options.Targets
 	dbHosts := r.getInScopeHostURLs(ctx)
@@ -879,20 +1133,30 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 		}
 	}
 
-	formsState := "on"
-	if settingsCfg.NoForms {
-		formsState = "off"
-	}
-	configDetail := fmt.Sprintf("Config: strategy=%s, max-depth=%s, max-states=%s, forms=%s, headless=%s",
+	configDetail := fmt.Sprintf("Config: strategy=%s, max-depth=%s, max-states=%s, headless=%s",
 		terminal.HiTeal(settingsCfg.Strategy),
 		terminal.HiTeal(fmt.Sprintf("%d", settingsCfg.MaxDepth)),
 		terminal.HiTeal(fmt.Sprintf("%d", settingsCfg.MaxStates)),
-		terminal.HiTeal(formsState),
 		terminal.HiTeal(fmt.Sprintf("%v", settingsCfg.Headless)))
 	if budget := PhaseSpeedDetail(r.settings, "spidering", maxDuration); budget != "" {
 		configDetail += ", " + budget
 	}
 	r.printPhaseDetail(configDetail)
+	// What the browser may change, resolved once for the phase. Every target's
+	// config resolves the same policy from the same settings (buildSpiderConfig),
+	// so this line and the conflict warnings describe all of them.
+	policy := resolveBrowserPolicy(settingsCfg, r.options.Intensity)
+	for _, c := range policy.conflicts {
+		zap.L().Warn("Spidering: interaction policy key overrides a legacy key", zap.String("override", c))
+	}
+	r.printPhaseDetail("Policy: " + terminal.HiTeal(policy.detail()))
+	r.printPhaseDetail("Browser security: " + terminal.HiTeal(securityDetail(spitolas.EffectiveBrowserSecurity(resolveBrowserCompat(settingsCfg)))))
+	if infra.scopeMatcher != nil && !infra.scopeMatcher.IsPassAll() {
+		// The in-page primers fetch only what the operator scope admits; the
+		// service-worker primer fetches inside its own script and cannot be held
+		// to a path boundary, so a custom scope turns it off.
+		r.printPhaseDetail("Priming: " + terminal.HiTeal("in-page fetches limited to the operator scope, service_worker=off (custom scope)"))
+	}
 	r.printTargetDetail(r.formatTargetCounts(ctx, len(targets)))
 	r.printVerboseTargets(targets)
 
@@ -905,12 +1169,19 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 	// whatever budget remains and any targets beyond it are skipped (logged).
 	// phaseDeadline treats a zero ceiling (unlimited max-duration) as unbounded.
 	phaseCeiling := spideringPhaseCeiling(maxDuration, len(targets))
-	phaseCtx, phaseCancel := phaseDeadline(ctx, phaseCeiling)
+	phaseCtx, phaseCancel := r.trackedPhaseDeadline(ctx, phaseCeiling)
 	defer phaseCancel()
 
-	var totalStates, totalActions, totalRecords int
+	var totalStates, totalActions, totalRecords, totalPrevented, totalUncertain int
+	// phaseCapture sums the final capture receipts: one per RunSpider, one per
+	// closed (or abandoned) session. Per-seed session receipts are deltas of a
+	// still-open writer and are not summed.
+	var phaseCapture spitolas.CaptureReceipt
 	var ssoHosts []string
 	var skippedTargets int
+	// Targets that used their whole per-target budget. Reported as a LIMIT, not a
+	// defect: the time box did what it was configured to do.
+	var budgetExhaustedTargets int
 
 	// Carry the browser's WAF/bot-cleared session (cookies + optionally its UA)
 	// forward into discovery and scanning. On by default; scoped per-host below.
@@ -970,6 +1241,13 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 				cfg := r.buildSpiderConfig(target, settingsCfg, maxDuration, infra)
 				rw := database.NewRecordWriter(r.repository, database.RecordWriterConfig{})
 				oc = runSpiderWatchdog(timeoutCtx, cfg, rw, maxDuration, target)
+				phaseCapture.Merge(oc.capture())
+			}
+			// Asked BEFORE cancel(): cancelling a context whose deadline had not
+			// fired overwrites Err with Canceled, and the question "did this target
+			// use its whole budget" then has no answer.
+			if targetBudgetExhausted(timeoutCtx, phaseCtx) {
+				budgetExhaustedTargets++
 			}
 			cancel()
 
@@ -989,8 +1267,14 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 					// one unreachable target.
 					abandoned = oc.wedged
 					if abandoned {
-						zap.L().Warn("Spidering: browser wedged, abandoning shared session for host (leaks until exit)",
+						zap.L().Warn("Spidering: browser wedged, abandoning shared session for host and killing its browser process",
 							zap.String("target", target))
+						// Abandoned means nothing will ever close this session, so the
+						// Chromium process and its profile would live for the rest of the
+						// scan — one per wedged host group. Kill takes no lock the wedged
+						// crawl goroutine might hold; its own goroutine because the
+						// launcher's kill waits for the process to go.
+						go sess.Kill()
 					} else {
 						zap.L().Warn("Spidering: crawl failed, closing shared browser session for host",
 							zap.String("target", target))
@@ -1009,6 +1293,8 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 			totalStates += result.StatesDiscovered
 			totalActions += result.ActionsExecuted
 			totalRecords += result.RecordsSaved
+			totalPrevented += result.FormSubmitsPrevented
+			totalUncertain += result.FormSubmitsUncertain
 
 			if carrySession && (len(result.HarvestedCookies) > 0 || result.HarvestedAuthorization != "") {
 				// Scope the session to the host the crawl actually settled on: the
@@ -1031,7 +1317,15 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 					// shared browser session under that name, and shadowing it here
 					// would make a later `sess.Close()` in this block close the wrong
 					// thing while still compiling.
-					carried := httpmsg.CarriedSession{CookieHeader: cookieHeader}
+					// Both forms: Cookies is authoritative on the HTTP path
+					// (evaluated per request, so a /admin or Secure cookie is
+					// not sent where a browser wouldn't send it), CookieHeader
+					// remains the flat summary and the fallback for consumers
+					// that cannot evaluate a jar.
+					carried := httpmsg.CarriedSession{
+						CookieHeader: cookieHeader,
+						Cookies:      httpmsg.CarriedCookiesFromHTTP(sessionHost, result.HarvestedCookies),
+					}
 					if carryUA {
 						carried.UserAgent = result.BrowserUserAgent
 					}
@@ -1058,7 +1352,45 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 				zap.String("target", target),
 				zap.Int("states", result.StatesDiscovered),
 				zap.Int("actions", result.ActionsExecuted),
-				zap.Int("records_saved", result.RecordsSaved))
+				zap.Int("records_saved", result.RecordsSaved),
+				zap.Int("forms_submitted", result.FormsSubmitted),
+				zap.Int("form_submits_prevented", result.FormSubmitsPrevented),
+				zap.Int("form_submits_uncertain", result.FormSubmitsUncertain),
+				zap.Int("records_failed", result.Capture.Failed+result.Capture.Refused),
+				zap.Int("wait_conditions_failed", result.WaitConditionsFailed),
+				zap.String("auth_state", result.AuthState),
+				zap.Int("aux_fetches_denied", result.AuxFetchesDenied),
+				zap.Strings("credential_hosts_denied", result.CredentialHostsDenied))
+
+			// Configured authentication that did not reach the browser means this
+			// target was (at least partly) crawled anonymously — say so rather
+			// than let it read as an authenticated crawl.
+			if result.AuthState == spitolas.AuthFailed {
+				r.printPhaseDetail(fmt.Sprintf("%s %s: configured authentication could not be applied to the browser — crawled unauthenticated (set spidering.require_auth or --require-auth to fail instead).",
+					terminal.Yellow(terminal.SymbolWarning),
+					terminal.Gray(target)))
+				// The same code the HTTP path records when a configured session
+				// could not be established. Without it, whether an operator's
+				// scan row says `auth_unavailable` depended on which subsystem
+				// failed to log in, not on whether the login failed.
+				r.currentPhase.Load().markPartial(database.ReasonAuthUnavailable)
+			}
+			if len(result.CredentialHostsDenied) > 0 {
+				r.printPhaseDetail(fmt.Sprintf("%s %s: credential headers withheld from %s (outside the operator scope).",
+					terminal.Gray(terminal.SymbolArrow),
+					terminal.Gray(target),
+					strings.Join(result.CredentialHostsDenied, ", ")))
+			}
+
+			// A readiness condition that never met explains a thin crawl better
+			// than "the site has little content" does.
+			if result.WaitConditionsFailed > 0 {
+				r.printPhaseDetail(fmt.Sprintf("%s %s: %s readiness condition(s) never met (%s) — the crawl saw the page before it was ready.",
+					terminal.Yellow(terminal.SymbolWarning),
+					terminal.Gray(target),
+					terminal.Orange(fmt.Sprintf("%d", result.WaitConditionsFailed)),
+					strings.Join(result.WaitConditionFailures, ", ")))
+			}
 
 			// A landing whose "Log on" CTA was driven means the crawler entered the
 			// app's OAuth/SAML/SSO flow — surface it so the captured login-flow URLs
@@ -1110,11 +1442,8 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 			r.reportSpiderCoverage(result, target)
 		}
 
-		// A session abandoned after a wedged crawl is left to the process to
-		// reclaim, exactly as the per-target watchdog does — closing a browser that
-		// did not answer would hang the phase we are trying to protect.
-		if sess != nil && !abandoned {
-			closeReSpiderSession(sess, sessRW)
+		if sess != nil {
+			phaseCapture.Merge(sessionCapture(sess, sessRW, abandoned))
 		}
 	}
 
@@ -1148,6 +1477,8 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 	r.spidering = spideringOutcome{
 		ran:      true,
 		records:  totalRecords,
+		lost:     phaseCapture.Lost(),
+		complete: phaseCapture.Clean(),
 		sawSSO:   len(ssoHosts) > 0,
 		ssoHosts: ssoHosts,
 	}
@@ -1159,17 +1490,40 @@ func (r *Runner) runSpideringPhase(ctx context.Context, infra *phaseInfra) error
 	}
 
 	elapsed := time.Since(phaseStart)
-	completion := fmt.Sprintf("completed — %s records, %s states, %s actions in %s",
+	completion := fmt.Sprintf("completed — %s records%s, %s states, %s actions in %s",
 		terminal.Orange(fmt.Sprintf("%d", totalRecords)),
+		terminal.Yellow(captureIncompleteNote(phaseCapture)),
 		terminal.Orange(fmt.Sprintf("%d", totalStates)),
 		terminal.Orange(fmt.Sprintf("%d", totalActions)),
 		terminal.HiPurple(fmtDuration(elapsed)))
+	if totalPrevented > 0 {
+		completion += fmt.Sprintf(", %s form submission(s) prevented by policy",
+			terminal.Yellow(fmt.Sprintf("%d", totalPrevented)))
+	}
+	if totalUncertain > 0 {
+		completion += fmt.Sprintf(", %s POST form(s) with an uncertain outcome — dependent writes stopped (no fallback, no retry)",
+			terminal.Yellow(fmt.Sprintf("%d", totalUncertain)))
+	}
 	if skippedTargets > 0 {
 		completion += fmt.Sprintf(" (%s targets skipped — phase budget ceiling of %s reached)",
 			terminal.Yellow(fmt.Sprintf("%d", skippedTargets)),
 			terminal.Yellow(fmtDuration(phaseCeiling)))
 	}
 	r.printPhaseComplete("Spidering", completion)
+
+	// The two coverage facts this phase owns, onto the phase outcome: targets the
+	// ceiling never let it reach (a gap), and targets that spent their whole
+	// per-target budget (a configured bound, hence a limit).
+	tracker := r.currentPhase.Load()
+	if skippedTargets > 0 {
+		tracker.markPartial(database.ReasonTargetsSkipped)
+	}
+	if budgetExhaustedTargets > 0 {
+		tracker.noteLimit(database.LimitTargetBudget)
+	}
+	// What the browser capture actually managed to persist — the same fact the
+	// HTTP phases get from shutdownWriters.
+	recordCapture(tracker, phaseCapture)
 	// Name the way out at the moment it bit. The ceiling is not a pace the flags
 	// can widen — the phase crawls one host at a time — so an operator told only
 	// that N targets were dropped has no move to make from that line alone. The

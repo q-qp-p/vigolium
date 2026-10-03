@@ -1,0 +1,241 @@
+name: Package release
+
+# Manual, like CI: select a published stable tag. Building never publishes to
+# third-party registries. Attaching new assets is a separate explicit input.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
+      attach_release_assets:
+        description: Attach verified DEB/RPM packages and recipes to this release
+        default: false
+        type: boolean
+      build_snap:
+        description: Also build classic snaps (no Store upload)
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Validate requested tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          python3 - <<'PY'
+          import os, re
+          assert re.fullmatch(r'v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', os.environ['RELEASE_TAG']), 'stable tag required'
+          PY
+      - name: Check out notices from the release source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+          path: release-source
+          sparse-checkout: |
+            LICENSE
+            THIRD_PARTY_NOTICES.md
+          sparse-checkout-cone-mode: false
+      - name: Download existing release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release download "$RELEASE_TAG" --dir build/dist-public \
+            --pattern 'vigolium_*.tar.gz' --pattern 'vigolium_*.zip' \
+            --pattern checksums.txt --pattern metadata.json
+          python3 - <<'PY'
+          import json, os
+          metadata = json.load(open('build/dist-public/metadata.json'))
+          assert metadata['version'] == os.environ['RELEASE_TAG'], 'release tag/metadata mismatch'
+          PY
+      - name: Verify and generate package recipes
+        run: |
+          make packages-test
+          python3 build/packaging/generate.py --notices-dir release-source
+      - id: version
+        run: |
+          python3 - <<'PY'
+          import json, os
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('version=' + json.load(open('build/dist-packages/release.json'))['version'] + '\n')
+          PY
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Install pinned nFPM and build Linux packages
+        run: |
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0
+          make packages-linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vigolium-packages
+          path: build/dist-packages/native/*
+          if-no-files-found: error
+
+  linux:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vigolium-packages
+          path: packages
+      - name: Check packages, install DEB, and smoke test
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+          VIGOLIUM_DISABLE_UPDATE_CHECK: '1'
+        run: |
+          cd packages
+          sha256sum --check package-checksums.txt
+          sudo apt-get update
+          sudo apt-get install -y "./vigolium_${VERSION}_${ARCH}.deb" rpm
+          vigolium version
+          vigolium --help
+          test "$(cat /usr/lib/vigolium/.vigolium-package-manager)" = deb
+          rpm -qpl "vigolium_${VERSION}_${ARCH}.rpm"
+          sudo apt-get remove -y vigolium
+          test ! -e /usr/bin/vigolium
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vigolium-packages
+          path: packages
+      - name: Ensure WinGet is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery
+            Repair-WinGetPackageManager -AllUsers
+            "$env:LOCALAPPDATA\Microsoft\WindowsApps" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
+      - name: Validate WinGet manifests and smoke test Windows archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VIGOLIUM_DISABLE_UPDATE_CHECK: '1'
+        shell: pwsh
+        run: |
+          tar -xzf "packages/vigolium_$($env:VERSION)_package-recipes.tar.gz" -C packages
+          if ($LASTEXITCODE -ne 0) { throw 'recipe extraction failed' }
+          winget validate --manifest "packages/winget/manifests/v/Vigolium/Vigolium/$($env:VERSION)"
+          if ($LASTEXITCODE -ne 0) { throw 'WinGet validation failed' }
+          $manifest = Get-Content packages/scoop/vigolium.json -Raw | ConvertFrom-Json
+          $asset = "vigolium_$($env:VERSION)_windows_amd64.zip"
+          gh release download $env:RELEASE_TAG --pattern $asset --dir packages
+          if ($LASTEXITCODE -ne 0) { throw 'release download failed' }
+          $hash = (Get-FileHash "packages/$asset" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $manifest.architecture.'64bit'.hash) { throw 'Windows checksum mismatch' }
+          Expand-Archive "packages/$asset" packages/windows
+          & packages/windows/vigolium.exe version
+          if ($LASTEXITCODE -ne 0) { throw 'Windows version smoke test failed' }
+          & packages/windows/vigolium.exe --help
+          if ($LASTEXITCODE -ne 0) { throw 'Windows help smoke test failed' }
+
+  nix:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vigolium-packages
+          path: packages
+      - uses: cachix/install-nix-action@v31
+      - name: Build and smoke test Nix wrapper
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          tar -xzf "packages/vigolium_${VERSION}_package-recipes.tar.gz" -C packages
+          nix flake check ./packages/nix
+          nix build ./packages/nix --out-link nix-result
+          ./nix-result/bin/vigolium version
+          ./nix-result/bin/vigolium --help
+
+  snap:
+    if: inputs.build_snap
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vigolium-packages
+          path: packages
+      - name: Extract recipes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: tar -xzf "packages/vigolium_${VERSION}_package-recipes.tar.gz" -C packages
+      - uses: snapcore/action-build@v1
+        id: snapcraft
+        with:
+          path: packages/snap/${{ matrix.arch }}
+      - name: Install and smoke test snap
+        env:
+          SNAP_FILE: ${{ steps.snapcraft.outputs.snap }}
+        run: |
+          sudo snap install "$SNAP_FILE" --dangerous --classic
+          /snap/bin/vigolium version
+          /snap/bin/vigolium --help
+          sudo snap remove vigolium
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vigolium-snap-${{ matrix.arch }}
+          path: ${{ steps.snapcraft.outputs.snap }}
+
+  attach:
+    if: inputs.attach_release_assets
+    needs: [prepare, linux, windows, nix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vigolium-packages
+          path: packages
+      - name: Attach packages without replacing existing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          cd packages
+          sha256sum --check package-checksums.txt
+          gh release upload "$RELEASE_TAG" ./*.deb ./*.rpm ./*_package-recipes.tar.gz ./package-checksums.txt

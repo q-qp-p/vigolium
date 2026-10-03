@@ -144,6 +144,8 @@ func NewTestConfig(targetURL string) *config.Config {
 		FormFillEnabled: true,
 		FormFillMode:    config.FormFillNormal,
 		CrawlFrames:     true,
+		Policy:          config.DefaultInteractionPolicy(),
+		BrowserCompat:   config.DefaultBrowserCompat(),
 	}
 }
 

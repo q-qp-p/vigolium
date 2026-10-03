@@ -84,12 +84,19 @@ func (r *Runner) runProbePhase(ctx context.Context, infra *phaseInfra) error {
 	// earlier deadline, so an outer scan-wide cap still wins.
 	if pace.MaxDuration > 0 {
 		var phaseCancel context.CancelFunc
-		ctx, phaseCancel = phaseDeadline(ctx, pace.MaxDuration)
+		ctx, phaseCancel = r.trackedPhaseDeadline(ctx, pace.MaxDuration)
 		defer phaseCancel()
 	}
 
+	sharedRequester := infra.httpRequester
 	infra, releasePace := r.probePaceInfra(infra, pace)
 	defer releasePace()
+	// A phase-local requester is traffic the tracker knows nothing about:
+	// beginPhase baselined the SHARED requester, which a paced probe never touches,
+	// so phase.finished reported ≈0 requests for a full sweep.
+	if local := infra.httpRequester; local != nil && local != sharedRequester {
+		r.currentPhase.Load().addCounter(local.RequestsSent)
+	}
 	r.printPhaseDetail(fmt.Sprintf("Speed: concurrency=%s, rate-limit=%s, max-per-host=%s",
 		terminal.HiBlue(fmt.Sprintf("%d", pace.Concurrency)),
 		terminal.HiBlue(fmt.Sprintf("%d", pace.RateLimit)),
@@ -189,9 +196,8 @@ func (r *Runner) runProbePhase(ctx context.Context, infra *phaseInfra) error {
 
 	executor := core.NewExecutor(executorCfg, src, nil, passive)
 	_, err := executor.Execute(ctx)
-	if probeRecordWriter != nil {
-		probeRecordWriter.Close()
-	}
+	r.currentPhase.Load().noteExecution(executor.Report())
+	r.shutdownWriters("probe", probeRecordWriter)
 	if err != nil {
 		return err
 	}

@@ -405,10 +405,19 @@ func TestHandleAgentQuery_AsyncFailureIsPersisted(t *testing.T) {
 	}
 
 	// Now read the row directly. Before the fix, the row would still be
-	// "running" because the failure path skipped DB persistence.
-	run, err := repo.GetAgenticScan(context.Background(), ack.AgenticScanUUID)
-	if err != nil {
-		t.Fatalf("GetAgenticScan: %v", err)
+	// "running" because the failure path skipped DB persistence. The handler
+	// flips the in-memory status before it writes the row, so poll briefly
+	// rather than reading once (a single read lost that race under -race).
+	var run *database.AgenticScan
+	for dbDeadline := time.Now().Add(5 * time.Second); ; {
+		run, err = repo.GetAgenticScan(context.Background(), ack.AgenticScanUUID)
+		if err != nil {
+			t.Fatalf("GetAgenticScan: %v", err)
+		}
+		if run.Status != "running" || time.Now().After(dbDeadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if run.Status != "failed" {
 		t.Errorf("expected DB status=failed, got %q", run.Status)

@@ -283,6 +283,24 @@ func applyResolvedPhaseDurations(opts *types.Options, pace *config.ScanningPaceC
 	}
 }
 
+// applyRequestRateLimit records a requested global rate limit in both places the
+// native scan reads it: the scanning pace (which paces known-issue-scan) and
+// Options.RateLimit (which builds the scan's own limiter).
+//
+// Writing only the pace is what REST scans used to do, and DefaultOptions leaves
+// RateLimit at 0, so an API caller that asked for a rate limit got an unlimited
+// native scan — the setting was accepted and then ignored. n <= 0 means unset and
+// leaves both alone, so default throughput is unchanged.
+func applyRequestRateLimit(opts *types.Options, pace *config.ScanningPaceConfig, n int) {
+	if n <= 0 {
+		return
+	}
+	pace.RateLimit = n
+	if opts != nil {
+		opts.RateLimit = n
+	}
+}
+
 // HandleRunScan handles POST /api/scans/run — triggers an async target-based scan.
 // This route only accepts target URLs. Use POST /api/scan-all-records to scan DB records.
 func (h *Handlers) HandleRunScan(c fiber.Ctx) error {
@@ -374,9 +392,7 @@ func (h *Handlers) HandleRunScan(c fiber.Ctx) error {
 	}
 
 	// Apply rate_limit
-	if req.RateLimit > 0 {
-		settings.ScanningPace.RateLimit = req.RateLimit
-	}
+	applyRequestRateLimit(opts, &settings.ScanningPace, req.RateLimit)
 
 	// Resolve per-phase durations from scanning_pace (mirrors CLI behavior in scan.go)
 	applyResolvedPhaseDurations(opts, &settings.ScanningPace)

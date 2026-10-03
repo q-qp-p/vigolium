@@ -41,6 +41,16 @@ type RecordWriterConfig struct {
 	// still drains in full. Default: 2m (far longer than any healthy drain).
 	FlushTimeout time.Duration
 
+	// OperationTimeout bounds ONE steady-state flush. Steady flushes deliberately
+	// do not inherit the scan's context — cancelling a scan mid-transaction would
+	// abort records already pulled off the channel and fail writers waiting on
+	// their results — but "uncancellable" was implemented as context.Background(),
+	// i.e. no bound at all: one wedged transaction parked a shard's flush loop for
+	// the rest of the process, its channel filled, and every Write routed to that
+	// host blocked behind it. This is the bound, set far above SQLite's 60s
+	// busy_timeout so a merely busy database still succeeds. Default: 2m.
+	OperationTimeout time.Duration
+
 	// DedupCacheSize bounds the in-memory dedup cache (LRU) that maps a record's
 	// dedup key to its UUID. A cache hit lets Write skip the per-record SELECT and
 	// the redundant insert for a key already seen by this writer (common in
@@ -59,6 +69,12 @@ type RecordWriterConfig struct {
 	// Defaults: 1024 records, 128 MiB.
 	MaxSubmitRecords int
 	MaxSubmitBytes   int64
+
+	// insertBatch replaces the repository batch insert. Unexported, so only this
+	// package's tests can set it — and it lives on the config rather than on the
+	// writer because NewRecordWriter starts the flush goroutines, which read the
+	// seam: assigning it afterwards would be a data race on every flush.
+	insertBatch func(context.Context, []*HTTPRecord) error
 }
 
 func (c *RecordWriterConfig) withDefaults() RecordWriterConfig {
@@ -74,6 +90,9 @@ func (c *RecordWriterConfig) withDefaults() RecordWriterConfig {
 	// has the driver available.
 	if out.FlushTimeout <= 0 {
 		out.FlushTimeout = 2 * time.Minute
+	}
+	if out.OperationTimeout <= 0 {
+		out.OperationTimeout = 2 * time.Minute
 	}
 	if out.DedupCacheSize == 0 {
 		out.DedupCacheSize = 50000
@@ -147,6 +166,15 @@ type RecordWriter struct {
 	closed atomic.Bool
 	wg     sync.WaitGroup
 
+	// shutdown carries the single absolute deadline the whole shutdown shares —
+	// the admission wait, every drain flush and the wait for the flush loops to
+	// exit — and the once-only outcome. See shutdownBudget.
+	shutdown shutdownBudget
+
+	// insertBatch is the persistence seam. Defaults to the repository's batch
+	// insert; replaced in tests to drive the stall and failure paths.
+	insertBatch func(context.Context, []*HTTPRecord) error
+
 	// admitMu + admitWG form the shutdown admission gate. A write takes admitMu
 	// for read, checks closed, and (if open) adds itself to admitWG before
 	// enqueueing; Close takes admitMu for write to set closed, then admitWG.Wait()s
@@ -208,6 +236,13 @@ func NewRecordWriter(repo *Repository, cfg RecordWriterConfig) *RecordWriter {
 		shards: make([]*writerShard, cfg.Shards),
 		ctx:    ctx,
 		cancel: cancel,
+	}
+
+	if w.insertBatch = cfg.insertBatch; w.insertBatch == nil {
+		w.insertBatch = func(ctx context.Context, records []*HTTPRecord) error {
+			_, err := repo.SaveRecordsBatch(ctx, records)
+			return err
+		}
 	}
 
 	if cfg.DedupCacheSize > 0 {
@@ -516,59 +551,97 @@ func recordWireSize(rr *httpmsg.HttpRequestResponse) int64 {
 // context. That guarantees the shutdown drain observes every admitted record —
 // none is orphaned in a channel after the flush loop exits, and every admitted
 // write receives its real result instead of a spurious "closed" error.
-func (w *RecordWriter) Close() {
-	w.admitMu.Lock()
-	if w.closed.Load() {
+// Prefer Shutdown when the caller can report what happened; Close is the
+// fire-and-forget form kept for existing call sites.
+func (w *RecordWriter) Close() { _ = w.Shutdown() }
+
+// Shutdown is Close that reports what became of every record it accepted.
+//
+// One absolute deadline (now+FlushTimeout) governs the entire shutdown: the wait
+// for in-flight enqueues to settle, every flush the drain performs, and the wait
+// for the flush loops to exit. Each of those used to start its own FlushTimeout,
+// so a wedged database could hold Close for three times the configured budget —
+// and the caller still learned nothing about what was lost.
+//
+// Idempotent: the outcome is computed once and every later or concurrent caller
+// gets the same value.
+// A nil writer is a no-op reporting a zero (clean) outcome: a phase that had no
+// repository created no writer, and it accepted nothing, so there is nothing to
+// report. Keeping that here rather than at every call site is what lets a caller
+// pass the writers it owns without first proving each one exists — and a typed-nil
+// pointer inside a PersistenceShutdowner interface is not caught by a nil check
+// there anyway.
+func (w *RecordWriter) Shutdown() PersistenceOutcome {
+	if w == nil {
+		return PersistenceOutcome{Writer: PersistenceWriterRecords}
+	}
+	w.shutdown.once.Do(func() {
+		// Published BEFORE cancel so the drain branch adopts it rather than
+		// starting a fresh budget of its own.
+		deadline := w.shutdown.publish(w.cfg.FlushTimeout)
+
+		w.admitMu.Lock()
+		w.closed.Store(true)
 		w.admitMu.Unlock()
-		return
-	}
-	w.closed.Store(true)
-	w.admitMu.Unlock()
 
-	// Wait for in-flight enqueues to land in a shard channel, but BOUND it: if a
-	// steady-state flush is wedged on a stalled database, its shard channel fills
-	// and an admitted enqueue blocks on the send — admitWG.Wait() would then never
-	// return and Close would hang forever, defeating FlushTimeout. On timeout we
-	// cancel the flush context anyway; the admit-send also selects on w.ctx.Done(),
-	// so cancelling releases any blocked send (resolved as closed) and unblocks
-	// admitWG.
-	if !waitBounded(&w.admitWG, w.cfg.FlushTimeout) {
-		zap.L().Warn("RecordWriter.Close: admitted enqueues did not settle before FlushTimeout; forcing shutdown")
-	}
-	w.cancel() // drain sees every admitted record; also releases blocked admit-sends
-	// Bound the flush-loop drain too: a steady-state flush already executing on an
-	// uncancellable context when Close fired sits outside the drain's FlushTimeout,
-	// so without this bound wg.Wait() could still hang on a wedged database.
-	if !waitBounded(&w.wg, w.cfg.FlushTimeout) {
-		zap.L().Warn("RecordWriter.Close: flush loops did not drain before FlushTimeout; proceeding")
-	}
-}
+		// Wait for in-flight enqueues to land in a shard channel, but BOUND it: if a
+		// steady-state flush is wedged on a stalled database, its shard channel fills
+		// and an admitted enqueue blocks on the send — admitWG.Wait() would then never
+		// return and Close would hang forever, defeating FlushTimeout. On timeout we
+		// cancel the flush context anyway; the admit-send also selects on w.ctx.Done(),
+		// so cancelling releases any blocked send (resolved as closed) and unblocks
+		// admitWG.
+		admitSettled := waitBounded(&w.admitWG, time.Until(deadline))
+		if !admitSettled {
+			zap.L().Warn("RecordWriter shutdown: admitted enqueues did not settle before the flush deadline; forcing shutdown")
+		}
+		w.cancel() // drain sees every admitted record; also releases blocked admit-sends
+		// Bound the flush-loop drain too: a steady-state flush already executing on
+		// its own OperationTimeout when Close fired sits outside the drain's budget,
+		// so without this bound wg.Wait() could still outlast the deadline.
+		drained := waitBounded(&w.wg, time.Until(deadline))
+		if !drained {
+			zap.L().Warn("RecordWriter shutdown: flush loops did not drain before the flush deadline; proceeding")
+		}
 
-// waitBounded waits for wg with a timeout. Returns true if the group completed,
-// false if the timeout elapsed first.
-func waitBounded(wg *sync.WaitGroup, timeout time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-		return true
-	case <-time.After(timeout):
-		return false
-	}
+		enqueued := w.enqueued.Load()
+		flushed := w.flushed.Load()
+		failed := w.flushFailed.Load()
+
+		w.shutdown.outcome = PersistenceOutcome{
+			Writer: PersistenceWriterRecords,
+			// Dedup-cache hits never enqueue: admit resolves them from memory and
+			// returns the existing UUID, so they are not writes this writer
+			// accepted and are deliberately absent from every count here.
+			Accepted:  enqueued,
+			Committed: flushed,
+			Failed:    failed,
+			// Admitted but neither resolved nor failed when the deadline passed.
+			Unknown:  nonNegative(enqueued - flushed - failed),
+			TimedOut: !admitSettled || !drained,
+		}
+
+		if o := w.shutdown.outcome; !o.Clean() {
+			zap.L().Warn("RecordWriter: some records may not have been persisted",
+				zap.Int64("failed", o.Failed),
+				zap.Int64("unknown", o.Unknown),
+				zap.Int64("committed", o.Committed),
+				zap.Int64("accepted", o.Accepted),
+				zap.Bool("timed_out", o.TimedOut))
+		}
+	})
+	return w.shutdown.outcome
 }
 
 // flushLoop is the goroutine that drains a shard's channel and batch-inserts.
-// Steady-state flushes use an uncancellable context.Background(): when Close()
-// cancels w.ctx mid-flush, propagating that cancellation would abort the
-// in-flight SQL transaction and lose records that were already pulled from the
-// channel, so a slow insert must never be cancelled during normal operation. The
-// shutdown drain (the ctx.Done() branch) is the only path that bounds its
-// flushes — with a single FlushTimeout budget for the whole drain — so a wedged
-// database can't hang Close() forever while healthy databases still drain in
-// full.
+// Steady-state flushes are detached from w.ctx: when Close() cancels it mid-flush,
+// propagating that cancellation would abort the in-flight SQL transaction and lose
+// records that were already pulled from the channel, so a slow insert must never
+// be cancelled during normal operation. They are still bounded, by
+// OperationTimeout, so a wedged transaction fails instead of parking this
+// goroutine for the rest of the process. The shutdown drain (the ctx.Done()
+// branch) runs on the single absolute deadline Shutdown published, so a wedged
+// database can't hang Close() forever while healthy databases still drain in full.
 //
 // A batch is formed from what is already queued and committed immediately; see
 // the channel arm for why no timer can help it.
@@ -597,14 +670,14 @@ func (w *RecordWriter) flushLoop(ctx context.Context, s *writerShard) {
 			// up to BatchSize. What it no longer does is hold a finished batch
 			// waiting for company that cannot arrive.
 			batch = drainAvailable(batch, s.ch, w.cfg.BatchSize)
-			w.flush(context.Background(), batch)
+			w.flushBounded(batch)
 			batch = resetBatch(batch)
 
 		case <-ctx.Done():
-			// Shutdown drain. Bound the total flush time with a single budget so
-			// Close() returns even against a wedged database; against a healthy
-			// one every buffered batch still flushes well within it.
-			drainCtx, cancel := context.WithTimeout(context.Background(), w.cfg.FlushTimeout)
+			// Shutdown drain. It shares Shutdown's single absolute deadline, so
+			// Close() returns even against a wedged database; against a healthy one
+			// every buffered batch still flushes well within it.
+			drainCtx, cancel := context.WithDeadline(context.Background(), w.shutdown.drainDeadline(w.cfg.FlushTimeout))
 			defer cancel()
 			for {
 				batch = drainAvailable(batch, s.ch, w.cfg.BatchSize)
@@ -616,6 +689,14 @@ func (w *RecordWriter) flushLoop(ctx context.Context, s *writerShard) {
 			}
 		}
 	}
+}
+
+// flushBounded runs one steady-state flush under OperationTimeout, detached from
+// the writer's own context so a Close cannot abort a transaction in progress.
+func (w *RecordWriter) flushBounded(batch []writeRequest) {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cfg.OperationTimeout)
+	defer cancel()
+	w.flush(ctx, batch)
 }
 
 // resetBatch empties a flushed batch for reuse, clearing the entries first.
@@ -651,9 +732,9 @@ func drainAvailable(batch []writeRequest, ch <-chan writeRequest, limit int) []w
 // within the batch to a single insert, and inserts the remaining distinct new
 // records in one transaction.
 //
-// The caller chooses the context: flushLoop uses an uncancellable
-// context.Background() for steady-state flushes and a bounded context only for
-// the shutdown drain (see flushLoop).
+// The caller chooses the context: flushLoop uses an OperationTimeout-bounded
+// context detached from the writer's own for steady-state flushes, and the shared
+// shutdown deadline for the drain (see flushLoop).
 func (w *RecordWriter) flush(ctx context.Context, batch []writeRequest) {
 	w.batchCount.Add(1)
 
@@ -696,7 +777,7 @@ func (w *RecordWriter) flush(ctx context.Context, batch []writeRequest) {
 
 	var insErr error
 	if len(toInsert) > 0 {
-		_, insErr = w.repo.SaveRecordsBatch(ctx, toInsert)
+		insErr = w.insertBatch(ctx, toInsert)
 	}
 	if insErr != nil {
 		w.flushErrors.Add(1)

@@ -165,6 +165,9 @@ func (c *Crawler) harvestSpeculativeLinks(ctx context.Context, page *browser.Pag
 		return
 	}
 
+	// Early pruning only — fetchURLsInPage (admissibleFetchURLs) is the
+	// enforcement point. Filtering here bounds the work before the budget maths
+	// below, which depends on the in-scope length.
 	inScope := c.filterInScope(discovered)
 	if len(inScope) == 0 {
 		return

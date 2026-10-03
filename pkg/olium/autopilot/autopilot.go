@@ -21,7 +21,9 @@ import (
 	"github.com/vigolium/vigolium/pkg/olium/tool"
 	"github.com/vigolium/vigolium/pkg/olium/toollog"
 	"github.com/vigolium/vigolium/pkg/olium/vigtool"
+	"github.com/vigolium/vigolium/pkg/spitolas"
 	"github.com/vigolium/vigolium/pkg/terminal"
+	"github.com/vigolium/vigolium/pkg/utils"
 )
 
 // quotedLineWriter wraps an io.Writer and prepends prefix to every line
@@ -235,7 +237,12 @@ type Options struct {
 	// gets a short addendum telling the model how to use the browser
 	// surface (web_fetch mode=browser, browser_probe, agent-browser
 	// SKILL.md). Off by default so blackbox HTTP-only runs stay terse.
+	// Also gates the typed browser_auth tool: false leaves it unregistered.
 	BrowserAvailable bool
+
+	// BrowserBinaryPath is agent.browser.binary_path for the typed
+	// browser_auth adapter; empty resolves agent-browser on PATH.
+	BrowserBinaryPath string
 
 	// InitialPrompt, when non-empty, replaces the auto-generated initial
 	// user message entirely. Callers that have pre-assembled a richer
@@ -701,9 +708,14 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		tools.Register(vigtool.NewAttackKitTool())
 		// browser_auth wraps agent-browser to drive interactive login flows
 		// and persist the resulting cookies as an auth_session row. Only
-		// registers when agent-browser is on PATH; otherwise the constructor
-		// returns nil and the agent doesn't see the tool.
-		if t := vigtool.NewBrowserAuthTool(opts.Repo, opts.ProjectUUID); t != nil {
+		// registers when the browser integration is enabled for this run and
+		// the configured binary resolves; otherwise the constructor returns
+		// nil and the agent doesn't see the tool.
+		if t := vigtool.NewBrowserAuthTool(opts.Repo, opts.ProjectUUID, vigtool.BrowserToolConfig{
+			Enabled:    opts.BrowserAvailable,
+			BinaryPath: opts.BrowserBinaryPath,
+			Headed:     utils.EnvTruthy(spitolas.EnvBrowserHeaded),
+		}); t != nil {
 			tools.Register(t)
 		}
 		tools.Register(vigtool.NewListModulesTool())

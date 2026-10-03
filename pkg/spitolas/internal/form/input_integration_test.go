@@ -266,8 +266,10 @@ func TestFillCheckboxCheck(t *testing.T) {
 	}
 
 	// Check the checkbox
-	if err := FillCheckbox(elem, true); err != nil {
+	if outcome, err := FillCheckbox(elem, true); err != nil {
 		t.Fatalf("FillCheckbox() failed: %v", err)
+	} else if outcome != FillVerified {
+		t.Errorf("FillCheckbox() outcome = %q, want %q", outcome, FillVerified)
 	}
 
 	time.Sleep(50 * time.Millisecond)
@@ -304,7 +306,7 @@ func TestFillCheckboxUncheck(t *testing.T) {
 	}
 
 	// First check it
-	if err := FillCheckbox(elem, true); err != nil {
+	if _, err := FillCheckbox(elem, true); err != nil {
 		t.Fatalf("FillCheckbox(true) failed: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -316,7 +318,7 @@ func TestFillCheckboxUncheck(t *testing.T) {
 	}
 
 	// Then uncheck it
-	if err := FillCheckbox(elem, false); err != nil {
+	if _, err := FillCheckbox(elem, false); err != nil {
 		t.Fatalf("FillCheckbox(false) failed: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -352,7 +354,7 @@ func TestFillRadio(t *testing.T) {
 		t.Fatalf("Element() failed: %v", err)
 	}
 
-	if err := FillRadio(elem, "1"); err != nil {
+	if _, err := FillRadio(elem, "1"); err != nil {
 		t.Fatalf("FillRadio() failed: %v", err)
 	}
 
@@ -398,7 +400,7 @@ func TestFillRadioSwitchValue(t *testing.T) {
 	}
 
 	// First select male
-	if err := FillRadio(maleElem, "1"); err != nil {
+	if _, err := FillRadio(maleElem, "1"); err != nil {
 		t.Fatalf("FillRadio(male) failed: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -410,7 +412,7 @@ func TestFillRadioSwitchValue(t *testing.T) {
 	}
 
 	// Then select female - should deselect male (browser behavior)
-	if err := FillRadio(femaleElem, "1"); err != nil {
+	if _, err := FillRadio(femaleElem, "1"); err != nil {
 		t.Fatalf("FillRadio(female) failed: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -450,7 +452,7 @@ func TestFillRadioWithoutName(t *testing.T) {
 	}
 
 	// Should work without error - no name attribute required
-	if err := FillRadio(elem, "1"); err != nil {
+	if _, err := FillRadio(elem, "1"); err != nil {
 		t.Fatalf("FillRadio() failed for radio without name: %v", err)
 	}
 
@@ -484,13 +486,13 @@ func TestFillRadioAlreadyChecked(t *testing.T) {
 	}
 
 	// First click to check
-	if err := FillRadio(elem, "1"); err != nil {
+	if _, err := FillRadio(elem, "1"); err != nil {
 		t.Fatalf("First FillRadio() failed: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
 
 	// Second call should succeed without error (no double-click)
-	if err := FillRadio(elem, "1"); err != nil {
+	if _, err := FillRadio(elem, "1"); err != nil {
 		t.Fatalf("Second FillRadio() failed: %v", err)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -523,8 +525,10 @@ func TestFillRadioValueZero(t *testing.T) {
 	}
 
 	// Value "0" should do nothing - radio stays unchecked
-	if err := FillRadio(elem, "0"); err != nil {
+	if outcome, err := FillRadio(elem, "0"); err != nil {
 		t.Fatalf("FillRadio(0) failed: %v", err)
+	} else if outcome != FillSkipped {
+		t.Errorf("FillRadio(0) outcome = %q, want %q", outcome, FillSkipped)
 	}
 	time.Sleep(50 * time.Millisecond)
 
@@ -556,8 +560,10 @@ func TestFillSelect(t *testing.T) {
 	}
 
 	// Select by value
-	if err := FillSelect(elem, "us"); err != nil {
+	if outcome, err := FillSelect(elem, "us"); err != nil {
 		t.Fatalf("FillSelect() failed: %v", err)
+	} else if outcome != FillVerified {
+		t.Errorf("FillSelect() outcome = %q, want %q", outcome, FillVerified)
 	}
 
 	time.Sleep(50 * time.Millisecond)
@@ -594,7 +600,7 @@ func TestFillSelectByText(t *testing.T) {
 	}
 
 	// Select by text content
-	if err := FillSelect(elem, "United Kingdom"); err != nil {
+	if _, err := FillSelect(elem, "United Kingdom"); err != nil {
 		t.Fatalf("FillSelect() failed: %v", err)
 	}
 
@@ -632,7 +638,7 @@ func TestFillSelectMultiple(t *testing.T) {
 	}
 
 	// Select multiple values
-	if err := FillSelectMultiple(elem, []string{"en", "es"}); err != nil {
+	if _, err := FillSelectMultiple(elem, []string{"en", "es"}); err != nil {
 		t.Fatalf("FillSelectMultiple() failed: %v", err)
 	}
 
@@ -834,7 +840,7 @@ func TestIsChecked(t *testing.T) {
 	}
 
 	// Check it
-	FillCheckbox(elem, true)
+	_, _ = FillCheckbox(elem, true)
 	time.Sleep(50 * time.Millisecond)
 
 	// Now checked
@@ -868,7 +874,7 @@ func TestGetSelectedOptions(t *testing.T) {
 	}
 
 	// Select options
-	FillSelectMultiple(elem, []string{"en", "fr"})
+	_, _ = FillSelectMultiple(elem, []string{"en", "fr"})
 	time.Sleep(50 * time.Millisecond)
 
 	// Get selected
@@ -901,7 +907,7 @@ func TestFillHiddenNilElement(t *testing.T) {
 
 // TestFillCheckboxNilElement tests nil element handling.
 func TestFillCheckboxNilElement(t *testing.T) {
-	err := FillCheckbox(nil, true)
+	_, err := FillCheckbox(nil, true)
 	if err == nil {
 		t.Error("Expected error for nil element")
 	}
@@ -909,7 +915,7 @@ func TestFillCheckboxNilElement(t *testing.T) {
 
 // TestFillRadioNilElement tests nil element handling.
 func TestFillRadioNilElement(t *testing.T) {
-	err := FillRadio(nil, "value")
+	_, err := FillRadio(nil, "value")
 	if err == nil {
 		t.Error("Expected error for nil element")
 	}
@@ -917,7 +923,7 @@ func TestFillRadioNilElement(t *testing.T) {
 
 // TestFillSelectNilElement tests nil element handling.
 func TestFillSelectNilElement(t *testing.T) {
-	err := FillSelect(nil, "value")
+	_, err := FillSelect(nil, "value")
 	if err == nil {
 		t.Error("Expected error for nil element")
 	}
@@ -925,7 +931,7 @@ func TestFillSelectNilElement(t *testing.T) {
 
 // TestFillSelectMultipleNilElement tests nil element handling.
 func TestFillSelectMultipleNilElement(t *testing.T) {
-	err := FillSelectMultiple(nil, []string{"value"})
+	_, err := FillSelectMultiple(nil, []string{"value"})
 	if err == nil {
 		t.Error("Expected error for nil element")
 	}

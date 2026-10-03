@@ -595,12 +595,12 @@ func checkFuzzScope(hostname string) error {
 	if fuzzIgnoreScope || hostname == "" {
 		return nil
 	}
-	settings, err := config.LoadSettings(globalConfig)
-	if err != nil {
-		// Scope is a guard rail, not a gate: an unreadable config shouldn't
-		// stop an operator who asked for a specific target.
-		return nil
-	}
+	// Scope is a guard rail, not a gate: an unreadable config must not stop an
+	// operator who asked for a specific target. It must not do so SILENTLY
+	// either — the fallback scope is "everything in the config's scope section",
+	// which an empty default makes vacuous, so the warning is the only sign the
+	// guard rail is not the one that was configured.
+	settings := settingsOrDefaults()
 	matcher := config.NewScopeMatcher(settings.Scope, globalTargets...)
 	if matcher.HostInScope(hostname) {
 		return nil

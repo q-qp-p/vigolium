@@ -182,9 +182,7 @@ func removeAgentStatelessDB(dbPath string) {
 	if dbPath == "" {
 		return
 	}
-	_ = os.Remove(dbPath)
-	_ = os.Remove(dbPath + "-wal")
-	_ = os.Remove(dbPath + "-shm")
+	removeWorkingDB(dbPath)
 }
 
 // emitAgentStatelessExport materializes every requested --format from the

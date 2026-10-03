@@ -45,6 +45,22 @@ func ExtractPrimaryToken(headers map[string]string) string {
 
 // AuthenticationHostnameToSession converts a DB AuthenticationHostname row to a native authentication.Session.
 //
+// A row commonly carries BOTH a login flow and the headers that flow produced
+// last time (SessionToAuthenticationHostname writes both, and the stored headers
+// are what `vigolium session` shows the operator). A Session may name only ONE
+// credential source, though — Session.Validate rejects more, and
+// Session.IsHydrated treats stored headers as "already logged in" — so exactly
+// one is restored, in this order:
+//
+//	login flow (login_url) → raw login request → static headers
+//
+// A row with a login flow therefore restores with NIL headers, which is what
+// makes the login RE-RUN: the stored token is from an earlier scan and is very
+// likely expired, and the scan that reused it spent its whole run getting 401s.
+// Carrying both instead made NewManager reject the session outright and failed
+// session initialization for the entire scan, so a DB-sourced login session
+// never worked at all.
+//
 // Note: the DB schema does not carry the type/token_path shorthand fields —
 // only the expanded ExtractRules. SessionToAuthenticationHostname normalizes
 // shorthand into explicit rules on write so they round-trip correctly.
@@ -54,35 +70,65 @@ func AuthenticationHostnameToSession(sh *AuthenticationHostname) *authentication
 	}
 
 	s := &authentication.Session{
-		Name:    sh.SessionName,
-		Role:    authentication.Role(sh.SessionRole),
-		Headers: sh.Headers,
+		Name: sh.SessionName,
+		Role: authentication.Role(sh.SessionRole),
 	}
 
 	// Map flat login fields to LoginFlow if login_url is set.
-	if sh.LoginURL != "" {
+	switch {
+	case sh.LoginURL != "":
 		lf := &authentication.LoginFlow{
 			URL:         sh.LoginURL,
 			Method:      sh.LoginMethod,
 			ContentType: sh.LoginContentType,
 			Body:        sh.LoginBody,
 		}
-		// Unmarshal extract rules JSON into typed slice.
-		if sh.ExtractRules != "" {
-			var rules []authentication.ExtractRule
-			if err := json.Unmarshal([]byte(sh.ExtractRules), &rules); err == nil {
-				lf.Extract = rules
-			}
-		}
+		lf.Extract = decodeExtractRules(sh.ExtractRules)
 		s.Login = lf
-	}
-
-	// Map raw login request if present.
-	if sh.LoginRequest != "" {
+	case sh.LoginRequest != "":
 		s.LoginRequest = sh.LoginRequest
+	default:
+		s.Headers = sh.Headers
 	}
 
 	return s
+}
+
+// decodeExtractRules parses the extract_rules column into typed rules, nil when
+// there are none or the stored value is unreadable.
+//
+// It accepts TWO encodings because the column holds both. The field is a Go
+// string mapped to a `jsonb` column, and bun's write side JSON-encodes the
+// string — so the array `[{...}]` lands as the JSON *string* `"[{...}]"` —
+// while its read side hands back the raw column text, quotes and escapes
+// included. Every stored login flow is therefore double-encoded, and the single
+// `json.Unmarshal` this used to do failed on all of them: the restored flow had
+// zero extract rules, Validate rejected it ("login.extract requires at least
+// one rule"), and session initialization failed for the WHOLE scan. That is why
+// a session persisted by one scan could not be reused by the next.
+//
+// Unwrapping on read fixes every existing row without a migration and without
+// changing what is written (a single-encoded write would not survive bun's own
+// read path). A plain array is accepted too, so a row written by any other
+// producer also works.
+func decodeExtractRules(raw string) []authentication.ExtractRule {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var rules []authentication.ExtractRule
+	if err := json.Unmarshal([]byte(raw), &rules); err == nil {
+		return rules
+	}
+	// Double-encoded: a JSON string whose contents are the array.
+	var inner string
+	if err := json.Unmarshal([]byte(raw), &inner); err != nil {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(inner), &rules); err != nil {
+		return nil
+	}
+	return rules
 }
 
 // AuthenticationHostnamesToSessionConfig converts a slice of DB rows (typically for one hostname)

@@ -42,6 +42,7 @@ make test-race          # all tests with the race detector
 make test-e2e           # Docker-based e2e (-tags=e2e), in test/e2e/
 make test-canary        # against DVWA / VAmPI / Juice Shop (Docker, -tags=canary)
 make test-integration   # XSS benchmark tests (-tags=integration)
+make test-browser-conformance  # browser crawler contracts against a real headless browser
 make test-coverage      # produce coverage.out
 make coverage-gate      # enforce the COVERAGE_MIN floor against coverage.out
 ```
@@ -57,6 +58,18 @@ Run a single tagged test:
 ```bash
 go test -v -tags=e2e -run TestName ./test/e2e/...
 ```
+
+`make test-browser-conformance` runs the `//go:build integration` tests of
+`pkg/spitolas/internal/{browser,form,crawler,condition}` — launcher and
+security flags, dialog and submit-guard policy, form fill outcomes and
+scoping, POST-submission attribution, crawler gates, wait conditions — against
+a real headless Chrome/Chromium and local `httptest` fixtures (no Docker, no
+internet). The `-short` unit run never executes these files, so this target is
+where those contracts are checked. It first runs `TestConformancePrecheck` and
+exits non-zero with an install hint when no browser can be launched, rather
+than reporting a browserless run as green. Packages run one at a time (`-p 1`)
+because several cases are timing-sensitive. `make test-race` names the
+race-sensitive packages in its comment. CI does not run this target yet.
 
 Vulnerable apps for e2e/canary are managed with Docker Compose under
 `test/testdata/vulnerable-apps/`:

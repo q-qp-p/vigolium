@@ -1,6 +1,7 @@
 package condition
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -19,8 +20,8 @@ func TestNewWaitCondition(t *testing.T) {
 	if w.Visible {
 		t.Error("Visible should default to false")
 	}
-	if w.URLPattern != "" {
-		t.Errorf("URLPattern = %q, want empty", w.URLPattern)
+	if w.URLMatch != "" {
+		t.Errorf("URLMatch = %q, want empty", w.URLMatch)
 	}
 	if w.Polling != 100*time.Millisecond {
 		t.Errorf("Polling = %v, want %v", w.Polling, 100*time.Millisecond)
@@ -32,14 +33,14 @@ func TestNewWaitCondition(t *testing.T) {
 func TestNewWaitConditionFromConfig(t *testing.T) {
 	t.Run("explicit timeout", func(t *testing.T) {
 		cfg := config.WaitConditionConfig{
-			URLPattern: "/dashboard",
+			URLPattern: "/dashboard", //nolint:staticcheck // the deprecated alias must still be honored
 			Selector:   "#widget",
 			Visible:    true,
 			Timeout:    3 * time.Second,
 		}
 		w := NewWaitConditionFromConfig(cfg)
-		if w.URLPattern != "/dashboard" {
-			t.Errorf("URLPattern = %q, want %q", w.URLPattern, "/dashboard")
+		if w.URLMatch != "/dashboard" {
+			t.Errorf("URLMatch = %q, want %q (deprecated URLPattern carried over)", w.URLMatch, "/dashboard")
 		}
 		if w.Selector != "#widget" {
 			t.Errorf("Selector = %q, want %q", w.Selector, "#widget")
@@ -67,8 +68,8 @@ func TestWaitConditionBuilders(t *testing.T) {
 		WithVisibility(true).
 		WithPolling(50 * time.Millisecond)
 
-	if w.URLPattern != "/admin" {
-		t.Errorf("URLPattern = %q, want %q", w.URLPattern, "/admin")
+	if w.URLMatch != "/admin" || w.Matcher != config.URLMatchSubstring {
+		t.Errorf("URLMatch = %q (matcher %q), want %q (substring)", w.URLMatch, w.Matcher, "/admin")
 	}
 	if !w.Visible {
 		t.Error("Visible = false, want true")
@@ -94,7 +95,7 @@ func TestWaitResultConstants(t *testing.T) {
 // TestWaitAnyEmpty verifies WaitAny with no conditions returns success without
 // touching the page.
 func TestWaitAnyEmpty(t *testing.T) {
-	if got := WaitAny(nil); got != WaitSuccess {
+	if got := WaitAny(context.Background(), nil); got != WaitSuccess {
 		t.Errorf("WaitAny() with no conditions = %d, want WaitSuccess", got)
 	}
 }

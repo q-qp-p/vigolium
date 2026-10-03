@@ -63,3 +63,69 @@ func TestBuildDiscoveryHeaders_NoSessionNoCustomIsNil(t *testing.T) {
 		t.Errorf("expected nil headers with no session and no custom headers, got %v", headers)
 	}
 }
+
+// TestBuildDiscoveryHeaders_HTTPTargetDropsSecureCookie: the engine takes one
+// static Cookie header per target, and it used to be the whole flattened jar —
+// so a Secure cookie the browser only ever sent over https rode a plain-http
+// crawl of the same host. With the harvested attributes carried, the header is
+// evaluated for the target's origin.
+func TestBuildDiscoveryHeaders_HTTPTargetDropsSecureCookie(t *testing.T) {
+	sess := httpmsg.CarriedSession{
+		// Deliberately everything, to prove the evaluation runs rather than the
+		// flat fallback.
+		CookieHeader: "sid=s; tracker=t",
+		Cookies: []httpmsg.CarriedCookie{
+			{Name: "sid", Value: "s", Domain: "example.com", Path: "/", HostOnly: true},
+			{Name: "tracker", Value: "t", Domain: "example.com", Path: "/", Secure: true},
+		},
+	}
+	d := &DeparosDiscoverySource{cfg: DeparosDiscoveryConfig{
+		BrowserSessions: map[string]httpmsg.CarriedSession{"example.com": sess},
+	}}
+
+	if got := d.buildDiscoveryHeaders("http://example.com/")["Cookie"]; got != "sid=s" {
+		t.Errorf("http target Cookie = %q, want the Secure cookie dropped", got)
+	}
+	if got := d.buildDiscoveryHeaders("https://example.com/")["Cookie"]; got != "sid=s; tracker=t" {
+		t.Errorf("https target Cookie = %q, want both cookies", got)
+	}
+	// Path is ignored for an origin-wide header, so a path-scoped cookie is
+	// still offered: the engine crawls the whole origin from one header.
+	withPath := httpmsg.CarriedSession{Cookies: []httpmsg.CarriedCookie{
+		{Name: "admin_csrf", Value: "c", Domain: "example.com", Path: "/admin"},
+	}}
+	d.cfg.BrowserSessions = map[string]httpmsg.CarriedSession{"example.com": withPath}
+	if got := d.buildDiscoveryHeaders("https://example.com/")["Cookie"]; got != "admin_csrf=c" {
+		t.Errorf("path-scoped cookie = %q, want it offered for the whole origin", got)
+	}
+}
+
+// A host-only cookie harvested from the apex must not be handed to a subdomain
+// target.
+func TestBuildDiscoveryHeaders_HostOnlyCookieStaysOnItsHost(t *testing.T) {
+	sess := httpmsg.CarriedSession{Cookies: []httpmsg.CarriedCookie{
+		{Name: "ho", Value: "1", Domain: "example.com", Path: "/", HostOnly: true},
+		{Name: "dw", Value: "2", Domain: "example.com", Path: "/"},
+	}}
+	// Keyed by the subdomain, as a harvest from that subdomain's crawl would be.
+	d := &DeparosDiscoverySource{cfg: DeparosDiscoveryConfig{
+		BrowserSessions: map[string]httpmsg.CarriedSession{"api.example.com": sess},
+	}}
+	if got := d.buildDiscoveryHeaders("https://api.example.com/")["Cookie"]; got != "dw=2" {
+		t.Errorf("Cookie = %q, want only the domain-wide cookie", got)
+	}
+}
+
+// An unparseable target matches nothing rather than panicking or sending the
+// whole jar.
+func TestBuildDiscoveryHeaders_UnparseableTarget(t *testing.T) {
+	sess := httpmsg.CarriedSession{Cookies: []httpmsg.CarriedCookie{
+		{Name: "sid", Value: "s", Domain: "example.com", Path: "/"},
+	}}
+	d := &DeparosDiscoverySource{cfg: DeparosDiscoveryConfig{
+		BrowserSessions: map[string]httpmsg.CarriedSession{"example.com": sess},
+	}}
+	if headers := d.buildDiscoveryHeaders("::not a url::"); headers != nil {
+		t.Errorf("expected nil headers for an unparseable target, got %v", headers)
+	}
+}

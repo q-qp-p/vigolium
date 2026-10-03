@@ -95,6 +95,9 @@ func maybeCheckForUpdate(cmd *cobra.Command) {
 // updateCheckHardDisabled reports conditions that switch off both the notice and
 // the auto-update paths entirely. current is the running binary's version.
 func updateCheckHardDisabled(cmd *cobra.Command, current string) bool {
+	if managedPackageManager() != "" {
+		return true
+	}
 	if utils.EnvTruthy(envDisableUpdateCheck) {
 		return true
 	}

@@ -5,10 +5,12 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -262,4 +264,274 @@ func readJSON(t *testing.T, path string, v any) {
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.NoError(t, json.Unmarshal(data, v))
+}
+
+// fsSeedRecord inserts one minimal record, optionally with a response body.
+func fsSeedRecord(t *testing.T, db *database.DB, uuid, host, path, body string) {
+	t.Helper()
+	resp := []byte("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n" + body)
+	_, err := db.NewInsert().Model(&database.HTTPRecord{
+		UUID:        uuid,
+		Scheme:      "https",
+		Hostname:    host,
+		Port:        443,
+		Method:      "GET",
+		Path:        path,
+		URL:         "https://" + host + path,
+		HTTPVersion: "HTTP/1.1",
+		RequestHash: "rhash-" + uuid,
+		StatusCode:  200,
+		HasResponse: true,
+		RawRequest:  []byte("GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\n\r\n"),
+		RawResponse: resp,
+	}).Exec(context.Background())
+	require.NoError(t, err)
+}
+
+// fsStagingLeftovers lists the staging and retired directories beside base.
+func fsStagingLeftovers(t *testing.T, base string) []string {
+	t.Helper()
+	var out []string
+	for _, pattern := range []string{".*.staging-*", "*.old-*"} {
+		matches, err := filepath.Glob(filepath.Join(filepath.Dir(base), pattern))
+		require.NoError(t, err)
+		out = append(out, matches...)
+	}
+	return out
+}
+
+// A re-export used to write into the live tree, so a smaller result set left the
+// previous run's files behind: 0002.req from a three-record run survived a
+// one-record re-export, while index.json (which IS rewritten) described a tree
+// that disagreed with its own contents.
+func TestFSExportReexportRemovesStaleFiles(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	for i, name := range []string{"a", "b", "c"} {
+		fsSeedRecord(t, db, "rec-"+name, "alpha.example", fmt.Sprintf("/%d", i), "body-"+name)
+	}
+
+	base := filepath.Join(t.TempDir(), "out")
+	stats, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+	require.Equal(t, 3, stats.Traffic)
+	require.FileExists(t, filepath.Join(base+"-traffic", "alpha.example", "0002.req"))
+
+	// Re-export a single record.
+	stats, err = writeFSExport(ctx, db,
+		database.QueryFilters{RecordUUIDs: []string{"rec-a"}}, base, fsExportOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, stats.Traffic)
+
+	assert.NoFileExists(t, filepath.Join(base+"-traffic", "alpha.example", "0002.req"),
+		"a re-export publishes a whole generation; last run's files must be gone")
+	var index []map[string]any
+	readJSON(t, filepath.Join(base+"-traffic", "index.json"), &index)
+	assert.Len(t, index, 1, "the index and the tree must agree")
+	assert.Empty(t, fsStagingLeftovers(t, base), "no staging or retired tree may survive a publish")
+}
+
+// A re-export that now matches nothing must replace the stale generation with
+// an empty index, not leave last run's results under a name that claims to
+// describe this one.
+func TestFSExportEmptyReplacesStaleTrees(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
+
+	base := filepath.Join(t.TempDir(), "out")
+	_, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(base+"-traffic", "alpha.example", "0001.req"))
+
+	stats, err := writeFSExport(ctx, db,
+		database.QueryFilters{RecordUUIDs: []string{"rec-nonexistent"}}, base, fsExportOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 0, stats.Traffic)
+	assert.Equal(t, base+"-traffic", stats.TrafficDir, "the stale tree was corrected, so it is reported")
+
+	assert.NoDirExists(t, filepath.Join(base+"-traffic", "alpha.example"))
+	var index []map[string]any
+	readJSON(t, filepath.Join(base+"-traffic", "index.json"), &index)
+	assert.Empty(t, index)
+	assert.Empty(t, fsStagingLeftovers(t, base))
+}
+
+// Nothing to export and nothing already there: create nothing at all, so the
+// summary's "Nothing to export" is literally true.
+func TestFSExportFreshEmptyCreatesNothing(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+
+	dir := t.TempDir()
+	base := filepath.Join(dir, "out")
+	stats, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, stats.TrafficDir)
+	assert.Empty(t, stats.FindingsDir)
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "an empty first export must not create a tree")
+}
+
+// A base path that collides with an unrelated directory is an operator mistake
+// worth an error. Deleting their files is not a reasonable way to report it.
+func TestFSExportRefusesForeignDir(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
+
+	dir := t.TempDir()
+	base := filepath.Join(dir, "out")
+	foreign := base + "-traffic"
+	require.NoError(t, os.MkdirAll(foreign, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(foreign, "thesis.txt"), []byte("important"), 0o644))
+
+	_, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not a vigolium fs export")
+
+	data, readErr := os.ReadFile(filepath.Join(foreign, "thesis.txt"))
+	require.NoError(t, readErr, "the foreign directory must be untouched")
+	assert.Equal(t, "important", string(data))
+	assert.Empty(t, fsStagingLeftovers(t, base), "a refused publish must clean up after itself")
+}
+
+// Traffic publishes before findings, so a findings failure leaves the previous
+// findings tree in place and says that traffic was already updated.
+func TestFSExportFailureKeepsPrevious(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
+	require.NoError(t, database.NewRepository(db).SaveFindingDirect(ctx, &database.Finding{
+		HTTPRecordUUIDs: []string{"rec-a"},
+		ModuleID:        "mod-a",
+		ModuleName:      "Module A",
+		ModuleType:      "active",
+		Severity:        "high",
+		Confidence:      "firm",
+		FindingHash:     "hash-a",
+		URL:             "https://alpha.example/a",
+		Hostname:        "alpha.example",
+		Description:     "finding a",
+	}))
+
+	base := filepath.Join(t.TempDir(), "out")
+	_, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(base+"-findings", "alpha.example", "0001.md"))
+
+	// Make the findings pass fail: drop the table the second query reads.
+	_, err = db.NewRaw("DROP TABLE findings").Exec(ctx)
+	require.NoError(t, err)
+
+	_, err = writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.Error(t, err)
+
+	assert.FileExists(t, filepath.Join(base+"-findings", "alpha.example", "0001.md"),
+		"a failed findings pass must leave the previous findings tree intact")
+	assert.Empty(t, fsStagingLeftovers(t, base), "no staging tree may survive a failure")
+}
+
+// The finding markdown embeds the .req/.resp files of its linked traffic by
+// READING them back. Read from the live root, a record whose body is now empty
+// re-inherited the previous generation's body at the same host/id.
+func TestFSExportNoStaleBodyInFinding(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "SECRET-FROM-RUN-ONE")
+
+	base := filepath.Join(t.TempDir(), "out")
+	_, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(base+"-traffic", "alpha.example", "0001.resp.body"))
+
+	// Record B takes the same host/id in the next generation, with no body, and
+	// carries the finding.
+	_, err = db.NewRaw("DELETE FROM http_records").Exec(ctx)
+	require.NoError(t, err)
+	fsSeedRecord(t, db, "rec-b", "alpha.example", "/b", "")
+	require.NoError(t, database.NewRepository(db).SaveFindingDirect(ctx, &database.Finding{
+		HTTPRecordUUIDs: []string{"rec-b"},
+		ModuleID:        "mod-b",
+		ModuleName:      "Module B",
+		ModuleType:      "active",
+		Severity:        "high",
+		Confidence:      "firm",
+		FindingHash:     "hash-b",
+		URL:             "https://alpha.example/b",
+		Hostname:        "alpha.example",
+		Description:     "finding b",
+	}))
+
+	_, err = writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+
+	md, err := os.ReadFile(filepath.Join(base+"-findings", "alpha.example", "0001.md"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(md), "SECRET-FROM-RUN-ONE",
+		"a finding must not embed the previous generation's response body")
+	assert.NoFileExists(t, filepath.Join(base+"-traffic", "alpha.example", "0001.resp.body"))
+}
+
+// An empty directory is one of ours by construction (a published generation
+// always has an index.json, and a half-made one has nothing worth keeping).
+func TestFSExportPublishesOverAnEmptyDir(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
+
+	base := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.MkdirAll(base+"-traffic", 0o755))
+
+	_, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+	assert.FileExists(t, filepath.Join(base+"-traffic", "alpha.example", "0001.req"))
+}
+
+// A kill -9 between creating a staging tree and publishing it leaves one
+// behind. Nothing else sweeps it, so the next export to the same destination
+// does — but only once it is old enough not to be a live concurrent export.
+func TestFSExportSweepsAbandonedStagingTrees(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
+
+	dir := t.TempDir()
+	base := filepath.Join(dir, "out")
+
+	stale := filepath.Join(dir, ".out-traffic.staging-deadbeef")
+	require.NoError(t, os.MkdirAll(stale, 0o755))
+	old := time.Now().Add(-48 * time.Hour)
+	require.NoError(t, os.Chtimes(stale, old, old))
+
+	fresh := filepath.Join(dir, ".out-traffic.staging-cafe")
+	require.NoError(t, os.MkdirAll(fresh, 0o755))
+
+	_, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+
+	assert.NoDirExists(t, stale, "an abandoned staging tree must be collected")
+	assert.DirExists(t, fresh, "a recent staging tree may belong to a live export")
+}
+
+// The staging directory IS the published root after the rename, so its mode is
+// the tree's mode. os.MkdirTemp would have made it 0700 while the host
+// directories inside stayed 0755.
+func TestFSExportRootKeepsDirectoryMode(t *testing.T) {
+	ctx := context.Background()
+	db := newExportTestDB(t)
+	fsSeedRecord(t, db, "rec-a", "alpha.example", "/a", "body-a")
+
+	base := filepath.Join(t.TempDir(), "out")
+	_, err := writeFSExport(ctx, db, database.QueryFilters{}, base, fsExportOptions{})
+	require.NoError(t, err)
+
+	root, err := os.Stat(base + "-traffic")
+	require.NoError(t, err)
+	host, err := os.Stat(filepath.Join(base+"-traffic", "alpha.example"))
+	require.NoError(t, err)
+	assert.Equal(t, host.Mode().Perm(), root.Mode().Perm(),
+		"the published root and the host directories inside it must agree")
 }

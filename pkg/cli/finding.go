@@ -163,6 +163,7 @@ func init() {
 	f.BoolVar(&findingMarkdown, "markdown", false, "Render the matched findings as Markdown (evidence + request/response in fenced http blocks) to stdout; response bodies are compacted to a preview by default (use --full-body for whole bodies)")
 	f.BoolVarP(&globalStateless, "stateless", "S", false, "Read from --db (a .jsonl export or standalone .sqlite) with project scoping off; never writes to your project DB")
 	f.StringVar(&globalGlobDB, "glob-db", "", "Read across a glob of result files merged into one temporary DB (e.g. --glob-db 'scans/*.sqlite'); implies -S")
+	f.BoolVar(&globalGlobStrict, "glob-strict", false, "Fail the read on the first --glob-db source that cannot be imported, instead of skipping it with a warning")
 	f.BoolVar(&findingWithRecords, "with-records", false, "With --json: resolve and embed the linked HTTP records (self-contained triage bundle)")
 	f.StringSliceVar(&findingColumns, "columns", nil, "Columns to show (comma-separated, e.g. ID,SEVERITY,MODULE)")
 	f.StringSliceVar(&findingExclude, "exclude-columns", nil, "Columns to hide (comma-separated)")

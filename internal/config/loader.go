@@ -3,9 +3,12 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"gopkg.in/yaml.v3"
@@ -170,46 +173,119 @@ func ApplyProfile(settings *Settings, profile *ProfileSettings) error {
 	return nil
 }
 
+// LoadError reports a configuration file that could not be used, and names the
+// file. Every LoadSettings failure is one of these.
+//
+// Explicit distinguishes the two cases a caller must handle differently. A file
+// the operator named with --config is load-bearing: failing to read it means
+// running under settings they did not choose, so the caller fails. A file found
+// by discovery is a convenience; an unreadable one warns and falls back to
+// defaults. The distinction used to be invisible — LoadSettings returned a bare
+// fmt.Errorf and ~35 call sites answered it with `settings = DefaultSettings()`,
+// so `--config ./prod.yaml` with a typo in it ran the scan against the DEFAULT
+// database and reported success.
+//
+// Op is "stat", "read" or "parse": which step failed, for a caller that wants to
+// word its own message. Err is the underlying error and unwraps, so
+// errors.Is(err, fs.ErrNotExist) still works.
+type LoadError struct {
+	Path     string
+	Explicit bool
+	Op       string
+	Err      error
+}
+
+func (e *LoadError) Error() string {
+	verb := "load"
+	switch e.Op {
+	case "stat":
+		verb = "access"
+	case "read":
+		verb = "read"
+	case "parse":
+		verb = "parse"
+	}
+	return fmt.Sprintf("config file %s: cannot %s it: %v", e.Path, verb, e.Err)
+}
+
+func (e *LoadError) Unwrap() error { return e.Err }
+
 // LoadSettings loads configuration from YAML file
 // Search paths (in order):
 //  1. --config flag path (if specified)
 //  2. $HOME/.vigolium/vigolium-configs.yaml
 //  3. ./vigolium-configs.yaml
+//
+// Every failure is a *LoadError. Use LoadSettingsWithWarnings (or, in the CLI,
+// clicommon.LoadSettings) when the non-fatal diagnostics matter too.
 func LoadSettings(configPath string) (*Settings, error) {
-	var path string
+	settings, _, err := LoadSettingsWithWarnings(configPath)
+	return settings, err
+}
 
-	// If config path is explicitly provided, use it
-	if configPath != "" {
+// LoadSettingsWithWarnings is LoadSettings plus the diagnostics that are worth
+// printing but must not fail the command: unknown keys, and a cwd config file
+// that discovery passed over.
+//
+// Both describe a file the operator wrote that is not doing what they think it
+// is, which is otherwise indistinguishable from the setting having no effect.
+// They are returned rather than printed so this package stays free of output
+// policy (--silent, machine modes) that only the CLI knows.
+func LoadSettingsWithWarnings(configPath string) (*Settings, []string, error) {
+	var (
+		path     string
+		explicit = configPath != ""
+		warnings []string
+	)
+
+	if explicit {
 		path = ExpandPath(configPath)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			return nil, fmt.Errorf("config file not found: %s", path)
+		if _, err := os.Stat(path); err != nil {
+			return nil, nil, &LoadError{Path: path, Explicit: true, Op: "stat", Err: err}
 		}
 	} else {
-		// Try default locations
-		paths := []string{
-			ExpandPath("~/.vigolium/vigolium-configs.yaml"),
-			"./vigolium-configs.yaml",
-		}
+		home := ExpandPath("~/.vigolium/vigolium-configs.yaml")
+		const cwdConfig = "./vigolium-configs.yaml"
 
 		found := false
-		for _, p := range paths {
-			if _, err := os.Stat(p); err == nil {
+		for _, p := range []string{home, cwdConfig} {
+			_, err := os.Stat(p)
+			if err == nil {
 				path = p
 				found = true
 				break
+			}
+			// ONLY a missing file falls through to the next candidate. A permission
+			// error, a dangling symlink or an I/O error on ~/.vigolium means the
+			// operator's config exists and could not be looked at, and silently
+			// continuing to the next candidate (or to defaults) answered that with
+			// a scan configured by nobody.
+			if !errors.Is(err, fs.ErrNotExist) {
+				return nil, nil, &LoadError{Path: p, Explicit: false, Op: "stat", Err: err}
 			}
 		}
 
 		// If no config file found, return default settings
 		if !found {
-			return DefaultSettings(), nil
+			return DefaultSettings(), nil, nil
+		}
+
+		// Discovery is first-match-wins, so a project-local ./vigolium-configs.yaml
+		// is INVISIBLE whenever the home file exists. Someone who drops one in a
+		// repo expecting it to apply gets no error and no effect; say so.
+		if path == home {
+			if _, err := os.Stat(cwdConfig); err == nil {
+				warnings = append(warnings, fmt.Sprintf(
+					"%s is ignored because %s exists; pass --config %s to use it",
+					cwdConfig, ContractPath(home), cwdConfig))
+			}
 		}
 	}
 
 	// Read config file
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
+		return nil, nil, &LoadError{Path: path, Explicit: explicit, Op: "read", Err: err}
 	}
 
 	// Expand environment variables in YAML content
@@ -218,7 +294,11 @@ func LoadSettings(configPath string) (*Settings, error) {
 	// Parse YAML on top of defaults so unspecified sections keep sensible values
 	settings := *DefaultSettings()
 	if err := yaml.Unmarshal([]byte(content), &settings); err != nil {
-		return nil, fmt.Errorf("failed to parse config file: %w", err)
+		return nil, nil, &LoadError{Path: path, Explicit: explicit, Op: "parse", Err: err}
+	}
+
+	if msg := unknownKeyWarning(path, content); msg != "" {
+		warnings = append(warnings, msg)
 	}
 
 	// Install the configured global User-Agent selector so every scan phase that
@@ -228,7 +308,67 @@ func LoadSettings(configPath string) (*Settings, error) {
 	// resolution time.
 	httpmsg.SetDefaultUserAgent(settings.ScanningStrategy.HTTP.UserAgent)
 
-	return &settings, nil
+	return &settings, warnings, nil
+}
+
+// unknownKeyWarning decodes content a second time with KnownFields on and
+// reports the keys that match no struct field, or "" when there are none.
+//
+// A second decode rather than one strict decode, because strictness here must
+// never fail the load: a config written for a newer vigolium, or one carrying a
+// key a build dropped, should still apply everything it CAN. But a typo
+// (`default_stratgy`) is silently inert, and "I set it and nothing changed" is
+// the single most expensive kind of configuration bug to chase.
+//
+// The throwaway destination is a zero Settings rather than defaults: nothing is
+// read out of it, and building defaults twice per load is wasted work.
+//
+// The answer is memoized per exact (path, content), because the strict decode is
+// half the cost of a whole load and its only output is a diagnostic the CLI
+// already dedupes to one line per process. A scan loads settings five times, so
+// four of those decodes could not produce anything observable. Keyed on the
+// content itself, so a file that changes mid-process is re-checked rather than
+// answered from a stale verdict.
+func unknownKeyWarning(path, content string) string {
+	cacheKey := path + "\x00" + content
+	if cached, ok := unknownKeyCache.Load(cacheKey); ok {
+		return cached.(string)
+	}
+	msg := computeUnknownKeyWarning(path, content)
+	unknownKeyCache.Store(cacheKey, msg)
+	return msg
+}
+
+// unknownKeyCache memoizes unknownKeyWarning. Bounded by the number of distinct
+// config contents a process reads, which is one or two.
+var unknownKeyCache sync.Map
+
+func computeUnknownKeyWarning(path, content string) string {
+	var throwaway Settings
+	dec := yaml.NewDecoder(strings.NewReader(content))
+	dec.KnownFields(true)
+	err := dec.Decode(&throwaway)
+	if err == nil || errors.Is(err, io.EOF) {
+		return ""
+	}
+	// A *yaml.TypeError lists every offending key at once. Anything else here is
+	// a parse failure the lenient decode above already accepted, so it is not an
+	// unknown key and saying "unknown key" about it would be wrong.
+	var typeErr *yaml.TypeError
+	if !errors.As(err, &typeErr) {
+		return ""
+	}
+	var unknown []string
+	for _, e := range typeErr.Errors {
+		if strings.Contains(e, "not found in type") {
+			unknown = append(unknown, e)
+		}
+	}
+	if len(unknown) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("config file %s has %d key(s) vigolium does not recognize (they have no effect): %s",
+		path, len(unknown), strings.Join(unknown, "; "))
 }
 
 // DefaultSettings returns default configuration

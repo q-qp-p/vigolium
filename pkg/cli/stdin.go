@@ -3,6 +3,7 @@ package cli
 import (
 	"time"
 
+	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 )
 
@@ -13,8 +14,8 @@ import (
 // producer could block forever.
 //
 // Commands that do not register --input-read-timeout still get the default
-// deadline through globalInputReadTimeout, because the zero value there means
-// "no deadline" and a command with no dial is exactly the one a caller cannot
+// deadline, because globalInputReadTimeout is initialized to it: zero now means
+// "no deadline", and a command with no dial is exactly the one a caller cannot
 // rescue.
 //
 // See pkg/cli/internal/clicommon/stdin.go for why the read runs on a goroutine.
@@ -22,20 +23,49 @@ func readStdin() ([]byte, error) {
 	return clicommon.ReadStdinBounded(clicommon.DefaultStdinLimit, stdinReadTimeout())
 }
 
-// stdinReadTimeout resolves the effective deadline. The flag is only registered
-// on the scanning and ingestion commands; everywhere else the global keeps its
-// zero value, and falling back to the same documented default there means a
-// `vigolium js` or `vigolium agent query` reading a pipe is bounded too.
+// stdinReadTimeout resolves the effective deadline. It returns the global
+// verbatim, including zero: ReadBounded treats a zero or negative timeout as
+// "no deadline", which is what --input-read-timeout 0 has always been
+// documented to mean.
+//
+// The previous version substituted the default whenever the global was <= 0, so
+// `--input-read-timeout 0` silently re-armed the three-minute deadline it was
+// asked to remove — the one value a caller passes precisely because their
+// producer is slower than any deadline they can guess. The default now lives in
+// the variable's initializer instead (see globalInputReadTimeout in root.go), so
+// a command that never registers the flag is still bounded.
 func stdinReadTimeout() time.Duration {
-	if globalInputReadTimeout > 0 {
-		return globalInputReadTimeout
-	}
-	return defaultInputReadTimeout
+	return globalInputReadTimeout
 }
 
 // defaultInputReadTimeout matches the --input-read-timeout default registered in
-// flag_helpers.go. Both sides read this constant so they cannot drift.
+// flag_helpers.go and the globalInputReadTimeout initializer. All three sides
+// read this constant so they cannot drift.
 const defaultInputReadTimeout = 3 * time.Minute
+
+// inputReadTimeoutFlag is the flag name, shared by the registration helper and
+// the negative-value check in PersistentPreRunE.
+const inputReadTimeoutFlag = "input-read-timeout"
+
+// validateInputReadTimeout rejects a negative --input-read-timeout. It reads the
+// flag off the resolved command, so it is a no-op for the commands that don't
+// register it, and it only fires when the flag was actually typed — the default
+// can never be negative, and a Changed check keeps the error about the user's
+// input rather than about the program's state.
+func validateInputReadTimeout(cmd *cobra.Command) error {
+	if cmd == nil {
+		return nil
+	}
+	f := cmd.Flags().Lookup(inputReadTimeoutFlag)
+	if f == nil || !f.Changed {
+		return nil
+	}
+	if globalInputReadTimeout < 0 {
+		return usageErrorf("--%s must be >= 0 (0 disables the deadline), got %s",
+			inputReadTimeoutFlag, globalInputReadTimeout)
+	}
+	return nil
+}
 
 // resolveStdinInput decides whether a scan should drain stdin at all.
 //

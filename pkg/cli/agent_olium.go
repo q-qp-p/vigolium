@@ -74,7 +74,7 @@ func runAgentOlium(cmd *cobra.Command, args []string) error {
 	// matching the pre-config behavior.
 	var oliumCfg config.OliumConfig
 	var sessionsDir string
-	if settings, err := config.LoadSettings(globalConfig); err == nil {
+	if settings := settingsOrDefaults(); settings != nil {
 		oliumCfg = settings.Agent.Olium
 		sessionsDir = settings.Agent.EffectiveSessionsDir()
 	}

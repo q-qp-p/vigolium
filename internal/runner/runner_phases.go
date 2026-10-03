@@ -43,6 +43,12 @@ import (
 // other's descriptors.
 var stderrCaptureActive atomic.Bool
 
+// cursorFlushBudget bounds the post-round cursor checkpoint. It runs on a
+// context detached from the phase's, so it needs a bound of its own; ten seconds
+// is generous for one UPDATE and short enough that a wedged database delays
+// teardown by a visible-but-tolerable amount rather than hanging it.
+const cursorFlushBudget = 10 * time.Second
+
 // teeDrainTimeout bounds the wait for the stderr-capture reader to finish after
 // the write end is closed. The healthy path takes microseconds and never
 // reaches it; the timeout exists only so a wedged reader cannot hang a scan's
@@ -62,6 +68,11 @@ func (r *Runner) RunNativeScan() (err error) {
 	defer close(r.done)
 	ctx := r.ctx
 
+	// A Runner is reused across agent rescans, so the phase ledger starts empty
+	// here rather than at construction — otherwise the second run's scan row
+	// would carry the first run's curtailment.
+	r.scanOutcome.reset()
+
 	// Total scan budget: when --scanning-max-duration is set, bound the WHOLE scan
 	// (all phases combined). Each phase wraps this ctx with its own per-phase
 	// deadline via phaseDeadline, which keeps the earlier deadline — so phases can
@@ -78,7 +89,7 @@ func (r *Runner) RunNativeScan() (err error) {
 
 	plan := BuildNativeScanPlan(r.options)
 
-	infra, err := r.buildInfrastructure(plan)
+	infra, err := r.buildInfrastructure(ctx, plan)
 	if err != nil {
 		return err
 	}
@@ -148,7 +159,10 @@ func (r *Runner) RunNativeScan() (err error) {
 			// runner the single finalization owner — the server no longer overwrites.
 			finalCtx, finalCancel := context.WithTimeout(context.WithoutCancel(r.ctx), 30*time.Second)
 			defer finalCancel()
-			if completeErr := r.repository.CompleteScan(finalCtx, infra.scanUUID, errMsg); completeErr != nil {
+			// WithOutcome, not CompleteScan: the runner is the only component that
+			// saw every phase, so it is the only one that can say whether the run
+			// actually covered its input. Everything else writes "unknown".
+			if completeErr := r.repository.CompleteScanWithOutcome(finalCtx, infra.scanUUID, errMsg, r.Completion()); completeErr != nil {
 				zap.L().Warn("Failed to complete scan record", zap.Error(completeErr))
 			}
 			r.finalized.Store(true)
@@ -260,10 +274,11 @@ func (r *Runner) RunNativeScan() (err error) {
 					findingSummary = fmt.Sprintf(", findings: %d", scan.TotalFindings)
 				}
 			}
-			fmt.Fprintf(os.Stderr, "  %s Scan finished %s %s\n",
+			fmt.Fprintf(os.Stderr, "  %s Scan finished %s %s%s\n",
 				terminal.SuccessSymbol(),
 				terminal.BoldCyan(infra.scanUUID),
-				terminal.Gray(fmt.Sprintf("duration: %s%s", fmtDuration(duration), findingSummary)))
+				terminal.Gray(fmt.Sprintf("duration: %s%s", fmtDuration(duration), findingSummary)),
+				partialBannerSuffix(r.Completion()))
 		}()
 	}
 
@@ -308,11 +323,12 @@ func (r *Runner) RunNativeScan() (err error) {
 				break
 			}
 			r.inputSource = database.NewOneShotDBInputSource(r.repository.DB(), r.repository, infra.scanUUID)
-			for _, step := range plan.Steps {
+			for i, step := range plan.Steps {
 				if !step.Enabled {
 					continue
 				}
 				if ctx.Err() != nil {
+					r.recordSkippedSteps(plan.Steps[i:], scanStopReason(ctx, r.ctx))
 					break
 				}
 				if err := r.executeNativePhase(ctx, infra, step.Phase); err != nil {
@@ -325,7 +341,7 @@ func (r *Runner) RunNativeScan() (err error) {
 		return nil
 	}
 
-	for _, step := range plan.Steps {
+	for i, step := range plan.Steps {
 		if !step.Enabled {
 			continue
 		}
@@ -336,6 +352,10 @@ func (r *Runner) RunNativeScan() (err error) {
 		if ctx.Err() != nil {
 			zap.L().Warn("Scan budget (scanning-max-duration) reached; skipping remaining phases",
 				zap.String("phase", string(step.Phase)))
+			// Record the phases that never ran. Without this the scan row shows
+			// outcomes only for the phases that happened to start, which reads
+			// exactly like a scan whose plan was that short to begin with.
+			r.recordSkippedSteps(plan.Steps[i:], scanStopReason(ctx, r.ctx))
 			break
 		}
 		if err := r.executeNativePhase(ctx, infra, step.Phase); err != nil {
@@ -369,7 +389,7 @@ func (r *Runner) executeNativePhase(ctx context.Context, infra *phaseInfra, phas
 	r.currentPhase.Store(tracker)
 	defer func() {
 		r.currentPhase.Store((*phaseTracker)(nil))
-		tracker.finish(ctx, err)
+		r.scanOutcome.append(tracker.finish(ctx, err))
 	}()
 
 	switch phase {
@@ -430,7 +450,8 @@ func (r *Runner) executeNativePhase(ctx context.Context, infra *phaseInfra, phas
 		r.scanLogger.Info("discovery", "phase started")
 		if err := r.runDiscoveryPhase(ctx, infra); err != nil {
 			r.scanLogger.Error("discovery", "phase failed: "+err.Error())
-			tracker.noteError(err)
+			// No noteError here: this error is RETURNED, so it ends the scan and
+			// rides out on scan.finished. The tracker records it once, in finish.
 			return fmt.Errorf("discovery phase failed: %w", err)
 		}
 		r.scanLogger.Info("discovery", "phase completed")
@@ -484,6 +505,11 @@ func (r *Runner) executeNativePhase(ctx context.Context, infra *phaseInfra, phas
 		} else {
 			zap.L().Info("No modules to execute")
 			r.scanLogger.Info("dynamic-assessment", "skipped, no modules to execute")
+			// Skipped, not completed: a scan that ran no modules at all must not
+			// be reportable as a clean assessment. It is still a COMPLETE scan —
+			// nothing was missed, there was nothing to do — which is why
+			// no_modules is the one skip reason Completion treats as benign.
+			tracker.markSkipped(database.ReasonNoModules)
 		}
 	}
 	return nil
@@ -504,16 +530,21 @@ func (r *Runner) executeNativePhase(ctx context.Context, infra *phaseInfra, phas
 // preserving prior behavior. Each pass emits one feedback line when it removes
 // anything.
 func (r *Runner) cleanupDeparosRecords(ctx context.Context) {
-	report := func(label string, n int64, codes map[int]int64) {
-		if n <= 0 {
+	report := func(label string, res database.RecordCleanupResult) {
+		if res.Deleted <= 0 && res.KeptReferenced <= 0 {
 			return
 		}
-		detail := fmt.Sprintf("%s %s records", label, terminal.Orange(fmt.Sprintf("%d", n)))
-		if len(codes) > 0 {
-			detail += " — " + formatStatusCodeMap(codes)
+		detail := fmt.Sprintf("%s %s records", label, terminal.Orange(fmt.Sprintf("%d", res.Deleted)))
+		if len(res.ByStatus) > 0 {
+			detail += " — " + formatStatusCodeMap(res.ByStatus)
+		}
+		// Say when a pass spared evidence, so a smaller-than-expected deletion
+		// count does not read as the pass having failed.
+		if res.KeptReferenced > 0 {
+			detail += fmt.Sprintf(" (kept %d referenced by findings)", res.KeptReferenced)
 		}
 		r.printPhaseFeedback("Discovery", detail)
-		r.scanLogger.Info("discovery", fmt.Sprintf("%s %d records", label, n))
+		r.scanLogger.Info("discovery", fmt.Sprintf("%s %d records (kept %d referenced)", label, res.Deleted, res.KeptReferenced))
 	}
 
 	// Refresh query-planner statistics before the dedup window queries run:
@@ -531,33 +562,38 @@ func (r *Runner) cleanupDeparosRecords(ctx context.Context) {
 				KeepPerPath:    dedupCfg.KeepPerPathStatuses(),
 				PerPathCap:     dedupCfg.PerPathCapValue(),
 			}
-			dropped, codes, err := r.repository.ApplyDeparosStatusPolicy(ctx, r.options.ProjectUUID, statusPolicy)
+			res, err := r.repository.ApplyDeparosStatusPolicy(ctx, r.options.ProjectUUID, statusPolicy)
 			if err != nil {
 				zap.L().Warn("Deparos status-policy cleanup failed", zap.Error(err))
 			} else {
-				report("dropped client-error", dropped, codes)
+				report("dropped client-error", res)
 			}
 		}
 		if dedupCfg.NormalizeReflectedEnabled() {
-			deleted, codes, err := r.repository.DeduplicateDeparosByNormHash(ctx, r.options.ProjectUUID)
+			res, err := r.repository.DeduplicateDeparosByNormHash(ctx, r.options.ProjectUUID)
 			if err != nil {
 				zap.L().Warn("Deparos reflected-URL dedup failed", zap.Error(err))
 			} else {
-				report("collapsed reflected-URL", deleted, codes)
+				report("collapsed reflected-URL", res)
 			}
 		}
 	}
 
-	softDeleted, codes, err := r.repository.DeduplicateSoftDeparosRecords(ctx, r.options.ProjectUUID)
+	softRes, err := r.repository.DeduplicateSoftDeparosRecords(ctx, r.options.ProjectUUID)
 	if err != nil {
 		zap.L().Warn("Deparos soft deduplication failed", zap.Error(err))
 	} else {
-		report("soft-deduplicated", softDeleted, codes)
+		report("soft-deduplicated", softRes)
 	}
 }
 
 // buildInfrastructure extracts common setup from the old RunNativeScan into a reusable struct.
-func (r *Runner) buildInfrastructure(plan NativeScanPlan) (*phaseInfra, error) {
+//
+// ctx is the scan context (already carrying --scanning-max-duration when set),
+// threaded in so the one piece of setup that talks to the network — the session
+// login flows — is cancellable and bounded like everything else. Nothing else
+// here blocks: the rest is in-process construction.
+func (r *Runner) buildInfrastructure(ctx context.Context, plan NativeScanPlan) (*phaseInfra, error) {
 	// Auto-generate scan UUID when not provided via --scan-uuid
 	scanUUID := r.options.ScanUUID
 	if scanUUID == "" {
@@ -580,10 +616,13 @@ func (r *Runner) buildInfrastructure(plan NativeScanPlan) (*phaseInfra, error) {
 		infra.jsEngine = r.sharedInfra.JSEngine
 		infra.hookChain = r.sharedInfra.HookChain
 		// Still need to initialize sessions
-		if err := r.initSessions(infra); err != nil {
+		if err := r.initSessions(ctx, infra); err != nil {
 			if len(r.options.AuthFiles) > 0 || len(r.options.AuthInline) > 0 {
 				return nil, fmt.Errorf("session initialization failed: %w", err)
 			}
+			// Continuing unauthenticated. Recorded so the assessment phases can
+			// say so instead of letting a wall of 401s read as an open app.
+			infra.authFailureReason = authFailureReason(ctx, err)
 			zap.L().Warn("Failed to initialize sessions", zap.Error(err))
 		}
 		return infra, nil
@@ -641,7 +680,7 @@ func (r *Runner) buildInfrastructure(plan NativeScanPlan) (*phaseInfra, error) {
 		Options:      r.options,
 		Notifier:     infra.notifier,
 		DedupManager: r.dedupManager,
-		RateLimiter:  buildScanRateLimiter(r.options.RateLimit),
+		RateLimiter:  buildScanRateLimiter(effectiveRateLimit(r.options)),
 	}
 
 	if r.options.ShouldUseHostError() {
@@ -718,12 +757,15 @@ func (r *Runner) buildInfrastructure(plan NativeScanPlan) (*phaseInfra, error) {
 	// Initialize multi-session support for IDOR/BOLA testing. Skipped when no
 	// enabled phase will reach the target: see reachesTarget above.
 	if reachesTarget {
-		if err := r.initSessions(infra); err != nil {
+		if err := r.initSessions(ctx, infra); err != nil {
 			// If the user explicitly configured sessions, surface the error clearly
 			hasCLIAuth := len(r.options.AuthFiles) > 0 || len(r.options.AuthInline) > 0
 			if hasCLIAuth && !r.options.AuthBestEffort {
 				return nil, fmt.Errorf("session initialization failed: %w", err)
 			}
+			// Continuing unauthenticated. Recorded so the assessment phases can
+			// say so instead of letting a wall of 401s read as an open app.
+			infra.authFailureReason = authFailureReason(ctx, err)
 			zap.L().Warn("Failed to initialize sessions, continuing without session support", zap.Error(err))
 		}
 	}
@@ -884,7 +926,7 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 	// legs are bounded independently rather than sharing one budget. A ctx error
 	// means this leg's max_duration (or the overall scan) elapsed — that is a
 	// curtailment, not a failure.
-	nucleiCtx, nucleiCancel := phaseDeadline(ctx, kisMaxDuration)
+	nucleiCtx, nucleiCancel := r.trackedPhaseDeadline(ctx, kisMaxDuration)
 	defer nucleiCancel()
 	if err := r.runKnownIssueScan(nucleiCtx, infra, onResult, inScopeHosts); err != nil {
 		if nucleiCtx.Err() != nil {
@@ -901,7 +943,7 @@ func (r *Runner) runKnownIssueScanPhase(ctx context.Context, infra *phaseInfra) 
 	// network) and normally finishes well within this budget. Worst-case phase
 	// wall-clock is ~2× max_duration, capped by the overall scan budget. A ctx error
 	// is a curtailment, distinct from a genuine scanner failure.
-	secretScanCtx, secretScanCancel := phaseDeadline(ctx, kisMaxDuration)
+	secretScanCtx, secretScanCancel := r.trackedPhaseDeadline(ctx, kisMaxDuration)
 	defer secretScanCancel()
 	if err := r.runSecretScanBatch(secretScanCtx, infra, onResult, inScopeHosts); err != nil {
 		if secretScanCtx.Err() != nil {
@@ -1342,6 +1384,34 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	// nextjs_chunk_audit's per-host discovery map).
 	activeModules = freshenPerScanModules(activeModules)
 
+	// The requester every module in this phase sends through. Under
+	// session.use_in_discovery: false the primary session's credentials are
+	// deliberately absent from infra.httpRequester (discovery and spidering must
+	// stay anonymous) and arrive here instead, on a view that shares that
+	// requester's pool, limiter and carried browser sessions. Derived ONCE for the
+	// phase: a view per round or per module would split the response cache
+	// partition and the connection pool for no gain.
+	daRequester, err := r.assessmentRequester(infra)
+	if err != nil {
+		return fmt.Errorf("dynamic-assessment: %w", err)
+	}
+
+	// Configured authentication that never reached the scan means the assessment
+	// is probing an authenticated app anonymously. Report it rather than let the
+	// resulting 401s read as an application with nothing behind the login.
+	if infra.authFailureReason != "" {
+		r.printPhaseDetail(fmt.Sprintf("%s configured authentication could not be applied — assessment runs unauthenticated.",
+			terminal.Yellow(terminal.SymbolWarning)))
+		r.scanLogger.Warn("dynamic-assessment", "configured authentication could not be applied — assessment runs unauthenticated")
+		tracker := r.currentPhase.Load()
+		// auth_unavailable is always marked so a consumer has one code to look
+		// for; the specific cause (cancelled, login_budget, …) rides alongside.
+		// They coincide when the cause is an ordinary failure, and marking is
+		// idempotent per code, so that case reports one reason.
+		tracker.markPartial(database.ReasonAuthUnavailable)
+		tracker.markPartial(infra.authFailureReason)
+	}
+
 	// Wire compare session clients into the authz-compare module
 	if len(infra.compareSessions) > 0 {
 		clients := make([]*http.Requester, len(infra.compareSessions))
@@ -1372,13 +1442,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	}
 
 	// Resolve dynamic-assessment concurrency: scanning_pace.dynamic-assessment overrides global when CLI not explicit
-	daConcurrency := r.options.Concurrency
-	if r.settings != nil && !r.options.ConcurrencyExplicitlySet {
-		daPace := r.settings.ScanningPace.ResolvePhase("dynamic-assessment")
-		if daPace.Concurrency > 0 {
-			daConcurrency = daPace.Concurrency
-		}
-	}
+	daConcurrency := r.phaseConcurrency("dynamic-assessment")
 
 	// Initialize OAST service if enabled
 	var oastService *oast.Service
@@ -1426,7 +1490,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	// each round's executor would start a fresh timeout, letting total phase time
 	// reach feedbackRounds × daMaxDuration.
 	var phaseCancel context.CancelFunc
-	ctx, phaseCancel = phaseDeadline(ctx, daMaxDuration)
+	ctx, phaseCancel = r.trackedPhaseDeadline(ctx, daMaxDuration)
 	defer phaseCancel()
 
 	// Reset cursor so dynamic-assessment reads all records from the beginning
@@ -1442,12 +1506,16 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	var findingWriter *database.FindingWriter
 	if r.repository != nil {
 		recordWriter = database.NewRecordWriter(r.repository, database.RecordWriterConfig{})
-		defer recordWriter.Close()
 		// Batched, async finding persistence so module workers aren't blocked on
-		// a synchronous SaveFinding round-trip. Closed before recordWriter (LIFO)
-		// so buffered findings drain first.
+		// a synchronous SaveFinding round-trip.
 		findingWriter = database.NewFindingWriter(r.repository, database.FindingWriterConfig{})
-		defer findingWriter.Close()
+		// One deferred shutdown rather than two deferred Closes: findings drain
+		// first (today's LIFO order, and the order the data depends on — a finding's
+		// evidence is written through the record writer), and the two outcomes are
+		// reported together instead of being discarded.
+		defer func() {
+			r.shutdownWriters("dynamic-assessment", findingWriter, recordWriter)
+		}()
 	}
 
 	// phaseModuleTimeouts is shared across every per-round executor so the
@@ -1460,10 +1528,19 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	// repeat the same notice once per feedback round.
 	authWalls := newAuthWallCollector()
 
+	// One finding admission for the whole phase, for the same reason. Each round
+	// gets a fresh executor, so executor-local admission reset the per-module cap
+	// every round — a cap documented as holding for the remainder of the phase —
+	// and let a root cause already reported in an earlier round re-fire every
+	// callback and notification when the next round found it again.
+	phaseAdmission := core.NewFindingAdmission()
+
 	baseExecutorCfg := core.ExecutorConfig{
-		Workers:       daConcurrency,
-		Services:      infra.svc,
-		HTTPRequester: infra.httpRequester,
+		Workers:  daConcurrency,
+		Services: infra.svc,
+		// The authenticated view when use_in_discovery is false; otherwise
+		// infra.httpRequester itself. See assessmentRequester.
+		HTTPRequester: daRequester,
 		Repository:    r.repository,
 		RecordWriter:  recordWriter,
 		FindingWriter: findingWriter,
@@ -1480,6 +1557,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 		SkipBaseline:         true,
 		PauseCtrl:            r.pauseCtrl,
 		MaxFindingsPerModule: r.options.MaxFindingsPerModule,
+		FindingAdmission:     phaseAdmission,
 		TechFilterDisabled:   r.options.NoTechFilter || strings.EqualFold(r.options.Intensity, "deep"),
 		// Seed the per-host content-class fallback from the heuristics root probe
 		// so markup-only passive modules (clickjacking, autocomplete, SRI, mixed-
@@ -1752,6 +1830,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 			oastService.SetRequestUUIDResolver(executor.ResolveRequestUUID)
 		}
 		_, err := executor.Execute(ctx)
+		r.currentPhase.Load().noteExecution(executor.Report())
 		if metrics := executor.ModuleMetrics(); len(metrics) > 0 {
 			logModuleMetrics(metrics)
 		}
@@ -1782,13 +1861,35 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 		}
 	}
 
-	// Feedback loop: re-scan newly discovered URLs
+	// Feedback loop: re-scan newly discovered URLs.
+	//
+	// roundsRun / roundErr / deadlineHit record HOW the loop ended, because the
+	// completion line used to claim "all rounds completed" on every exit path
+	// including a round that errored out — the one case where it was certainly
+	// false. roundErr is returned at the end rather than swallowed: a round that
+	// failed is a failed phase, and the scan continues past it exactly as it does
+	// past any other non-fatal phase error.
+	var (
+		roundsRun   int
+		roundErr    error
+		deadlineHit bool
+	)
 	for round := 0; round < feedbackRounds; round++ {
-		processed, err := r.runDynamicAssessmentRound(ctx, infra, round, inScopeHosts, activeModules, passiveModules, baseExecutorCfg, oastService)
+		res, err := r.runDynamicAssessmentRound(ctx, infra, round, inScopeHosts, activeModules, passiveModules, baseExecutorCfg, oastService)
+		roundsRun = round + 1
 		if err != nil {
 			zap.L().Error("DynamicAssessment: executor error", zap.Error(err), zap.Int("round", round))
+			roundErr = err
 			break
 		}
+		// A checkpoint that did not land means the next round would re-read the
+		// same resume cursor and re-serve the records this one just scanned. Stop
+		// instead of burning the remaining rounds on repeated work; the phase is
+		// already marked partial, so the shortfall is reported rather than hidden.
+		if res.checkpointFailed {
+			break
+		}
+		processed := res.processed
 
 		// Deduplicate findings after each dynamic-assessment round, scoped to the
 		// hosts being scanned. DA runs before known-issue-scan and only scans
@@ -1801,6 +1902,7 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 		if ctx.Err() != nil {
 			zap.L().Info("DynamicAssessment: phase deadline reached, stopping feedback loop",
 				zap.Int("round", round+1), zap.Error(ctx.Err()))
+			deadlineHit = true
 			break
 		}
 
@@ -1834,10 +1936,32 @@ func (r *Runner) runDynamicAssessmentPhase(ctx context.Context, infra *phaseInfr
 	}
 
 	elapsed := time.Since(phaseStart)
-	r.printPhaseComplete("DynamicAssessment", fmt.Sprintf("all rounds completed in %s", terminal.HiPurple(fmtDuration(elapsed))))
+	r.printPhaseComplete("DynamicAssessment", dynamicAssessmentExitLine(roundsRun, elapsed, roundErr, deadlineHit))
 	r.reportAuthWalls("DynamicAssessment", authWalls)
 
+	if roundErr != nil {
+		r.currentPhase.Load().markPartial(database.ReasonRoundError)
+		return fmt.Errorf("dynamic-assessment round %d: %w", roundsRun, roundErr)
+	}
 	return nil
+}
+
+// dynamicAssessmentExitLine describes how the feedback loop actually ended.
+//
+// It used to print "all rounds completed in …" unconditionally — on a round that
+// errored, on a phase cut off at its deadline, and on a loop that stopped early
+// because there was nothing left to scan. Three of the four cases were false, and
+// the one an operator most needs to see (a failed round) was the most misleading.
+func dynamicAssessmentExitLine(rounds int, elapsed time.Duration, roundErr error, deadlineHit bool) string {
+	d := terminal.HiPurple(fmtDuration(elapsed))
+	switch {
+	case roundErr != nil:
+		return fmt.Sprintf("stopped after round %d error in %s", rounds, d)
+	case deadlineHit:
+		return fmt.Sprintf("stopped at phase deadline after %d round(s) in %s", rounds, d)
+	default:
+		return fmt.Sprintf("completed %d round(s) in %s", rounds, d)
+	}
 }
 
 func (r *Runner) runDynamicAssessmentRound(
@@ -1849,7 +1973,8 @@ func (r *Runner) runDynamicAssessmentRound(
 	passiveModules []modules.PassiveModule,
 	baseCfg core.ExecutorConfig,
 	oastService *oast.Service,
-) (int64, error) {
+) (daRoundResult, error) {
+	var res daRoundResult
 	roundStart := time.Now()
 	dbSource := database.NewRiskPrioritizedDBInputSource(r.repository.DB(), r.repository, infra.scanUUID).
 		WithHostScopes(inScopeHosts).
@@ -1860,6 +1985,36 @@ func (r *Runner) runDynamicAssessmentRound(
 		oastService.SetRequestUUIDResolver(executor.ResolveRequestUUID)
 	}
 	_, err := executor.Execute(ctx)
+	tracker := r.currentPhase.Load()
+	tracker.noteExecution(executor.Report())
+
+	// Checkpoint the round's cursor, with a reported result.
+	//
+	// On a detached context with its own short budget: ctx is already expired on
+	// the path that most needs this (a phase deadline, a Ctrl-C), and a checkpoint
+	// that cannot be written is exactly the condition this exists to surface, so
+	// running it on the dead context would guarantee the failure it is testing
+	// for. WithoutCancel keeps the request values and drops the cancellation.
+	flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), cursorFlushBudget)
+	flushErr := dbSource.FlushCursor(flushCtx)
+	flushCancel()
+	if flushErr != nil {
+		// The round's work is done but the cursor does not know it. Reporting the
+		// phase as partial is what keeps the scan row from reading as a clean
+		// predecessor — a later scan-on-receive run inherits a completed scan's
+		// cursor, so a lying checkpoint under a clean verdict is how records get
+		// skipped permanently rather than merely re-scanned.
+		zap.L().Error("DynamicAssessment: failed to checkpoint the scan cursor; the round's records may be re-served",
+			zap.Int("round", round+1), zap.Error(flushErr))
+		r.scanLogger.Error("dynamic-assessment",
+			fmt.Sprintf("round %d: scan cursor checkpoint failed: %s", round+1, flushErr))
+		tracker.markPartial(database.ReasonCheckpointFailed)
+		res.checkpointFailed = true
+	}
+	if unresolved := dbSource.Unresolved(); unresolved > 0 {
+		zap.L().Warn("DynamicAssessment: round ended with records still unresolved; they stay behind the cursor and will be re-served",
+			zap.Int("round", round+1), zap.Int("unresolved", unresolved))
+	}
 
 	if metrics := executor.ModuleMetrics(); len(metrics) > 0 {
 		logModuleMetrics(metrics)
@@ -1869,10 +2024,11 @@ func (r *Runner) runDynamicAssessmentRound(
 	}
 	infra.httpRequester.LogPoolStats()
 	if err != nil {
-		return 0, err
+		return res, err
 	}
 
 	processed := executor.Processed()
+	res.processed = processed
 	roundElapsed := time.Since(roundStart)
 	// Surface how many redundant value-only-different records the param-shape
 	// coalescing skipped this round, so the reduced item count isn't mistaken
@@ -1895,7 +2051,22 @@ func (r *Runner) runDynamicAssessmentRound(
 		fields = append(fields, zap.Int64("findings_dropped_unconfirmed", suppressed))
 	}
 	zap.L().Info("DynamicAssessment: round completed", fields...)
-	return processed, nil
+	return res, nil
+}
+
+// daRoundResult is what one dynamic-assessment feedback round reports back to the
+// loop that drives it.
+//
+// checkpointFailed is here rather than folded into the returned error because the
+// two mean different things to the caller: an error ends the phase, while a
+// failed checkpoint means the round's WORK succeeded and only its bookkeeping
+// did not. The loop must stop either way — a cursor that did not advance makes
+// the next round re-serve the same records forever — but a scan that produced
+// findings should not be reported as a failed phase because one UPDATE lost a
+// race with a locked database.
+type daRoundResult struct {
+	processed        int64
+	checkpointFailed bool
 }
 
 func (r *Runner) countRemainingDynamicAssessmentRecords(ctx context.Context, scanUUID string, hosts []database.HostTarget) (int64, error) {
@@ -1974,9 +2145,13 @@ func (r *Runner) runKnownIssueScan(ctx context.Context, infra *phaseInfra, onRes
 		ScanUUID:    r.options.ScanUUID,
 		ProjectUUID: r.options.ProjectUUID,
 		ProxyURL:    r.options.ProxyURL,
-		Headers:     r.options.Headers,
-		OnResult:    onResult,
-		Repository:  r.repository,
+		// nuclei runs its own HTTP stack, so it cannot use the assessment
+		// requester's view — it needs the headers themselves. Under
+		// use_in_discovery: false this is the only way the primary session
+		// reaches this phase; it previously ran unauthenticated.
+		Headers:    r.assessmentHeaderSlice(infra),
+		OnResult:   onResult,
+		Repository: r.repository,
 		// nuclei owns its own HTTP stack, so it cannot page through the shared
 		// requester. These hooks give it the next best thing: the shared
 		// requester's block detection and the limiter's per-host verdict, so this
@@ -1998,9 +2173,7 @@ func (r *Runner) runKnownIssueScan(ctx context.Context, infra *phaseInfra, onRes
 
 		// scanning_pace.known-issue-scan controls speed
 		knownIssueScanPace := r.settings.ScanningPace.ResolvePhase("known-issue-scan")
-		if !r.options.ConcurrencyExplicitlySet && knownIssueScanPace.Concurrency > 0 {
-			cfg.Concurrency = knownIssueScanPace.Concurrency
-		}
+		cfg.Concurrency = r.phaseConcurrency("known-issue-scan")
 		if knownIssueScanPace.RateLimit > 0 {
 			cfg.RateLimit = knownIssueScanPace.RateLimit
 		}
@@ -2060,6 +2233,7 @@ func (r *Runner) runExternalHarvestPhase(ctx context.Context, infra *phaseInfra)
 
 	executor := core.NewExecutor(executorCfg, src, nil, nil)
 	_, err := executor.Execute(ctx)
+	r.currentPhase.Load().noteExecution(executor.Report())
 	if err != nil {
 		return err
 	}

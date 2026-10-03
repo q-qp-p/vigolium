@@ -21,10 +21,17 @@ import (
 // ProbeConfig.Headed is unset, and agent-browser subprocesses inherit it.
 const EnvBrowserHeaded = "VIGOLIUM_BROWSER_HEADED"
 
-// CaptureSourceBrowserProbe is the default `source` label written to records
-// captured by ProbeURL. Exposed so callers writing their own ProbeConfig can
-// match it (and the browser_probe tool can reuse it).
-const CaptureSourceBrowserProbe = "browser-probe"
+// Capture `source` labels written to records a browser run persists. Exposed so
+// a caller writing its own ProbeConfig, and anything that later queries those
+// records back, name the same string instead of repeating the literal.
+const (
+	// CaptureSourceBrowserProbe is ProbeURL's default, and the browser_probe
+	// tool's.
+	CaptureSourceBrowserProbe = "browser-probe"
+	// CaptureSourceWebFetchBrowser is what web_fetch labels records with in
+	// browser (rendered) mode.
+	CaptureSourceWebFetchBrowser = "web-fetch-browser"
+)
 
 // CaptureSink persists HTTP request/response pairs observed by the browser
 // during ProbeURL. The shape matches database.Repository so callers can pass
@@ -38,19 +45,33 @@ type CaptureSink interface {
 
 // DialogEvent is a JavaScript dialog (alert/confirm/prompt/beforeunload)
 // captured during a probe. Recording happens before the page's auto-handler
-// accepts it, so the page never blocks waiting for human input.
+// answers it, so the page never blocks waiting for human input. Answered is
+// how the dialog policy answered it ("accepted" or "dismissed"): under the
+// default record-dismiss policy a confirm/prompt is dismissed.
 type DialogEvent struct {
-	Type    string    `json:"type"`
-	Message string    `json:"message"`
-	URL     string    `json:"url"`
-	At      time.Time `json:"at"`
+	Type     string    `json:"type"`
+	Message  string    `json:"message"`
+	URL      string    `json:"url"`
+	At       time.Time `json:"at"`
+	Answered string    `json:"answered,omitempty"`
 }
 
 // ProbeConfig configures a single-page probe used to confirm DOM/reflected
 // XSS by observing JavaScript dialogs that fire while the page renders.
 type ProbeConfig struct {
-	URL           string
-	WaitSelector  string
+	URL string
+
+	// WaitSelector is a readiness condition: after navigation the probe waits
+	// (up to NavTimeout) for it to appear. Whether it did is reported in
+	// ProbeResult.Readiness; a timeout is not silently a success.
+	WaitSelector string
+
+	// RequireSelector makes a WaitSelector that never appeared an error:
+	// ProbeURL returns the partial result together with ErrReadinessFailed.
+	// Off by default — callers that only need dialogs or a best-effort DOM
+	// keep the result and read Readiness.
+	RequireSelector bool
+
 	WaitExtra     time.Duration
 	NavTimeout    time.Duration
 	BrowserPath   string
@@ -84,6 +105,12 @@ type ProbeConfig struct {
 	// of the two is treated as "capture disabled".
 	CaptureProjectUUID string
 
+	// CaptureBodies makes captured records keep their response bodies and
+	// headers. Off by default: without it a captured record carries only the
+	// request line and status, which keeps the dialog-confirm path fast.
+	// ProbeResult.Capture reports which were retained.
+	CaptureBodies bool
+
 	// CollectHTML asks ProbeURL to grab the post-render DOM and return it in
 	// ProbeResult.HTML. Off by default — the XSS-dialog path doesn't need
 	// it and grabbing HTML adds wall-time on large pages. The autopilot
@@ -113,12 +140,60 @@ type ProbeResult struct {
 	// is true. Kept opt-in because grabbing HTML on every XSS probe doubles the
 	// per-call wall time on large pages.
 	HTML string `json:"html,omitempty"`
+
+	// Capture is what the probe's network capture retained, read from the
+	// writer after it closed. Zero-valued (Enabled false) when no sink was
+	// wired; Enabled false with Err set when capture could not start.
+	Capture CaptureReceipt `json:"capture"`
+
+	// Readiness is the outcome of ProbeConfig.WaitSelector: ReadinessReady,
+	// ReadinessTimeout or ReadinessFailed; empty when no selector was asked
+	// for. ReadinessFailed (the bool) is true for either failure, and
+	// ReadinessDetail says what was waited for and why it ended.
+	Readiness       string `json:"readiness,omitempty"`
+	ReadinessFailed bool   `json:"readiness_failed,omitempty"`
+	ReadinessDetail string `json:"readiness_detail,omitempty"`
+}
+
+// Readiness outcomes (ProbeResult.Readiness).
+const (
+	ReadinessReady   = "ready"   // the selector appeared
+	ReadinessTimeout = "timeout" // it did not appear within the wait
+	ReadinessFailed  = "failed"  // the wait itself failed (bad selector, page gone, cancelled)
+)
+
+// ErrReadinessFailed is returned (wrapped) by ProbeURL when RequireSelector
+// is set and the selector never appeared; the partial result comes with it.
+var ErrReadinessFailed = errors.New("readiness condition not met")
+
+// applyReadiness records the outcome of the selector wait on res and returns
+// the error ProbeURL must surface (only with RequireSelector).
+func applyReadiness(res *ProbeResult, cfg ProbeConfig, waitErr error, waited time.Duration) error {
+	if cfg.WaitSelector == "" {
+		return nil
+	}
+	if waitErr == nil {
+		res.Readiness = ReadinessReady
+		return nil
+	}
+	res.ReadinessFailed = true
+	res.Readiness = ReadinessFailed
+	if errors.Is(waitErr, context.DeadlineExceeded) {
+		res.Readiness = ReadinessTimeout
+		res.ReadinessDetail = fmt.Sprintf("selector %q did not appear within %s", cfg.WaitSelector, waited)
+	} else {
+		res.ReadinessDetail = fmt.Sprintf("waiting for selector %q failed: %v", cfg.WaitSelector, waitErr)
+	}
+	if cfg.RequireSelector {
+		return fmt.Errorf("ProbeURL: %w: %s", ErrReadinessFailed, res.ReadinessDetail)
+	}
+	return nil
 }
 
 // ProbeURL launches a single-page browser session and returns any dialog
 // events that fired during navigation. Each call spins up a fresh browser
 // process; callers are responsible for budgeting concurrency.
-func ProbeURL(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
+func ProbeURL(ctx context.Context, cfg ProbeConfig) (res *ProbeResult, err error) {
 	if cfg.URL == "" {
 		return nil, errors.New("ProbeURL: URL is required")
 	}
@@ -154,7 +229,7 @@ func ProbeURL(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 	}
 	crawlerCfg.PageLoadTimeout = navTimeout
 
-	br, err := browser.New(crawlerCfg)
+	br, err := browser.NewWithContext(ctx, crawlerCfg)
 	if err != nil {
 		return nil, fmt.Errorf("ProbeURL: launch browser: %w", err)
 	}
@@ -180,13 +255,18 @@ func ProbeURL(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 			targetHost = u.Hostname()
 		}
 		writer := network.NewRepositoryWriter(cfg.CaptureSink, source, cfg.CaptureProjectUUID)
-		capture := network.New(writer, true, true, false, false, false, targetHost, "probe")
+		capture := network.New(writer, true, true, false, cfg.CaptureBodies, cfg.CaptureBodies, targetHost, "probe")
 		if startErr := capture.Start(br.RodBrowser()); startErr != nil {
 			zap.L().Debug("ProbeURL: capture start failed", zap.Error(startErr))
 			// NewRepositoryWriter starts its flush goroutine in the constructor, so
 			// the writer owns a goroutine even when the capture never started. The
 			// failure path has to close it or every failed start leaks one.
 			_ = writer.Close()
+			defer func() {
+				if res != nil {
+					res.Capture = CaptureReceipt{Err: "capture start failed: " + startErr.Error()}
+				}
+			}()
 		} else {
 			// Close the CAPTURE, not just the writer. Capture.Close is what sets
 			// c.stopped, and c.stopped is the only thing cleanupLoop ever checks —
@@ -198,9 +278,15 @@ func ProbeURL(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 			//
 			// Registered after the `defer br.Close()` above, so LIFO runs it first:
 			// capture down, then the browser.
+			//
+			// The receipt is read from the writer after that close, so a caller is
+			// told what was persisted, not merely that capture was configured.
 			defer func() {
 				if cerr := capture.Close(); cerr != nil {
 					zap.L().Debug("ProbeURL: capture close failed", zap.Error(cerr))
+				}
+				if res != nil {
+					res.Capture = newCaptureReceipt(writer.Receipt(), cfg.CaptureBodies, cfg.CaptureBodies)
 				}
 			}()
 		}
@@ -220,14 +306,11 @@ func ProbeURL(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 		}
 	}
 	if len(cfg.Headers) > 0 {
-		dict := make([]string, 0, len(cfg.Headers)*2)
-		for k, v := range cfg.Headers {
-			dict = append(dict, k, v)
-		}
-		if cleanup, herr := page.RodPage().SetExtraHeaders(dict); herr != nil {
+		// Not rod's Page.SetExtraHeaders: its "cleanup" restores the Network
+		// domain's enabled state, so deferring it disabled network events on the
+		// page before the capture had drained.
+		if herr := page.SetExtraHeaders(cfg.Headers); herr != nil {
 			zap.L().Debug("ProbeURL: set extra headers failed", zap.Error(herr))
-		} else if cleanup != nil {
-			defer cleanup()
 		}
 	}
 
@@ -239,8 +322,9 @@ func ProbeURL(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 		}, fmt.Errorf("ProbeURL: navigate: %w", err)
 	}
 
+	var waitErr error
 	if cfg.WaitSelector != "" {
-		_ = page.WaitElement(cfg.WaitSelector, navTimeout)
+		waitErr = page.WaitElement(cfg.WaitSelector, navTimeout)
 	}
 	if cfg.WaitExtra > 0 {
 		select {
@@ -261,12 +345,13 @@ func ProbeURL(ctx context.Context, cfg ProbeConfig) (*ProbeResult, error) {
 		}
 	}
 
-	return &ProbeResult{
+	res = &ProbeResult{
 		FinalURL: finalURL,
 		Title:    title,
 		Dialogs:  convertDialogs(page.DialogEvents()),
 		HTML:     html,
-	}, nil
+	}
+	return res, applyReadiness(res, cfg, waitErr, navTimeout)
 }
 
 func convertDialogs(in []browser.DialogEvent) []DialogEvent {
@@ -276,10 +361,11 @@ func convertDialogs(in []browser.DialogEvent) []DialogEvent {
 	out := make([]DialogEvent, len(in))
 	for i, ev := range in {
 		out[i] = DialogEvent{
-			Type:    ev.Type,
-			Message: ev.Message,
-			URL:     ev.URL,
-			At:      ev.At,
+			Type:     ev.Type,
+			Message:  ev.Message,
+			URL:      ev.URL,
+			At:       ev.At,
+			Answered: ev.Answered,
 		}
 	}
 	return out

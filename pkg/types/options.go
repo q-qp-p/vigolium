@@ -262,6 +262,11 @@ type Options struct {
 	SpideringHeaded        bool
 	SpideringNoCDP         bool
 	SpideringNoForms       bool
+	// SpideringBrowserInsecure turns every spidering.browser_compat exception on
+	// (--browser-insecure).
+	SpideringBrowserInsecure bool
+	// SpideringRequireAuth sets spidering.require_auth (--require-auth).
+	SpideringRequireAuth bool
 
 	// CarryBrowserSession carries the spidering browser's WAF/bot-cleared session
 	// (cookies, and — only when a non-default User-Agent is configured — the

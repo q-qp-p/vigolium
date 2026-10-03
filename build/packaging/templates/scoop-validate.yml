@@ -1,0 +1,46 @@
+  validate:
+    if: needs.prepare.outputs.validate == 'true'
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate
+          path: .
+      - name: Install through Scoop and test the package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VIGOLIUM_DISABLE_UPDATE_CHECK: '1'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-RestMethod https://raw.githubusercontent.com/ScoopInstaller/Install/1e2f334083d609986d8c8bc9e31ae8e87c39fab4/install.ps1 -OutFile "$env:RUNNER_TEMP/scoop-install.ps1"
+          if ((Get-FileHash "$env:RUNNER_TEMP/scoop-install.ps1" -Algorithm SHA256).Hash.ToLowerInvariant() -ne '94f983b190438311e006b957db7c8422709e0ba62a6c2ac04e278164108f2512') { throw 'Scoop installer checksum mismatch' }
+          & "$env:RUNNER_TEMP/scoop-install.ps1" -RunAsAdmin
+          $scoop = "$env:USERPROFILE/scoop/shims/scoop.ps1"
+          # Scoop clones buckets, so commit the candidate to a temporary bucket.
+          $testBucket = "$env:RUNNER_TEMP/vigolium-test-bucket"
+          New-Item "$testBucket/bucket" -ItemType Directory -Force | Out-Null
+          Copy-Item bucket/vigolium.json "$testBucket/bucket/vigolium.json"
+          git -C $testBucket init --initial-branch=main
+          git -C $testBucket add bucket/vigolium.json
+          git -C $testBucket -c user.name=Test -c user.email=test@example.com commit -m 'Validated candidate'
+          if ($LASTEXITCODE -ne 0) { throw 'test bucket creation failed' }
+          $testBucketUri = ([Uri]$testBucket).AbsoluteUri
+          & $scoop bucket add vigolium $testBucketUri
+          if ($LASTEXITCODE -ne 0) { throw 'test bucket registration failed' }
+          & $scoop install vigolium/vigolium
+          if ($LASTEXITCODE -ne 0) { throw 'Scoop install failed' }
+          $binary = "$env:USERPROFILE/scoop/apps/vigolium/current/vigolium.exe"
+          $versionOutput = & $binary version
+          if ($LASTEXITCODE -ne 0) { throw 'version smoke test failed' }
+          if (($versionOutput -join "`n") -notmatch [regex]::Escape($env:VERSION)) { throw 'version mismatch' }
+          & $binary --help
+          if ($LASTEXITCODE -ne 0) { throw 'help smoke test failed' }
+          $marker = Get-Content "$env:USERPROFILE/scoop/apps/vigolium/current/.vigolium-package-manager" -Raw
+          if ($marker.Trim() -ne 'scoop') { throw 'missing ownership marker' }
+          & $scoop uninstall vigolium
+          if (Test-Path $binary) { throw 'Scoop uninstall failed' }

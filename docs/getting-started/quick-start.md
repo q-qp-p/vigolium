@@ -71,8 +71,8 @@ cat urls.txt | vigolium scan
 echo "curl -X POST -d 'user=admin' https://example.com/login" | vigolium scan-request
 ```
 
-Supported input modes (`-I`): `urls`, `openapi`/`swagger`, `postman`, `curl`,
-`burpraw`, `burpxml`/`burp`, `burpscope`, `nuclei-output`/`nuclei`, `har`, and
+Supported input modes (`-I`), canonical names first: `urls`, `nuclei`, `openapi`,
+`wsdl`, `postman`, `curl`, `burpraw`, `burpxml`, `burpscope`, `har`, and
 `deparos`. Run `vigolium --list-input-mode` for aliases and examples.
 
 Note the two flags are not interchangeable: `-T/--target-file` reads its file as

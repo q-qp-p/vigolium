@@ -62,6 +62,9 @@ which installs to ` + installedBinaryPath + ` regardless of where the current
 binary lives — a warning is printed if the running binary is somewhere else
 (e.g. a ` + "`make install`" + ` build in $GOPATH/bin or a Homebrew install).
 
+Installations marked as package-managed must upgrade the binary through their
+package manager. Use --skip-binary to update only templates on those installs.
+
 Vigolium also checks npm for a newer release on startup (at most once per day)
 and prints a notice when one is available. Set ` + envDisableUpdateCheck + `=1
 to silence that check, or ` + envAutoUpdate + `=1 to have it update and re-exec
@@ -176,6 +179,10 @@ func runUpdateCmd(cmd *cobra.Command, args []string) error {
 // stderr wired to w. Shared by `vigolium update` (which streams to the console)
 // and the silent auto-update path (which captures to a buffer).
 func runInstallScript(ctx context.Context, w io.Writer) error {
+	if manager := managedPackageManager(); manager != "" {
+		return fmt.Errorf("this installation is managed by %s; %s. Use `vigolium update --skip-binary` to update only templates",
+			manager, packageManagerUpgrade(manager))
+	}
 	// install.sh is a POSIX shell installer that writes to ~/.local/bin; there
 	// is no Windows equivalent, and a stock Windows host has neither bash nor
 	// curl on PATH. Fail with the actual upgrade path rather than letting

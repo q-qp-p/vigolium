@@ -39,7 +39,8 @@ scope → scan → read → confirm → hand off
 The four load-bearing facts — **the database is the state** (scans write,
 queries read, commands compose through the DB not pipes), **three machine
 contracts** (`-j/--json` = one compact envelope for triage; `--format
-jsonl`/`export` = bulk full-fidelity stream for archival; `--events ndjson` =
+jsonl`/`export` = bulk archival stream, URL-deduplicated and confirmed-findings
+only unless you pass `--no-url-dedup`; `--events ndjson` =
 a live stream while a scan runs), **non-interactive by default** (TUI is
 `--tui`, destructive needs `--force`), and **every JSON summary hands you the
 next command** (the `query` field) — are stated in full in `SKILL.md`, always in
@@ -105,10 +106,27 @@ Control it:
 | `--markdown` | render as Markdown (evidence + fenced `http` blocks) instead of JSON | finding, traffic |
 | `--raw` | full raw HTTP request/response, human format | finding, traffic |
 | `--group-by <field>` | **count** the matched records by one field instead of listing them; `--group-limit N` bounds the buckets (default 20, `0` = all) | traffic |
+| `--max-output-bytes N` | with `--json`, cap the whole result document at N bytes by dropping whole trailing items (`0` = unlimited, the default). The document stays valid JSON and gains `output_budget` | finding, traffic, db ls |
 | `-o/--output <path>` | with `--json`, write the result document to a file and print a small receipt (path, bytes, sha256, `complete`) instead — the document never enters your context | finding, traffic, db ls |
 
 Rule of thumb: **survey with `--compact --fields`, then drill with `--id` +
 `--with-records`.** Never fetch full bodies for more than one record at a time.
+
+**`--max-output-bytes` is the backstop for the budget you actually have.**
+`-n/--limit` counts rows, and a row is anywhere from a few hundred bytes to
+megabytes, so no row count reliably stays under a context window. Cap the bytes
+directly and resume from the reported offset:
+
+```bash
+vigolium traffic -j --full-body --max-output-bytes 65536
+# → "output_budget": {"max_bytes":65536,"returned":14,"omitted":26,"next_offset":14}
+vigolium traffic -j --full-body --max-output-bytes 65536 --offset 14
+```
+
+The cut is at a record boundary, `total` still describes the whole result set
+(so an `-o` receipt reports `complete: false`), and a budget too small for the
+envelope's fixed parts fails with `error.code: "output_too_large"` rather than
+handing you an over-budget document. It requires `-j`.
 
 When you want the rows on disk rather than in context, `-o` is the cheapest
 option in the surface: the file is byte-identical to what the command would have
@@ -238,6 +256,14 @@ One JSON object per line on **stdout**, flushed per event; the human console
 stays on stderr, so `2>/dev/null` yields clean NDJSON with **zero** non-JSON
 lines. Available on `scan`, `run`, `scan-url`, `scan-request`.
 
+**`--events` owns stdout.** Anything else that would write there is refused with
+exit `2` rather than interleaved into a stream that is neither contract:
+`--ci-output-format`, `--format jsonl` without `-o` (including `-j`, which maps
+to jsonl on the scan path), `--print-finding`, `--print-traffic` and
+`--print-traffic-tree`. The error names the conflicting flag; give the other
+writer an `-o <file>` and both work. `--events` is also refused under a
+`-P/--parallel` fan-out, where each child's stdout is captured to its own log.
+
 ```jsonc
 {"v":1,"ts":"…","scan_uuid":"…","type":"scan.started","target":"https://…","strategy":"lite","phases":["heuristics-check","discovery","dynamic-assessment"],"db_path":"/tmp/…","pace":{"rate_limit":20,"concurrency":10,"max_per_host":10}}
 {"v":1,"ts":"…","scan_uuid":"…","type":"phase.started","phase":"discovery"}
@@ -260,15 +286,53 @@ What each type is for:
 | `waf.pacing` | Vigolium slowed itself down on purpose. Attribute the slowdown here, not to the target. |
 | `finding.new` | Metadata only. Evidence lives in `db_path`; query it with `finding -j --with-records` afterwards. |
 | `error` | A phase failed and the scan **carried on** — non-fatal by construction. A failure that ends the run rides on `scan.finished{status:"failed"}` instead, so this is never a reason to abandon a run that is still producing findings. |
-| `scan.finished` | Terminal. `status`, `findings_by_severity`, `records_written`. |
+| `phase.finished` | `status` plus `reasons`/`limits` (below) for that phase. |
+| `scan.interrupting` | **Nonterminal.** A shutdown began (SIGINT/SIGTERM). The terminal event still follows — do not treat this as the end of the stream. |
+| `scan.finished` | Terminal. `status`, `findings_by_severity`, `records_written`, and `stop_reason`/`reasons` when coverage was lost. |
 
-Four contracts you can build on:
+### Terminal `status` values
+
+| `status` | Means |
+|---|---|
+| `completed` | Ran to the end and covered its input. |
+| `curtailed` | Ran to the end but **did not cover everything** — a budget fired, targets failed, or records could not be stored. **Exit code is still 0.** |
+| `interrupted` | SIGINT/SIGTERM. |
+| `failed` | The run ended on an error. |
+
+`curtailed` is a downgrade of `completed` only: `failed` and `interrupted` pass
+through untouched, because a scan that failed is not a scan that was curtailed.
+
+### Coverage fields
+
+`phase.finished` and `scan.finished` carry three additive fields. A consumer
+that ignores them sees exactly the stream it saw before, and **a clean scan's
+lines are byte-identical to the pre-v0.5.2 contract** — these keys are absent,
+not empty.
+
+| Field | On | Means |
+|---|---|---|
+| `reasons[]` | both | Coverage was **lost**: `scan_budget`, `phase_deadline`, `cancelled`, `targets_failed`, `targets_skipped`, `persistence_incomplete`, `auth_unavailable`, `checkpoint_failed`, `input_incomplete`, … |
+| `limits[]` | both | A configured bound was **reached** — designed behaviour (currently `target_budget`). Never downgrades a status; do not read a correctly time-boxed target as degraded. |
+| `stop_reason` | `scan.finished` | The scan-level roll-up of why the run stopped launching work. |
+
+The same facts are persisted on the scan row as `completeness`
+(`complete`/`partial`; **empty means unknown**, which is what a pre-v0.5.2
+binary wrote), `stop_reason`, and `phase_outcomes` — readable with
+`vigolium db ls scans -j`, and carried by the REST scan object and
+`--format jsonl`. Reason codes are **add-only**: new ones appear over time, so
+match the ones you care about and ignore the rest rather than switching
+exhaustively.
+
+Five contracts you can build on:
 
 - **Every line carries `scan_uuid`.** A sweep is several `vigolium scan`
   invocations; this is how you attribute an event to one.
 - **`v` is the event-schema version.** Gate on it.
+- **`seq` is the stream's own total order**, a 1-based write counter stamped
+  under the write lock. Use it to detect a dropped line; `ts` alone cannot.
 - **`scan.finished` is always last**, including `status:"interrupted"` on
-  SIGINT/SIGTERM.
+  SIGINT/SIGTERM and `status:"curtailed"` on lost coverage. `scan.interrupting`
+  may precede it and does not end the stream.
 - **Its absence means the process was killed outright** (SIGKILL can't be
   caught). Treat a stream that stops without a terminal event as a hard kill,
   not as a completed scan.
@@ -558,7 +622,9 @@ and operational knobs: **[fuzzing.md](fuzzing.md)**.
 `finding` and `traffic` can read a file directly instead of your project DB.
 `-S/--stateless` requires `--db` and turns project scoping **off**, so every row
 in the file is shown. Nothing is written to your project DB (a JSONL source is
-loaded into a throwaway in-memory SQLite).
+loaded into a throwaway scratch SQLite **file**, deleted on exit — it was
+in-memory once, and a large export did not fit). An explicit `--project-uuid`
+(or `$VIGOLIUM_PROJECT_UUID`) still filters a stateless read.
 
 ```bash
 vigolium finding -S --db ./scan-target.jsonl --min-severity medium
@@ -700,7 +766,10 @@ Two shape notes that are not exceptions to the envelope, just to `items`:
 - `db stats -j` puts a summary **object** in `items`, not a row array — don't run
   a universal `.items[]` over it.
 - `ingest -j` has an empty `items` (`[]`); its payload is the sibling fields
-  `records_ingested`, `input_format`, `record_source`, `duration_ms`.
+  `records_ingested`, `records_failed`, `records_skipped`, `input_format`,
+  `record_source`, `duration_ms`. `records_ingested` is rows the database
+  HOLDS — it equals a `count(*)` on `http_records` for the run — and a non-zero
+  `records_failed` exits `1` with `error.code: "ingest_incomplete"`.
 
 **Errors are JSON too.** A failed `-j` command writes a parseable error object to
 **stdout** and the human `✖ Error:` line to stderr, so a consumer never has to
@@ -733,7 +802,10 @@ Those four are now genuinely distinct on a read. **A pure read command
 only about leaving the file byte-identical (below).
 
 The built-in default database is still created on first use, because a fresh
-install's first `vigolium traffic` legitimately has nothing to read yet.
+install's first `vigolium traffic` legitimately has nothing to read yet. It is
+**not** created when `--db` (or `$VIGOLIUM_DB_PATH`) pins a different store —
+first-run setup used to leave a seeded default file beside the one you asked
+for. `version`, `help` and `completion` no longer create `~/.vigolium` at all.
 
 **Single-message extraction codes** (`traffic body`, `traffic headers`) — the
 states that a filesystem export used to collapse into an empty file:
@@ -761,6 +833,7 @@ captured, and the two no longer share an answer.
   "limit": 100,
   "items": [ … ],
   "query": "vigolium traffic --uuid <uuid> --json --full-body",
+  "query_argv": ["vigolium", "traffic", "--uuid", "<uuid>", "--json", "--full-body"],
   "generated_at": "2026-09-04T10:11:12.345Z",
   "generated_at_ms": 1788453072345
 }
@@ -771,8 +844,11 @@ captured, and the two no longer share an answer.
 | `schema_version` | Gate on it. Bumped on any breaking field change. |
 | `items` | **The** row array, and the only one. The pre-envelope names (`records`, `findings`, `scans`, `rows`, `stats`) are gone from the default output: they duplicated every row on the wire, which on a 20-record compact read was 19,983 bytes against 7,884 of actual rows. `--json-legacy-keys` (or `VIGOLIUM_JSON_LEGACY_KEYS=1`) brings the alias back for a caller still migrating, at that cost. |
 | `db_path` | The database this command actually opened. Assert it; the open order ends at one shared default file, so a fall-through silently mixes engagements. |
-| `project_uuid` | The project that *would* apply — **not** proof a project filter was applied. Under `-S` scoping is off and the result spans every project, yet this field still names one. Treat it as advisory; `total` against the row count is the real check. |
+| `project_uuid` | The project filter that was **actually applied**, or absent when none was. It used to be filled from the active project regardless of the read mode, so a `-S` read spanning every project still named one. |
+| `project_scoped` | Whether a project filter was applied at all, so "unscoped" is explicit rather than inferred from a missing `project_uuid`. `false` on a plain `-S` read; `true` once you pass `--project-uuid`. |
 | `query` | A suggested follow-up. **Read it before running it** — see below. |
+| `query_argv` | The same follow-up as an argv vector. Prefer it from code: `query` is shell-quoted for a human, and re-splitting it is where the quoting breaks the parse. The two are always present or absent together — both are absent under `--glob-db`, whose merged source no argument list can reopen. |
+| `output_budget` | Present only when `--max-output-bytes` truncated the page: `{max_bytes, returned, omitted, next_offset}`. `total` still describes the whole result set. |
 | `generated_at` / `_ms` | RFC3339 with **exactly 3** fractional digits, plus an epoch-millisecond sibling. Both are safe to compare against a JS `toISOString()`; the old microsecond form sorted `…785113Z` *before* `…785Z`. |
 
 ### The `query` hint

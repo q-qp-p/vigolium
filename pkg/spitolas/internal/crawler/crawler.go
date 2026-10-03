@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/vigolium/vigolium/pkg/authsig"
+	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/action"
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/browser"
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/condition"
@@ -196,7 +197,17 @@ type Crawler struct {
 	// a confirmed default-credential login, carried forward so token-based SPAs are
 	// scanned authenticated (guarded by mu). Empty when no login succeeded.
 	harvestedAuth string
+
+	// authOps installs credentials on a page (zero value: the page's own
+	// methods). credentialHeadersWithdrawn is set once the crawl leaves the
+	// credential scope; later pages do not get the headers back (guarded by mu).
+	authOps                    pageAuthOps
+	credentialHeadersWithdrawn bool
 }
+
+// browserCountClampWarn makes the browser_count clamp warn once per process
+// rather than once per target crawl.
+var browserCountClampWarn sync.Once
 
 // Stats holds crawl statistics.
 type Stats struct {
@@ -205,11 +216,18 @@ type Stats struct {
 	ActionsExecuted     int
 	ActionsFailed       int
 	ConsecutiveFailures int // Current streak of consecutive failures
-	FormsSubmitted      int
-	BacktrackCount      int
-	InvariantFails      int
-	StartTime           time.Time
-	EndTime             time.Time
+	// FormsSubmitted counts form submissions dispatched by every mechanism
+	// (see submitMechanisms); written only by countSubmitDispatched.
+	// FormSubmitsPrevented counts submissions the interaction policy refused at
+	// a dispatch point. FormSubmitsUncertain counts POST forms whose outcome
+	// could not be attributed, so no fallback was sent.
+	FormsSubmitted       int
+	FormSubmitsPrevented int
+	FormSubmitsUncertain int
+	BacktrackCount       int
+	InvariantFails       int
+	StartTime            time.Time
+	EndTime              time.Time
 
 	// Start-redirect observations (default host-scope rule only).
 	// OffHostLanding is true when the start URL redirected the browser to a host
@@ -267,6 +285,26 @@ type Stats struct {
 	FollowUpPassesRun int
 	ActionsRetried    int
 	ActionsRecovered  int
+
+	// AuthState is the authentication outcome: AuthNotRequested,
+	// AuthConfigured, AuthApplied or AuthFailed (see page_auth.go).
+	// CredentialOriginsDenied counts hosts the operator's credential headers
+	// were kept from (outside the operator scope); CredentialHostsDenied names
+	// them — hosts only, never header values.
+	AuthState               string
+	CredentialOriginsDenied int
+	CredentialHostsDenied   []string
+
+	// AuxFetchesDenied counts URLs an in-page primer (iframe, GET-form, anchor,
+	// seed, speculative) wanted to fetch but the operator scope (or a denied
+	// login wall) did not admit — see admissibleFetchURLs.
+	AuxFetchesDenied int
+
+	// WaitConditionsFailed counts readiness (wait) conditions that timed out;
+	// WaitConditionFailures holds up to maxWaitConditionFailures of their
+	// distinct selectors.
+	WaitConditionsFailed  int
+	WaitConditionFailures []string
 }
 
 // New creates a new crawler.
@@ -319,6 +357,8 @@ func New(cfg *config.Config) (*Crawler, error) {
 	for _, wc := range cfg.WaitConditions {
 		c.waitConditions = append(c.waitConditions, condition.NewWaitConditionFromConfig(wc))
 	}
+
+	c.stats.AuthState = c.initialAuthState()
 
 	// Initialize MAB policy if strategy is adaptive
 	// RLCRAWLER PARITY: Use DefaultK=100 for Exp3.1 algorithm
@@ -419,19 +459,25 @@ func (c *Crawler) Run(ctx context.Context) (*Result, error) {
 	// only burns startup time and memory without adding any crawl throughput. Cap
 	// it to one; multi-browser scheduling is not implemented in this crawler.
 	if c.config.BrowserCount > 1 {
-		zap.L().Debug("Capping browser pool to 1 for single-threaded crawl",
-			zap.Int("configured", c.config.BrowserCount))
+		browserCountClampWarn.Do(func() {
+			zap.L().Warn("Spidering: browser_count > 1 requested, but the crawler is single-threaded — launching 1 browser",
+				zap.Int("configured", c.config.BrowserCount))
+		})
 		c.config.BrowserCount = 1
 	}
 
 	// Create browser pool FIRST (needed for browser-level capture)
-	pool, err := browser.NewPool(c.config)
+	pool, err := browser.NewPoolWithContext(ctx, c.config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create browser pool: %w", err)
 	}
 	c.browserPool = pool
 	zap.L().Debug("Browser pool created", zap.Int("size", c.config.BrowserCount))
-	defer func() { _ = pool.Close() }()
+	defer func() {
+		if err := pool.Close(); err != nil {
+			zap.L().Warn("Browser pool close failed", zap.Error(err))
+		}
+	}()
 
 	// Bind the crawl context to every page the pool creates so the deadline /
 	// cancellation reaches rod's per-operation timeouts. Without this the
@@ -447,10 +493,18 @@ func (c *Crawler) Run(ctx context.Context) (*Result, error) {
 	// Keep several distinct query-value variants per endpoint shape (category/
 	// filter/tab/search links) instead of collapsing them to one representative.
 	capture.SetMaxParamValueVariants(c.config.MaxParamValueVariants)
+	capture.SetMaxBodyBytes(c.config.MaxCaptureBodyBytes)
 	// Keep out-of-scope subresources (a login page's CAPTCHA widget, analytics
 	// beacons) out of the live log — they are dropped before storage anyway.
 	capture.ScopeFilter = c.config.ScopeFilter
-	defer func() { _ = capture.Close() }()
+	// A finished crawl is not failed over a flush error: the capture close
+	// error is the writer's drop tally, which the caller reads from the
+	// writer's receipt. Logged so it is never silent.
+	defer func() {
+		if err := capture.Close(); err != nil {
+			zap.L().Warn("Traffic capture closed with lost records", zap.Error(err))
+		}
+	}()
 
 	// Start capture at BROWSER level (captures ALL pages).
 	// Pin one browser for the entire crawl — Pool.Get() round-robins, so calling
@@ -521,6 +575,10 @@ func (c *Crawler) crawlWithBrowser(ctx context.Context, br *browser.Browser, cap
 		return nil, fmt.Errorf("browser pool returned nil browser")
 	}
 	c.browser = br
+	// Upload fixtures are generated on demand into a run-owned directory; hold
+	// it for the crawl so the last crawl out removes it.
+	form.RetainGeneratedFiles()
+	defer form.ReleaseGeneratedFiles()
 	// Both entry points funnel through here with the capture in hand, so this is
 	// the one place the wiring cannot be missed. Setting it on the Config instead
 	// silently failed on the multi-seed SpiderSession path, which rebuilds a fresh
@@ -570,8 +628,9 @@ func (c *Crawler) crawlWithBrowser(ctx context.Context, br *browser.Browser, cap
 	c.runFollowUpPasses(ctx)
 	c.retryFailedActions(ctx)
 
-	// Persist the map of what was reached and how, if the caller asked for one.
-	c.writeGraphDump()
+	// The map of what was reached and how is written by the caller
+	// (WriteGraphDump) once the capture has drained, so the graph's manifest can
+	// carry the final capture receipt.
 
 	// Log final MAB summary
 	c.logMABFinalSummary()
@@ -599,30 +658,6 @@ func (c *Crawler) logMABFinalSummary() {
 		zap.Int("total_actions", actionCount))
 }
 
-// applyPageAuth seeds operator-supplied authentication onto a freshly created
-// page before navigation: initial cookies (written into the browser's cookie
-// jar, so they persist for every subsequent navigation) and extra HTTP headers
-// such as Authorization / X-Api-Key (set per-page via CDP). Both are best-effort
-// — a failure leaves the crawl running unauthenticated rather than aborting it.
-func (c *Crawler) applyPageAuth(page *browser.Page) {
-	if len(c.config.InitialCookies) > 0 {
-		zap.L().Debug("Setting initial cookies", zap.Int("count", len(c.config.InitialCookies)))
-		if err := page.SetCookies(c.config.InitialCookies); err != nil {
-			zap.L().Warn("Failed to set initial cookies", zap.Error(err))
-		}
-	}
-	if len(c.config.ExtraHeaders) > 0 {
-		dict := make([]string, 0, len(c.config.ExtraHeaders)*2)
-		for k, v := range c.config.ExtraHeaders {
-			dict = append(dict, k, v)
-		}
-		zap.L().Debug("Setting extra headers", zap.Int("count", len(c.config.ExtraHeaders)))
-		if _, err := page.RodPage().SetExtraHeaders(dict); err != nil {
-			zap.L().Warn("Failed to set extra headers", zap.Error(err))
-		}
-	}
-}
-
 // initializeIndexState loads the initial page and captures the index state.
 func (c *Crawler) initializeIndexState(ctx context.Context) error {
 	zap.L().Debug("Initializing index state")
@@ -642,8 +677,11 @@ func (c *Crawler) initializeIndexState(ctx context.Context) error {
 
 	// Seed operator-supplied authentication (cookies + extra headers) before the
 	// first navigation so the crawl explores authenticated rather than only the
-	// unauthenticated shell.
-	c.applyPageAuth(page)
+	// unauthenticated shell. A failure is recorded in Stats.AuthState; with
+	// RequireAuth it fails the crawl instead of letting it run anonymously.
+	if err := c.seedPageAuth(page); err != nil {
+		return err
+	}
 
 	// Navigate to target URL
 	url := c.config.URL.String()
@@ -666,11 +704,11 @@ func (c *Crawler) initializeIndexState(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		return fmt.Errorf("failed to navigate: %w", navErr)
+		return fmt.Errorf("failed to navigate: %w%s", navErr, certRejectedHint(navErr))
 	}
 
 	// Check wait conditions
-	c.checkWaitConditions(page)
+	c.checkWaitConditions(ctx, page)
 
 	// NOTE: no explicit WaitStable here — NavigateCtx already waited for the DOM
 	// to stabilize (WaitStable(DOMStableTime)) as part of the navigation above, so
@@ -847,6 +885,16 @@ const initNavRetryBackoff = 2 * time.Second
 // retried; the navigation error is returned only after every attempt fails. The
 // navigation itself is injected so the retry policy can be unit-tested without a
 // browser. url is used for logging only.
+// certRejectedHint names the way out when navigation failed on a certificate:
+// the browser only verifies TLS when spidering.browser_compat.ignore_tls_errors
+// was turned off, so a self-signed local app needs it back on.
+func certRejectedHint(err error) string {
+	if err == nil || !strings.Contains(err.Error(), "ERR_CERT_") {
+		return ""
+	}
+	return " (certificate rejected — re-run with --browser-insecure, or set spidering.browser_compat.ignore_tls_errors: true, if this is a local test app)"
+}
+
 func navigateWithRetry(ctx context.Context, url string, backoff time.Duration, navFn func() error) error {
 	var lastErr error
 	for attempt := 1; attempt <= initNavAttempts; attempt++ {
@@ -1086,8 +1134,9 @@ func (c *Crawler) reset(ctx context.Context, nextTarget string) error {
 		}
 		br.SetCurrentPage(page)
 		// Extra headers are set per-page in CDP, so a freshly created reset page
-		// needs them re-applied (cookies persist in the browser jar).
-		c.applyPageAuth(page)
+		// needs them re-applied (cookies persist in the browser jar). The outcome
+		// lands in Stats.AuthState.
+		_ = c.applyPageAuth(page)
 	}
 
 	if err := page.NavigateCtx(ctx, resetURL); err != nil {
@@ -1103,7 +1152,7 @@ func (c *Crawler) reset(ctx context.Context, nextTarget string) error {
 			return ctxErr
 		}
 	}
-	c.checkWaitConditions(page)
+	c.checkWaitConditions(ctx, page)
 
 	c.checkOnURLState(ctx, page, previousState, resetURL)
 
@@ -1208,7 +1257,7 @@ func (c *Crawler) reachFromHome(ctx context.Context, target *state.State) error 
 				return ctxErr
 			}
 		}
-		c.checkWaitConditions(page)
+		c.checkWaitConditions(ctx, page)
 		c.stateMachine.SetCurrentState(onURLState)
 
 		// Follow path from onURL to target
@@ -1440,6 +1489,17 @@ func (c *Crawler) crawlThroughActions(ctx context.Context) {
 		eventable.TargetStateID = targetStateID
 
 		if err != nil {
+			// A policy-denied action is consumed, not failed: re-queueing or
+			// retrying it would only be denied again, and counting it toward
+			// ConsecutiveFailures could end a crawl that is working as configured.
+			if errors.Is(err, ErrActionNotPermitted) {
+				c.candidates.MarkExecuted(act)
+				if c.mabPolicy != nil {
+					c.mabPolicy.RemoveAction(sourceStateID, element.GetIdentification().Value)
+				}
+				afterBacktrack = false
+				continue
+			}
 			// RLCRAWLER PARITY: Skip MAB update entirely when crawl condition not met
 			// Action was not actually executed, so we shouldn't update MAB or count as failure
 			if errors.Is(err, ErrCrawlConditionNotMet) {
@@ -1630,6 +1690,11 @@ func (c *Crawler) executeActionWithEventable(ctx context.Context, crawlAction *a
 
 	zap.L().Debug("Event xpath", zap.String("xpath", xpath))
 
+	// The interaction policy is checked before anything is filled or clicked.
+	if err := c.checkSubmitPermitted(candidate, eventType); err != nil {
+		return 0, nil, err
+	}
+
 	if c.browser == nil {
 		return 0, nil, fmt.Errorf("crawler browser not initialized")
 	}
@@ -1722,6 +1787,8 @@ func (c *Crawler) executeActionWithEventable(ctx context.Context, crawlAction *a
 			} else {
 				return 0, nil, fmt.Errorf("click failed: %w", err)
 			}
+		} else if submitLikeCandidate(candidate) {
+			c.countSubmitDispatched(submitMechClick, 1)
 		}
 	case action.EventTypeHover:
 		elem, err := getElement()
@@ -1740,7 +1807,7 @@ func (c *Crawler) executeActionWithEventable(ctx context.Context, crawlAction *a
 		if err := elem.Click(); err != nil {
 			return 0, nil, fmt.Errorf("enter failed: %w", err)
 		}
-		c.stats.FormsSubmitted++
+		c.countSubmitDispatched(submitMechEnter, 1)
 	default:
 		return 0, nil, fmt.Errorf("unknown event type: %s", eventType)
 	}
@@ -1889,7 +1956,7 @@ func (c *Crawler) inspectNewState(ctx context.Context, page *browser.Page, event
 
 	// A login form can surface anywhere mid-crawl (a "Sign in" link, a gated
 	// section). If this newly reached state is a confirmed local login form, try
-	// common credentials once per host (deep intensity only) so the crawl can
+	// common credentials once per host (when the policy permits) so the crawl can
 	// continue into the now-unlocked area.
 	c.attemptLoginCredentials(ctx, page)
 
@@ -2346,6 +2413,10 @@ func (c *Crawler) evaluateStartRedirect(page *browser.Page, landingURL string) {
 	c.stats.OffHostLanding = true
 	c.stats.LandingURL = landingURL
 
+	// Whatever the landing turns out to be, the operator's credential headers
+	// stop here unless the operator scope admits the new host.
+	c.withdrawCredentialHeaders(page, landingURL, landHost)
+
 	// Login/SSO-wall detection runs regardless of scope mode so the caller still
 	// gets the "supply --auth" advice and the SSO host is excluded from fuzzing —
 	// even under an explicit operator scope.
@@ -2454,63 +2525,109 @@ func (c *Crawler) shouldCrawl(page *browser.Page) bool {
 	return true
 }
 
-// checkWaitConditions applies wait conditions to the page.
-func (c *Crawler) checkWaitConditions(page *browser.Page) {
+// maxWaitConditionFailures caps the failing selectors kept in Stats.
+const maxWaitConditionFailures = 5
+
+// checkWaitConditions applies wait conditions to the page and returns how many
+// timed out. Each timeout is counted in Stats.WaitConditionsFailed (with the
+// selector, up to maxWaitConditionFailures distinct ones) so a run that never
+// met a readiness condition says so instead of reading as an empty site. A
+// condition whose URL does not match, or a cancelled crawl, is not a failure.
+func (c *Crawler) checkWaitConditions(ctx context.Context, page *browser.Page) int {
+	failed := 0
 	for _, wc := range c.waitConditions {
-		result := wc.Wait(page)
-		if result == condition.WaitTimeout {
-			zap.L().Warn("Wait condition timed out", zap.String("selector", wc.Selector))
+		if wc.Wait(ctx, page) != condition.WaitTimeout {
+			continue
 		}
+		failed++
+		c.recordWaitConditionFailure(wc.Selector)
+	}
+	return failed
+}
+
+// recordWaitConditionFailure counts one timed-out readiness condition.
+func (c *Crawler) recordWaitConditionFailure(selector string) {
+	zap.L().Warn("Wait condition timed out", zap.String("selector", selector))
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.stats.WaitConditionsFailed++
+	if len(c.stats.WaitConditionFailures) < maxWaitConditionFailures && !slices.Contains(c.stats.WaitConditionFailures, selector) {
+		c.stats.WaitConditionFailures = append(c.stats.WaitConditionFailures, selector)
 	}
 }
 
 // getInputElements merges related form inputs with DOM-detected inputs.
 //  1. Start with eventable.getRelatedFormInputs() (inputs linked to this action)
-//  2. Add formHandler.getFormInputs() (inputs detected on current DOM)
+//  2. Add the inputs detected on the current DOM that belong to the action's
+//     own form (see mergeActionInputs) — an action never edits a form it
+//     cannot submit
 //  3. Remove duplicates (based on Identification)
 //  4. Order by FormFillOrder (NORMAL, DOM, VISUAL) - not implemented yet
 //
 // Returns DetectedInput for Go extension (value rotation, detection metadata).
 func (c *Crawler) getInputElements(page *browser.Page, eventable *action.Eventable) []*form.DetectedInput {
 	// Step 1: Start with related inputs from eventable
-	formInputs := make([]*form.DetectedInput, 0)
-	existingInputs := eventable.GetRelatedFormInputs()
-
-	// Convert action.FormInput to DetectedInput
-	for _, actionInput := range existingInputs {
-		detected := form.FromFormInput(actionInput)
-		if detected != nil {
-			formInputs = append(formInputs, detected)
+	related := make([]*form.DetectedInput, 0)
+	for _, actionInput := range eventable.GetRelatedFormInputs() {
+		if detected := form.FromFormInput(actionInput); detected != nil {
+			related = append(related, detected)
 		}
 	}
 
-	existingCount := len(formInputs)
-
-	// Step 2: Merge with all inputs detected on current DOM
-	domInputs, _ := c.formHandler.DetectInputs(page)
-	for _, domInput := range domInputs {
-		// Check if already exists (by Identification)
-		exists := false
-		for _, existing := range formInputs {
-			if c.detectedInputEquals(existing, domInput) {
-				exists = true
-				break
-			}
-		}
-		if !exists {
-			formInputs = append(formInputs, domInput)
-		}
+	// Step 2: Merge with the DOM inputs of the action's own form. The owning
+	// form is resolved in the same page evaluation as the inputs, so both sides
+	// of the comparison come from one DOM snapshot.
+	actionXPath := ""
+	if id := eventable.Identification; id != nil && id.How == action.HowXPath {
+		actionXPath = id.Value
 	}
+	domInputs, actionForm, _ := c.formHandler.DetectInputsForAction(page, actionXPath)
+	formInputs, excluded := c.mergeActionInputs(related, domInputs, actionForm)
 
 	zap.L().Debug("Changing related inputs",
 		zap.Int64("eventable_id", eventable.ID),
-		zap.Int("existing", existingCount),
+		zap.Int("existing", len(related)),
+		zap.Int("merged", len(formInputs)-len(related)),
+		zap.Int("excluded_other_forms", excluded),
+		zap.String("action_form", actionForm),
 		zap.Int("total", len(formInputs)))
 
 	// TODO: Step 3 - Order by FormFillOrder (VISUAL ordering)
 	// For now, use DOM order (default)
 
 	return formInputs
+}
+
+// mergeActionInputs appends to related every DOM input the action could submit
+// and returns the merged list plus how many DOM inputs were left out because
+// they belong to a different form.
+//
+// When the action sits inside a form (actionForm != ""), only that form's
+// controls are merged: clicking form A's submit button must not edit form B,
+// nor the orphan controls around it. When the action is outside any form — a
+// plain link, or an SPA "form" built from orphan inputs and a script-driven
+// button — every DOM input is merged, as before form scoping existed: there is
+// no owning form to scope by, and SPA login/registration flows depend on it.
+func (c *Crawler) mergeActionInputs(related, dom []*form.DetectedInput, actionForm string) ([]*form.DetectedInput, int) {
+	merged := related
+	excluded := 0
+	for _, domInput := range dom {
+		if actionForm != "" && domInput.FormKey != actionForm {
+			excluded++
+			continue
+		}
+		exists := false
+		for _, existing := range merged {
+			if c.detectedInputEquals(existing, domInput) {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			merged = append(merged, domInput)
+		}
+	}
+	return merged, excluded
 }
 
 // detectedInputEquals checks if two detected inputs are equal based on Identification.
@@ -2568,6 +2685,15 @@ func (c *Crawler) fillFormsIfPresent(page *browser.Page, actionID string) []*act
 	}
 
 	if len(inputs) > 0 {
+		// The trainer keys values by page origin and owning form, so a value
+		// learned on one origin is never replayed into another's form.
+		origin := ""
+		if c.formTrainer != nil {
+			if u, uerr := page.URL(); uerr == nil {
+				origin = httpmsg.OriginFromURL(u)
+			}
+		}
+
 		// Form trainer replay mode: use trained inputs
 		if c.formTrainer != nil && c.formTrainer.GetMode() == form.FillReplay {
 			for _, input := range inputs {
@@ -2575,7 +2701,7 @@ func (c *Crawler) fillFormsIfPresent(page *browser.Page, actionID string) []*act
 				if input.FormInput != nil {
 					inputType = string(input.Type)
 				}
-				trained := c.formTrainer.MatchInput(input.XPath, input.ID, input.Name, inputType)
+				trained := c.formTrainer.MatchInput(input.XPath, input.ID, input.Name, inputType, origin, input.FormKey)
 				if trained != nil && trained.Value != "" {
 					input.SetValues([]string{trained.Value})
 				}
@@ -2616,12 +2742,14 @@ func (c *Crawler) fillFormsIfPresent(page *browser.Page, actionID string) []*act
 					inputType = string(input.Type)
 				}
 				c.formTrainer.RecordInput(&form.TrainedInput{
-					XPath:  input.XPath,
-					Type:   inputType,
-					Name:   input.Name,
-					ID:     input.ID,
-					Value:  value,
-					Values: values,
+					XPath:   input.XPath,
+					Type:    inputType,
+					Name:    input.Name,
+					ID:      input.ID,
+					Value:   value,
+					Values:  values,
+					Origin:  origin,
+					FormKey: input.FormKey,
 				})
 			}
 		}

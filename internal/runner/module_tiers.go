@@ -52,6 +52,49 @@ func loginCredsPolicy(intensity string) (enabled, fullList bool) {
 	}
 }
 
+// accountActions is the resolved register/login-attempt permission plus where
+// each value came from ("" = the built-in default).
+type accountActions struct {
+	register, login, fullList   bool
+	registerSource, loginSource string
+	conflicts                   []string
+}
+
+// resolveAccountActions resolves register/login-attempt permission.
+// Precedence: explicit config (spidering.interaction.*) wins over the intensity
+// default, in both directions — a deny survives --intensity deep, and an
+// explicit allow survives --intensity quick. Intensity only picks a default and
+// only ever sizes the credential list.
+//
+// Registration has no intensity default at all: it is a write, and a work
+// budget is not an authorization. It is on only when spidering.interaction.
+// register_account or the legacy spidering.self_register says so, with the
+// explicit interaction key winning a disagreement.
+func resolveAccountActions(sp config.SpideringConfig, intensity string) accountActions {
+	var a accountActions
+	a.login, a.fullList = loginCredsPolicy(intensity)
+	if a.login {
+		a.loginSource = policySourceIntensity
+	}
+	if v := sp.Interaction.LoginAttempts; v != nil {
+		a.login = *v
+		a.loginSource = policySourceConfig
+	}
+
+	if sp.SelfRegister {
+		a.register = true
+		a.registerSource = policySourceSelfRegister
+	}
+	if v := sp.Interaction.RegisterAccount; v != nil {
+		if sp.SelfRegister && !*v {
+			a.conflicts = append(a.conflicts, "spidering.interaction.register_account=false overrides spidering.self_register=true")
+		}
+		a.register = *v
+		a.registerSource = policySourceConfig
+	}
+	return a
+}
+
 // hygieneModulesEnabled reports whether the hardening-advisory family (modules
 // tagged modules.TagHygiene — missing security headers, weak TLS protocol/cipher
 // policy, cookie attributes, CSP/HSTS/SRI audits) runs at this intensity.

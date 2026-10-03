@@ -6,6 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
@@ -133,8 +134,13 @@ func runModuleEnable(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	configPath := config.ConfigFilePath()
-	settings, err := config.LoadSettings(globalConfig)
+	// EffectiveConfigPath, not ConfigFilePath: with --config set, this command
+	// used to READ the named file and WRITE the discovered one, so
+	// `vigolium module enable X --config ./team.yaml` silently rewrote
+	// ~/.vigolium/vigolium-configs.yaml with team.yaml's contents plus the
+	// change — a whole config clobbered by a one-module edit.
+	configPath := clicommon.EffectiveConfigPath(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
@@ -178,8 +184,9 @@ func runModuleDisable(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	configPath := config.ConfigFilePath()
-	settings, err := config.LoadSettings(globalConfig)
+	// Load and save the SAME file — see runModuleEnable.
+	configPath := clicommon.EffectiveConfigPath(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}

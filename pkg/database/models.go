@@ -192,6 +192,24 @@ type Scan struct {
 
 	StorageURL string `bun:"storage_url,nullzero" json:"storage_url"`
 
+	// Scan completeness — whether the scan covered everything it was given, and
+	// if not, why and where. Written by the runner's finalizer, which is the only
+	// component that sees every phase's outcome.
+	//
+	// Status alone could never answer this: "completed" meant "the process
+	// reached the end", so a scan whose total budget fired after two of seven
+	// phases, or whose dynamic assessment was cut off at its own deadline, was
+	// indistinguishable from one that finished the whole plan. That mattered
+	// beyond reporting — scan-on-receive treats a completed scan as a valid
+	// predecessor and inherits its cursor, so a curtailed run that looked clean
+	// made the NEXT run skip the records the first one never processed.
+	//
+	// An EMPTY Completeness means unknown (an older binary, or an agent/server
+	// caller with no outcome data) and must never be read as "complete".
+	Completeness  string         `bun:"completeness,nullzero" json:"completeness,omitempty"`
+	StopReason    string         `bun:"stop_reason,nullzero" json:"stop_reason,omitempty"`
+	PhaseOutcomes []PhaseOutcome `bun:"phase_outcomes,type:jsonb,nullzero" json:"phase_outcomes,omitempty"`
+
 	CreatedAt time.Time `bun:"created_at,notnull,default:current_timestamp" json:"created_at"`
 	UpdatedAt time.Time `bun:"updated_at,notnull,default:current_timestamp" json:"updated_at"`
 }

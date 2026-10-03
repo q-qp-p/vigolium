@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/pkg/database"
 )
 
@@ -104,5 +105,31 @@ func TestTrafficFilterFlagCoversEveryGroupableField(t *testing.T) {
 		if !slices.Contains(database.GroupableFields(), field) {
 			t.Errorf("trafficFilterFlagFor names %q, which is not groupable", field)
 		}
+	}
+}
+
+// `--group-by host --raw=false` is an operator explicitly turning the
+// conflicting renderer OFF. Keyed on Changed, the validator rejected it and told
+// them to remove the very flag that resolved the conflict.
+func TestTrafficGroupAcceptsFalseConflictFlag(t *testing.T) {
+	cmd := &cobra.Command{Use: "traffic"}
+	var raw bool
+	cmd.Flags().BoolVar(&raw, "raw", false, "")
+	if err := cmd.Flags().Parse([]string{"--raw=false"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	setGroupFlags(t, "host", defaultTrafficGroupLimit)
+
+	if err := validateTrafficGroupFlags(func(name string) bool { return flagOn(cmd, name) }); err != nil {
+		t.Errorf("--raw=false is not a request to render records: %v", err)
+	}
+
+	// The real conflict must still be rejected.
+	if err := cmd.Flags().Parse([]string{"--raw=true"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err := validateTrafficGroupFlags(func(name string) bool { return flagOn(cmd, name) }); err == nil {
+		t.Error("--group-by with --raw=true must still be rejected")
 	}
 }

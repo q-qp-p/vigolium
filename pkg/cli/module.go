@@ -91,14 +91,11 @@ func moduleMatchesFilter(m modules.Module, filter string) bool {
 	return false
 }
 
-// loadEnabledModulesConfig loads the enabled_modules section from the config file.
-// Returns defaults (all enabled) on any error.
+// loadEnabledModulesConfig loads the enabled_modules section from the config
+// file. Falls back to defaults (all enabled) on any error, with one warning —
+// see settingsOrDefaults for why this one cannot simply fail.
 func loadEnabledModulesConfig() *config.EnabledModulesConfig {
-	settings, err := config.LoadSettings(globalConfig)
-	if err != nil {
-		return config.DefaultEnabledModulesConfig()
-	}
-	return &settings.DynamicAssessment.EnabledModules
+	return &settingsOrDefaults().DynamicAssessment.EnabledModules
 }
 
 // isModuleEnabled checks whether a module ID is enabled given a list from config.
@@ -303,9 +300,11 @@ func printModuleFooter() {
 	fmt.Printf("%s Filter by tag: %s\n",
 		terminal.InfoSymbol(),
 		terminal.Gray("vigolium scan --module-tag spring --module-tag injection"))
+	// The same resolution `module enable/disable` writes through, so the file
+	// this names under --config is the file an edit would land in.
 	fmt.Printf("%s Configure enabled modules in: %s\n",
 		terminal.InfoSymbol(),
-		terminal.Gray(config.ConfigFilePath()))
+		terminal.Gray(effectiveConfigPath()))
 	fmt.Printf("%s Module docs: %s\n",
 		terminal.InfoSymbol(),
 		terminal.Gray("https://docs.vigolium.com"))

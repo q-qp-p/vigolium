@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"sort"
 	"time"
 
@@ -49,6 +50,14 @@ type agentEnvelope struct {
 	// that cannot go stale, because it is generated from the same values the
 	// envelope reports.
 	Query string `json:"query,omitempty"`
+
+	// QueryArgv is the same follow-up as an argv vector. The string form is for
+	// a human to read and is shell-quoted; a consumer that wants to RUN it had
+	// to either shell out (inheriting the quoting rules of whatever shell it
+	// found) or re-split a quoted string, which is where the quoting that made
+	// the string safe becomes the thing that breaks the parse. The vector goes
+	// straight into exec.
+	QueryArgv []string `json:"query_argv,omitempty"`
 
 	// GeneratedAt is stamped in the wire timestamp format (RFC3339, exactly three
 	// fractional digits) with an epoch-millisecond sibling. See
@@ -129,7 +138,30 @@ func (e *agentEnvelope) With(key string, value any) *agentEnvelope {
 // it does not lead.
 func (e *agentEnvelope) WithQuery(tail ...string) *agentEnvelope {
 	e.Query = followUpQuery(tail...)
+	e.QueryArgv = followUpArgv(tail...)
 	return e
+}
+
+// envelopeItemSlice reports whether v is a row-list envelope, and hands back the
+// `items` slice by reflection.
+//
+// Reflection rather than a type switch over the two shapes the read commands
+// happen to use today: the scan views are typed slices ([]scanRowView and
+// friends), and a switch missing them called every paged scan listing complete.
+// Anything that is not a slice (db stats emits an object) has no record
+// boundary, which is the question both callers are really asking — resultIsPaged
+// to describe a page, applyOutputBudget to find somewhere to cut. One rule, so
+// the two cannot disagree about what counts as a row list.
+func envelopeItemSlice(v any) (*agentEnvelope, reflect.Value, bool) {
+	env, ok := v.(*agentEnvelope)
+	if !ok {
+		return nil, reflect.Value{}, false
+	}
+	items := reflect.ValueOf(env.Items)
+	if !items.IsValid() || items.Kind() != reflect.Slice {
+		return env, reflect.Value{}, false
+	}
+	return env, items, true
 }
 
 // envelopeFields is the struct's own JSON key set. Extra keys colliding with one
@@ -138,7 +170,7 @@ func (e *agentEnvelope) WithQuery(tail ...string) *agentEnvelope {
 var envelopeFields = map[string]bool{
 	"schema_version": true, "command": true, "project_uuid": true, "db_path": true,
 	"total": true, "offset": true, "limit": true, "items": true, "query": true,
-	"generated_at": true, "generated_at_ms": true,
+	"query_argv": true, "generated_at": true, "generated_at_ms": true,
 }
 
 // MarshalJSON merges the struct fields with extra (and the legacy row alias)

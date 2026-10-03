@@ -47,7 +47,10 @@ section.
   - `-j/--json` on `finding`/`traffic`/`db` → **one** compact, token-bounded
     envelope. Parse this during triage.
   - `--format jsonl` / `export` → bulk `{"type":…,"data":{…}}` stream, one per
-    line, full fidelity. Archival, not triage.
+    line. Archival, not triage — and a *view*, not a copy: exchanges sharing a
+    URL collapse to the first (plus any a finding links to), and only confirmed
+    findings are emitted. `export --no-url-dedup` keeps every exchange; for the
+    whole store use `-S --format sqlite` or the database file itself.
   - `--events ndjson` on the scan commands → a **live** event stream on stdout
     while the scan runs. This is how you learn what a 15-minute crawl is doing;
     see "Watching a scan while it runs" below.
@@ -116,6 +119,11 @@ One JSON object per line on **stdout**, flushed per event; the human console
 stays on stderr, so `2>/dev/null` yields clean NDJSON with zero non-JSON lines.
 Types: `scan.started` · `phase.started|progress|finished` · `waf.block` ·
 `waf.pacing` · `finding.new` · `error` · `scan.finished`.
+
+`--events` owns stdout: combining it with another stdout writer (`-j`,
+`--format jsonl` without `-o`, `--ci-output-format`, `--print-finding`,
+`--print-traffic[-tree]`) exits `2` naming the conflict, rather than producing a
+corrupt stream. Give the other writer an `-o <file>` and both work.
 
 Every line carries `scan_uuid` and a schema version `v`. `scan.finished` is
 always last (`status:"interrupted"` on SIGINT/SIGTERM); its **absence** means the
@@ -375,7 +383,15 @@ Things `-h` won't tell you:
 - **Exit codes are a table, not a boolean.** `0` success · `1` error · `2` usage
   error (bad flag or combination) · `3` `fuzz --fail-on-match` matched · `4`
   `--fail-on <sev>` gate tripped. **`4` is not a failure** — the scan ran to
-  completion and found something. `--soft-fail` forces `0` everywhere.
+  completion and found something. `--soft-fail` forces `0` everywhere. Under
+  `-P --split-by-host`, `4` fires when **any** child trips the gate, not only
+  when every child does.
+- **A scan that exits `0` did not necessarily cover everything.** Coverage is a
+  separate axis from success: the scan row carries `completeness`
+  (`complete`/`partial`; **empty means unknown**, which is what a pre-v0.5.2
+  binary wrote), `stop_reason` and `phase_outcomes`, and `scan.finished` reports
+  `status:"curtailed"` with `reasons[]`. Check it before reading a thin result
+  as a clean target — see [references/agent-loop.md](references/agent-loop.md).
 - **A positional argument to a scan command is always a target URL, never a
   file.** `vigolium scan https://a https://b` is three ways of saying the same
   thing as `-t`, and they merge with `-t`/`-T` with duplicates removed. But

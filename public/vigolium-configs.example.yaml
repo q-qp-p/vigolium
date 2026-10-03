@@ -303,14 +303,6 @@ scanning_strategy:
     known_issue_scan: true
     dynamic-assessment: true
 
-  whitebox:
-    external_harvesting: false
-    source_aware: true
-    discovery: true
-    spidering: false
-    known_issue_scan: true
-    dynamic-assessment: true
-
 # ============================================================================
 # Scanning Pace (Speed Control)
 # ============================================================================
@@ -431,11 +423,11 @@ dynamic-assessment:
   # Default: 1
   max_feedback_rounds: 1
 
-  # Maximum findings emitted per module before suppression.
-  # Prevents noisy modules from flooding results. Set to 0 for unlimited.
-  # Override with CLI flag: --max-findings-per-module
-  # Default: 15
-  max_findings_per_module: 15
+  # Maximum findings emitted per module before suppression is set with the CLI
+  # flag --max-findings-per-module (default 10, 0 = unlimited). There is no
+  # config key for it: one lived here as `max_findings_per_module: 15`, which
+  # matched no struct field, so it was silently inert AND documented a default
+  # the CLI does not use.
 
   # --------------------------------------------------------------------------
   # Enabled Modules
@@ -1034,8 +1026,9 @@ spidering:
   # Default: true
   headless: true
 
-  # Number of concurrent browser instances.
-  # More instances = faster crawling but higher resource usage.
+  # Browser instances to launch. The crawler is single-threaded and drives one
+  # browser, so values above 1 are clamped to 1 (with a warning) and add no
+  # speed; crawl several targets at once by running separate processes.
   # Default: 1
   browser_count: 1
 
@@ -1062,6 +1055,8 @@ spidering:
   # Disable automatic form filling during crawling.
   # When false (default), the crawler automatically fills and submits
   # forms it encounters. Set to true to skip form interactions.
+  # Legacy alias: equivalent to interaction.edit_fields and
+  # interaction.submit_forms both false; an explicit interaction key wins.
   # Default: false
   no_forms: false
 
@@ -1070,12 +1065,74 @@ spidering:
   # surface is invisible to an unauthenticated crawl; one account converts that
   # into ordinary crawlable content. Runs at most once per host, only submits to
   # an in-scope host, and reuses the identity it creates at any later login form.
-  # Off by default because registering is a write; --intensity deep enables it,
-  # and setting this to true forces it on at any intensity.
+  # Off by default because registering is a write, and no intensity turns it
+  # on. Legacy alias of interaction.register_account, which wins if both are set.
   # Default: false
   self_register: false
 
-  # Directory to write the crawl graph into (one file per host).
+  # Largest dynamic (HTML/JS/JSON/API) response body, in encoded bytes, the
+  # capture keeps. A larger response is still recorded, without its body.
+  # 0 = default (16 MiB, above the API-spec ingest window); -1 = no ceiling.
+  # Default: 0
+  max_capture_body_bytes: 0
+
+  # Domain of every email address the crawl generates (signup, login, plain
+  # email fields). Never derived from the target, whose own domain would make
+  # the address plausible real mail. A page-provided example address is still
+  # preferred. Empty = example.com (RFC 2606 reserved, null MX: never delivered).
+  # Default: ""
+  identity_email_domain: ""
+
+  # Fail a target's crawl instead of crawling it anonymously when configured
+  # authentication (session cookies / auth headers from --auth, --auth-file,
+  # -H) cannot be applied to the browser. Either way the per-target auth_state
+  # (not-requested | configured | applied | failed) is reported. Auth headers
+  # are only sent while the crawl is on a host the operator scope admits.
+  # CLI: --require-auth. Default: false
+  require_auth: false
+
+  # What the browser crawl is permitted to change. Every key is optional: an
+  # omitted key keeps its default and survives a profile/project overlay that
+  # does not name it; an explicit key wins over no_forms/self_register and over
+  # the intensity. The resolved policy is printed as the Spidering "Policy:" line.
+  interaction:
+    # Type into, toggle and select form controls. Default: true
+    # edit_fields: true
+    # Dispatch a form submit by any mechanism. Default: true
+    # submit_forms: true
+    # Attach the generated benign fixture to file inputs. Uploads are field
+    # edits, so edit_fields: false withdraws them too. Default: true
+    # upload_files: true
+    # Let the browser save downloads. Default: false
+    # download_files: false
+    # Complete a public signup form. Default: false at every intensity
+    # register_account: false
+    # Try default credentials on a confirmed login form.
+    # Default: unset = on at balanced/deep, off at quick/lite
+    # login_attempts: true
+    # How to answer JavaScript dialogs once recorded:
+    #   record-dismiss (default) — accept alert/beforeunload, dismiss confirm/prompt
+    #   accept-all               — accept everything
+    # dialogs: record-dismiss
+
+  # Browser security exceptions. Each key relaxes one Chromium boundary; every
+  # key is optional. --browser-insecure turns all four on (local test apps only).
+  # The effective posture is printed as the Spidering "Browser security:" line.
+  browser_compat:
+    # Run without the process sandbox. The sandbox is also dropped, with one
+    # warning, where the host cannot provide it (root, a container, user
+    # namespaces disabled) or a sandboxed launch fails on Linux. Default: false
+    # no_sandbox: false
+    # Accept invalid certificates, like the scanner's HTTP transport. Default: true
+    # ignore_tls_errors: true
+    # Let HTTPS pages load active HTTP subresources. Default: false
+    # allow_insecure_content: false
+    # Turn off the same-origin policy. Default: false
+    # disable_web_security: false
+
+  # Directory to write crawl graphs into: one file per crawl,
+  # crawl-graph-<host>-<scan uuid>-<seq>.json, owner-only and redacted (see
+  # graph_include_values). Files from older versions (version 1) are unredacted.
   # The captured traffic records what was requested; the graph records how the
   # crawler got there — which action on which state, with which form values, and
   # the selector to find that element again. That is what makes a run
@@ -1083,6 +1140,12 @@ spidering:
   # Empty disables.
   # Default: "" (disabled)
   graph_output_dir: ""
+
+  # Keep credential-bearing values in crawl graphs: password/hidden field
+  # values, credential-named fields and URL parameters, URL userinfo, element
+  # value/data-* attributes. The graph records which way it was written.
+  # Default: false (redacted)
+  graph_include_values: false
 
 # ============================================================================
 # Known Issue Scan

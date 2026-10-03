@@ -53,18 +53,60 @@ type Browser struct {
 	// flushing and shutdown still work after the deadline fires.
 	crawlCtx context.Context
 
+	// killer and killProfileDir are the process handles Kill uses, snapshotted at
+	// a successful launch and NEVER mutated afterwards.
+	//
+	// They duplicate launcher/profileDir deliberately. Kill exists for the case
+	// where Close is wedged — and a wedged Close is holding b.mu, so Kill cannot
+	// take the lock to read those fields. Write-once-at-launch fields are safe to
+	// read without it.
+	killer         processKiller
+	killProfileDir string
+
+	// killOnce makes Kill idempotent: the watchdog path can fire it while a
+	// racing Close is also escalating to it.
+	killOnce sync.Once
+
+	// closeRod overrides the bounded rod-browser close in tests. nil means the
+	// real one. It is a seam rather than an interface because the production path
+	// needs rod's own Timeout clone, and the branch worth testing — "a close that
+	// errored means the process may still be running, so escalate to Kill" — is
+	// otherwise only reachable with a genuinely wedged browser.
+	closeRod func() error
+
 	mu    sync.Mutex
 	pages []*Page
 }
 
-// New creates a new browser instance.
+// processKiller is the launcher capability Kill needs. An interface so the kill
+// path is testable without launching a real browser — *launcher.Launcher
+// satisfies it.
+type processKiller interface {
+	Kill()
+}
+
+// New creates a new browser instance. Provisioning is not cancellable; use
+// NewWithContext when a caller context should be able to stop it.
 func New(cfg *config.Config) (*Browser, error) {
+	return NewWithContext(context.Background(), cfg)
+}
+
+// NewWithContext creates a new browser instance whose provisioning — choosing
+// a candidate binary and, as a last resort, downloading Chrome for Testing —
+// stops when ctx ends. ctx bounds only the launch: the running browser stays
+// on the background context so capture flushing and shutdown keep working
+// after a crawl deadline (bind the crawl context to pages with
+// SetCrawlContext).
+func NewWithContext(ctx context.Context, cfg *config.Config) (*Browser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("failed to launch browser: %w", err)
+	}
 	b := &Browser{
 		config: cfg,
 		pages:  make([]*Page, 0),
 	}
 
-	if err := b.launch(); err != nil {
+	if err := b.launch(ctx); err != nil {
 		return nil, err
 	}
 
@@ -80,12 +122,36 @@ func New(cfg *config.Config) (*Browser, error) {
 // headless startup (e.g. some distro Chromium builds on a KVM guest) is
 // therefore auto-recovered from — the scan falls back to a working browser (in
 // practice Chrome for Testing) instead of failing outright. Only when every
-// candidate fails does this return an aggregated error.
-func (b *Browser) launch() error {
-	candidates := b.browserCandidates()
+// candidate fails does this return an aggregated error. A cancelled ctx stops
+// the walk before the next candidate (and inside the CfT download).
+func (b *Browser) launch(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("failed to launch browser: %w", err)
+	}
+	return b.launchFrom(ctx, b.browserCandidates(ctx))
+}
 
+// browserLaunchTimeout bounds a single `launcher.Launch()` call.
+//
+// Launch is not otherwise bounded by the caller's context — rod kills the browser
+// process when the launcher's context ends, and the running browser must outlive
+// the provisioning context so capture can keep flushing after a crawl deadline
+// (see NewWithContext). So the per-ATTEMPT bound is its own deadline: a binary
+// that starts but never prints its DevTools URL would otherwise hold the launch
+// walk open indefinitely, and the next candidate — in practice a working one —
+// would never be tried. A variable so tests can shrink it.
+var browserLaunchTimeout = 60 * time.Second
+
+// launchFrom walks candidates in order. Split out of launch so the candidate list
+// is injectable: the failure paths below are the whole point of this function and
+// a test must be able to drive them without a real browser on the host.
+func (b *Browser) launchFrom(ctx context.Context, candidates []browserCandidate) error {
 	var attempts []string
+	sandboxRetried := false
 	for _, c := range candidates {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("failed to launch browser: %w", err)
+		}
 		binPath, err := c.resolve()
 		if err != nil {
 			zap.L().Debug("browser candidate unavailable, skipping",
@@ -93,12 +159,39 @@ func (b *Browser) launch() error {
 			continue
 		}
 
-		l := b.newLauncher(binPath)
-		u, err := l.Launch()
+		compat := b.config.BrowserCompat
+		compat.NoSandbox = effectiveNoSandbox(compat)
+		l := b.newLauncher(binPath, compat)
+		u, err := launchBounded(l)
+		// A Linux host that cannot give this binary a sandbox fails the launch
+		// outright (Ubuntu 23.10+'s AppArmor user-namespace restriction is the
+		// common case and is not detectable up front for every binary). Retry
+		// once without it rather than fail the crawl; a success is remembered so
+		// the rest of the run launches unsandboxed directly, with one warning.
+		if err != nil && !compat.NoSandbox && runtime.GOOS == "linux" && !sandboxRetried {
+			sandboxRetried = true
+			reason := sandboxRetryReason(currentSandboxHost(), browserprobe.FirstLine(err.Error()))
+			compat.NoSandbox = true
+			// The sandboxed attempt's profile is abandoned here: the retry builds
+			// its own launcher with its own directory.
+			discardLauncherProfile(l)
+			l = b.newLauncher(binPath, compat)
+			if u2, err2 := launchBounded(l); err2 == nil {
+				recordSandboxFallback(reason)
+				u, err = u2, nil
+			} else {
+				zap.L().Debug("unsandboxed retry also failed; not a sandbox problem",
+					zap.String("candidate", c.label), zap.Error(err2))
+			}
+		}
 		if err != nil {
 			// No l.Kill() here: launcher.Launch already kills the process on the
 			// getURL/timeout failure path, and a failed cmd.Start leaves none —
 			// a second Kill would just burn its built-in ~1s sleep for nothing.
+			// The PROFILE still has to go: newLauncher allocated a scratch
+			// directory for this attempt, and a host where several candidates fail
+			// before one works left one stranded per failure, every launch.
+			discardLauncherProfile(l)
 			short := browserprobe.FirstLine(err.Error())
 			zap.L().Warn("browser candidate failed to launch, falling back to next",
 				zap.String("candidate", c.label),
@@ -111,6 +204,8 @@ func (b *Browser) launch() error {
 		browser := rod.New().ControlURL(u)
 		if err := browser.Connect(); err != nil {
 			l.Kill()
+			// Killed, so nothing is writing into the profile any more.
+			discardLauncherProfile(l)
 			zap.L().Warn("browser candidate connected but handshake failed, falling back to next",
 				zap.String("candidate", c.label), zap.Error(err))
 			attempts = append(attempts, fmt.Sprintf("%s [%s]: connect: %v", c.label, binPathOrAuto(binPath), err))
@@ -120,6 +215,11 @@ func (b *Browser) launch() error {
 		b.launcher = l
 		b.profileDir = l.Get(flags.UserDataDir)
 		b.rodBrowser = browser
+		// Snapshotted for Kill, which cannot take b.mu — see the field comments.
+		// Written here, before the browser is handed to any caller, and never again.
+		b.killer = l
+		b.killProfileDir = b.profileDir
+		b.applyDownloadPolicy()
 		zap.L().Debug("browser launched",
 			zap.String("candidate", c.label), zap.String("bin", binPathOrAuto(binPath)))
 		return nil
@@ -136,6 +236,73 @@ func (b *Browser) launch() error {
 		len(attempts), strings.Join(attempts, "; "))
 }
 
+// launchBounded runs one launcher.Launch under browserLaunchTimeout.
+//
+// l.Context(ctx) is how the bound is applied, and rod kills the process when that
+// context ends — which is exactly right HERE and only here: the context is
+// discarded the moment Launch returns a URL, because launcher.Launch has already
+// finished with it by then. It must never be the caller's long-lived context (see
+// browserLaunchTimeout).
+func launchBounded(l *launcher.Launcher) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), browserLaunchTimeout)
+	defer cancel()
+	return l.Context(ctx).Launch()
+}
+
+// removeProfileDir removes a Chromium profile directory this package allocated,
+// logging a failure rather than reporting it: the caller is always on a teardown
+// path whose outcome a stranded directory must not change. An empty dir is a
+// no-op, so every caller can hand over whichever field it holds. why names the
+// teardown in the log line.
+//
+// Profile ownership is the same rule everywhere, which is why this is one
+// function: newLauncher is the only thing that ever sets UserDataDir — a fresh
+// scratch directory per attempt, or rod's own per-launch temp path when scratch
+// allocation failed — so the directory is always that attempt's and nobody
+// else's. The abandoned-launch, Kill and Close paths all rely on exactly that.
+// Call it only once the attempt's process is gone.
+func removeProfileDir(dir, why string) {
+	if dir == "" {
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		zap.L().Debug("could not remove the browser profile directory",
+			zap.String("dir", dir), zap.String("teardown", why), zap.Error(err))
+	}
+}
+
+// discardLauncherProfile removes the Chromium profile directory a launch attempt
+// that will not be used had allocated.
+func discardLauncherProfile(l *launcher.Launcher) {
+	if l == nil {
+		return
+	}
+	removeProfileDir(l.Get(flags.UserDataDir), "abandoned launch attempt")
+}
+
+// Kill terminates the browser process and removes its profile, WITHOUT taking
+// b.mu.
+//
+// That is the whole reason it exists. Close holds b.mu for its bounded shutdown,
+// so when that shutdown wedges — the case where a browser process is actually
+// leaked — nothing that needs the lock can reach the process. The watchdog paths
+// that abandon a crawl call this instead, and so does Close when its own bounded
+// close fails.
+//
+// Safe to call concurrently with Close, more than once, and on a browser that
+// never launched. It reads only the write-once-at-launch handles.
+func (b *Browser) Kill() {
+	if b == nil {
+		return
+	}
+	b.killOnce.Do(func() {
+		if b.killer != nil {
+			b.killer.Kill()
+		}
+		removeProfileDir(b.killProfileDir, "kill")
+	})
+}
+
 // browserCandidate is one binary to attempt, in priority order. resolve is lazy
 // so expensive providers (the Chrome for Testing download) only run once every
 // cheaper candidate has already failed.
@@ -147,17 +314,23 @@ type browserCandidate struct {
 // browserCandidates builds the ordered candidate list for the current host. It
 // resolves the platform-varying inputs (system browser binaries, GOOS/GOARCH)
 // and hands them to buildBrowserCandidates, which owns the ordering.
-func (b *Browser) browserCandidates() []browserCandidate {
+func (b *Browser) browserCandidates(ctx context.Context) []browserCandidate {
 	systemBins := systemBrowserBins(browserPreferenceOrderFor(runtime.GOOS), lookPathFound, validateBrowserBin)
-	return buildBrowserCandidates(runtime.GOOS, runtime.GOARCH, b.config.BrowserPath, systemBins, b.getEmbeddedBrowserPath)
+	return buildBrowserCandidates(ctx, runtime.GOOS, runtime.GOARCH, b.config.BrowserPath, systemBins, b.getEmbeddedBrowserPath)
 }
+
+// ensureCfTBrowser downloads (or reuses) Chrome for Testing. A variable so
+// tests can observe the call without a network fetch.
+var ensureCfTBrowser = cftbrowser.EnsureBrowser
 
 // buildBrowserCandidates assembles the ordered candidate list from already-
 // resolved inputs. Platform (goos/goarch), the configured path, the resolved
 // system browser bins, and the embedded-binary resolver are all injected, so the
 // ordering — and the platform-specific tail (the linux/arm64 rod-auto-download
 // skip) — is unit-testable on any host. See launch() for the order rationale.
-func buildBrowserCandidates(goos, goarch, configPath string, systemBins []string, embedded func() (string, error)) []browserCandidate {
+// ctx reaches the Chrome for Testing download, the only candidate that blocks
+// on the network.
+func buildBrowserCandidates(ctx context.Context, goos, goarch, configPath string, systemBins []string, embedded func() (string, error)) []browserCandidate {
 	var cands []browserCandidate
 	add := func(label string, resolve func() (string, error)) {
 		cands = append(cands, browserCandidate{label: label, resolve: resolve})
@@ -198,7 +371,7 @@ func buildBrowserCandidates(goos, goarch, configPath string, systemBins []string
 	//    This is what recovers a host whose only system browser is broken.
 	add("Chrome for Testing (download)", cftCandidate(func() (string, error) {
 		zap.L().Info("No working system browser — downloading Chrome for Testing")
-		return cftbrowser.EnsureBrowser(context.Background())
+		return ensureCfTBrowser(ctx)
 	}))
 
 	// 6. rod's built-in auto-download (a browser rod fetches itself). Dropped
@@ -228,8 +401,9 @@ func isLinuxARM64For(goos, goarch string) bool {
 // newLauncher builds a fresh, fully-configured launcher for a single launch
 // attempt. A launcher.Launcher may only be Launch()ed once, so every candidate
 // gets its own. An empty binPath leaves the binary unset so rod resolves or
-// auto-downloads one.
-func (b *Browser) newLauncher(binPath string) *launcher.Launcher {
+// auto-downloads one. compat is the effective exception set for this attempt
+// (the sandbox decision already resolved by the caller).
+func (b *Browser) newLauncher(binPath string, compat config.BrowserCompat) *launcher.Launcher {
 	l := launcher.New()
 	if binPath != "" {
 		l = l.Bin(binPath)
@@ -251,11 +425,7 @@ func (b *Browser) newLauncher(binPath string) *launcher.Launcher {
 			zap.Error(err))
 	}
 
-	l.NoSandbox(true)
-	l.Set("disable-web-security").
-		Set("allow-running-insecure-content").
-		Set("reduce-security-for-testing").
-		Set("disable-ipc-flooding-protection").
+	l.Set("disable-ipc-flooding-protection").
 		Set("disable-xss-auditor").
 		Set("disable-bundled-ppapi-flash").
 		Set("disable-plugins-discovery").
@@ -286,8 +456,13 @@ func (b *Browser) newLauncher(binPath string) *launcher.Launcher {
 		Set("disable-background-networking").
 		// Disable HTTPS upgrade features to prevent Chrome from auto-upgrading HTTP to HTTPS
 		// which causes timeout when target doesn't have HTTPS server
-		Set("disable-features", "ChromeWhatsNewUI,HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode,HttpsFirstModeForAdvancedProtectionUsers,ImageServiceObserveSyncDownloadStatus,TrackingProtection3pcd,LensOverlay,AutomationControlled").
-		Set("ignore-certificate-errors")
+		Set("disable-features", "ChromeWhatsNewUI,HttpsUpgrades,HttpsFirstModeV2,HttpsFirstBalancedMode,HttpsFirstModeForAdvancedProtectionUsers,ImageServiceObserveSyncDownloadStatus,TrackingProtection3pcd,LensOverlay,AutomationControlled")
+
+	// Security boundaries are configured, not hard-coded: the sandbox, TLS
+	// verification, mixed-content blocking and the same-origin policy each
+	// relax only when compat asks (or, for the sandbox, when the host cannot
+	// provide one). The flags above are hygiene and stay unconditional.
+	l = applySecurityFlags(l, compat)
 
 	// Add fingerprint flags for Ungoogled-Chromium
 	if b.config.BrowserEngine == "ungoogled" || b.config.BrowserEngine == "fingerprint" {
@@ -367,16 +542,52 @@ func (b *Browser) boundedBrowser() *rod.Browser {
 	return b.rodBrowser.Timeout(browserOpTimeout)
 }
 
+// tabCreateTimeout bounds creating a tab (target create + attach) on a wedged
+// or unresponsive browser. A variable so tests can shrink it.
+var tabCreateTimeout = browserOpTimeout
+
+// createRodPage opens a tab, bounded by tabCreateTimeout and by crawlCtx.
+//
+// Not a Timeout-bounded clone: rod sets the new page's .browser to whatever
+// browser handle created it and derives the page's own context from that
+// handle's, so a Timeout clone would expire the long-lived crawl page
+// browserOpTimeout after creation. Instead the handle gets a cancel-only
+// context whose watchdog (the timeout, or the crawl context ending) is
+// disarmed as soon as the tab exists, leaving it live for the page's lifetime.
+// The returned release ends that context; call it once the page is closed.
+func (b *Browser) createRodPage(crawlCtx context.Context) (*rod.Page, context.CancelFunc, error) {
+	handle, release := b.rodBrowser.WithCancel()
+	timer := time.AfterFunc(tabCreateTimeout, release)
+	stopCrawlWatch := func() bool { return true }
+	if crawlCtx != nil {
+		stopCrawlWatch = context.AfterFunc(crawlCtx, release)
+	}
+	rodPage, err := handle.Page(proto.TargetCreateTarget{URL: "about:blank"})
+	timer.Stop()
+	stopCrawlWatch()
+	if err == nil && handle.GetContext().Err() != nil {
+		// The watchdog fired just as creation finished: the handle the page
+		// holds is already dead, so the page is unusable.
+		err = handle.GetContext().Err()
+		_ = closePageWithTimeout(rodPage.Context(context.Background()), browserOpTimeout, 1)
+	}
+	if err != nil {
+		release()
+		if crawlCtx != nil && crawlCtx.Err() != nil {
+			err = fmt.Errorf("%w (crawl context: %w)", err, crawlCtx.Err())
+		}
+		return nil, nil, err
+	}
+	return rodPage, release, nil
+}
+
 // NewPage creates a new page (tab).
 func (b *Browser) NewPage() (*Page, error) {
-	// Create on the raw browser, NOT a Timeout-bounded clone: rod sets the new
-	// page's .browser to whatever browser created it, and page ops that route
-	// through the browser context would then inherit (and outlive into) that short
-	// timeout — expiring the long-lived crawl page browserOpTimeout after creation.
-	// Page creation is a quick browser-level call; the wedged-browser cap matters
-	// for the one-shot ops (Close/Pages/version), which don't hand back a
-	// long-lived object.
-	rodPage, err := b.rodBrowser.Page(proto.TargetCreateTarget{URL: "about:blank"})
+	b.mu.Lock()
+	crawlCtx := b.crawlCtx
+	b.mu.Unlock()
+
+	rodPage, release, err := b.createRodPage(crawlCtx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create page: %w", err)
 	}
@@ -384,9 +595,6 @@ func (b *Browser) NewPage() (*Page, error) {
 	// Bind the crawl context (if set) so every rod operation on this page — and
 	// every element derived from it — inherits the crawl's deadline and
 	// cancellation. rod returns a clone from Context(), so use the clone.
-	b.mu.Lock()
-	crawlCtx := b.crawlCtx
-	b.mu.Unlock()
 	if crawlCtx != nil {
 		rodPage = rodPage.Context(crawlCtx)
 	}
@@ -419,10 +627,16 @@ func (b *Browser) NewPage() (*Page, error) {
 		rodPage: rodPage,
 		config:  b.config,
 		browser: b,
+		release: release,
 	}
 
-	// This runs in background and automatically accepts all JS dialogs.
+	// This runs in background and answers JS dialogs per the dialog policy.
 	page.setupAutoDialogHandler()
+
+	// A policy that denies form submission also blocks it inside the page.
+	if needsSubmitGuard(b.config) {
+		page.installSubmitGuard()
+	}
 
 	b.mu.Lock()
 	b.pages = append(b.pages, page)
@@ -485,19 +699,41 @@ func (b *Browser) HarvestCookies() ([]*http.Cookie, error) {
 	}
 	cookies := make([]*http.Cookie, 0, len(raw))
 	for _, c := range raw {
-		if c == nil || c.Name == "" {
-			continue
+		if converted := cdpCookieToHTTP(c); converted != nil {
+			cookies = append(cookies, converted)
 		}
-		cookies = append(cookies, &http.Cookie{
-			Name:     c.Name,
-			Value:    c.Value,
-			Domain:   c.Domain,
-			Path:     c.Path,
-			Secure:   c.Secure,
-			HttpOnly: c.HTTPOnly,
-		})
 	}
 	return cookies, nil
+}
+
+// cdpCookieToHTTP converts one CDP cookie to a net/http cookie, or nil for a
+// nil or nameless one. Pure, so the conversion is testable without a browser.
+//
+// Domain is passed through EXACTLY as CDP reports it, leading dot and all: that
+// dot is the only record of whether the cookie is host-only (bare domain) or
+// domain-wide (".example.com"), and stripping it here would silently widen every
+// host-only cookie to the whole domain downstream.
+//
+// Expires is carried for persistent cookies so a downstream consumer can drop a
+// cookie that has since expired. A session cookie (Session true, or a
+// non-positive epoch, which is CDP's "no expiry") keeps the zero time, which
+// every consumer reads as "lives as long as the session does".
+func cdpCookieToHTTP(c *proto.NetworkCookie) *http.Cookie {
+	if c == nil || c.Name == "" {
+		return nil
+	}
+	out := &http.Cookie{
+		Name:     c.Name,
+		Value:    c.Value,
+		Domain:   c.Domain,
+		Path:     c.Path,
+		Secure:   c.Secure,
+		HttpOnly: c.HTTPOnly,
+	}
+	if !c.Session && c.Expires > 0 {
+		out.Expires = c.Expires.Time()
+	}
+	return out
 }
 
 // closePageWithTimeout attempts to close a page with timeout and retry logic.
@@ -626,23 +862,69 @@ func (b *Browser) Close() error {
 	// Close browser. Cap it so a wedged browser can't hang teardown forever
 	// (the deferred pool.Close at the end of a crawl runs through here).
 	var closeErr error
-	if b.rodBrowser != nil {
+	switch {
+	case b.closeRod != nil:
+		closeErr = b.closeRod()
+	case b.rodBrowser != nil:
 		closeErr = b.boundedBrowser().Close()
+	}
+
+	// A bounded close that FAILED means the browser did not acknowledge shutdown
+	// within browserOpTimeout — the process may well still be running, and
+	// Close() returning was previously the last anyone looked at it. Escalate to
+	// the launcher's own kill, which is what actually owns the process.
+	//
+	// Kill also removes the profile, and it is idempotent, so the removal below
+	// is not duplicated work on this path — just whichever of the two runs first.
+	//
+	// An acknowledged close is not an exited process: Chromium answers
+	// Browser.close and then spends a moment shutting down, flushing its profile
+	// (Default/Cache, Network Persistent State...) as it goes. Removing the
+	// profile in that window lets the exiting process re-create it, which
+	// stranded one profile directory per closed browser. So a clean close waits
+	// for the exit too, and a process that does not exit gets the same kill.
+	if closeErr != nil || !b.awaitProcessExit(browserExitTimeout) {
+		b.Kill()
 	}
 
 	// Remove the Chromium profile whether or not the browser closed cleanly: a
 	// browser that failed to shut down is exactly the case that used to strand
 	// its profile. Done after the close above so the process is no longer
 	// writing into it.
-	if b.profileDir != "" {
-		if err := os.RemoveAll(b.profileDir); err != nil {
-			zap.L().Debug("could not remove the browser profile directory",
-				zap.String("dir", b.profileDir), zap.Error(err))
-		}
-		b.profileDir = ""
-	}
+	removeProfileDir(b.profileDir, "close")
+	b.profileDir = ""
 
 	return closeErr
+}
+
+// browserExitTimeout bounds how long Close waits for the browser process to exit
+// after an acknowledged close before escalating to Kill. Chromium normally exits
+// well within it. A variable so tests can shrink it.
+var browserExitTimeout = 5 * time.Second
+
+// awaitProcessExit reports whether the launched browser process exited within
+// timeout, and true when there is no process to wait for. rod's Cleanup is what
+// observes the exit (it also removes the profile once the process is gone); on a
+// timeout it keeps waiting in the background, so the Kill that follows still
+// ends with the profile removed after the process is really dead.
+func (b *Browser) awaitProcessExit(timeout time.Duration) bool {
+	l := b.launcher
+	if l == nil || l.PID() == 0 {
+		return true
+	}
+	exited := make(chan struct{})
+	go func() {
+		l.Cleanup()
+		close(exited)
+	}()
+	select {
+	case <-exited:
+		return true
+	case <-time.After(timeout):
+		zap.L().Debug("browser process did not exit after close, killing it",
+			zap.Int("pid", l.PID()), zap.Duration("waited", timeout))
+		return false
+	}
 }
 
 // IsConnected returns true if browser is connected.
@@ -836,8 +1118,15 @@ type Pool struct {
 	mu       sync.Mutex
 }
 
-// NewPool creates a new browser pool.
+// NewPool creates a new browser pool. Provisioning is not cancellable; see
+// NewPoolWithContext.
 func NewPool(cfg *config.Config) (*Pool, error) {
+	return NewPoolWithContext(context.Background(), cfg)
+}
+
+// NewPoolWithContext creates a new browser pool whose provisioning stops when
+// ctx ends (see NewWithContext).
+func NewPoolWithContext(ctx context.Context, cfg *config.Config) (*Pool, error) {
 	pool := &Pool{
 		config:   cfg,
 		browsers: make([]*Browser, 0),
@@ -845,7 +1134,7 @@ func NewPool(cfg *config.Config) (*Pool, error) {
 
 	// Create initial browsers
 	for i := 0; i < cfg.BrowserCount; i++ {
-		browser, err := New(cfg)
+		browser, err := NewWithContext(ctx, cfg)
 		if err != nil {
 			_ = pool.Close()
 			return nil, fmt.Errorf("failed to create browser %d: %w", i, err)

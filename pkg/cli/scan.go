@@ -9,11 +9,11 @@ import (
 	"io"
 	"net/url"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vigolium/vigolium/internal/scratch"
@@ -26,6 +26,7 @@ import (
 	"github.com/vigolium/vigolium/internal/memlimit"
 	"github.com/vigolium/vigolium/internal/runner"
 	"github.com/vigolium/vigolium/pkg/agent"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/httpmsg"
 	"github.com/vigolium/vigolium/pkg/input/formats/burpscope"
@@ -218,6 +219,12 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 	if err := reconcileOutputFormats(scanOpts); err != nil {
 		return err
 	}
+	// After reconcileOutputFormats, so the --json → jsonl mapping it performs is
+	// already visible: --events --json is the same stdout collision as
+	// --events --format jsonl, and checking before the mapping would miss it.
+	if err := validateStdoutProtocol(scanOpts); err != nil {
+		return err
+	}
 
 	// Stateless mode validation. The db-isolate precedence runs BEFORE the flag
 	// is copied into Options, so the copy below is already the resolved value and
@@ -256,6 +263,9 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 	if err := validateParallelScan(scanOpts); err != nil {
 		return err
 	}
+	if err := validateKeepDBOnError(scanOpts.Stateless); err != nil {
+		return err
+	}
 	if scanOpts.Stateless {
 		if globalDB != "" {
 			return fmt.Errorf("--stateless and --db are mutually exclusive")
@@ -279,30 +289,23 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 		}
 	}
 
-	// Load settings from config file
-	settings, err := config.LoadSettings(scanOpts.ConfigPath)
+	// Load settings from config file. A failure here is fatal: only an EXPLICIT
+	// --config reaches this branch (clicommon.LoadSettings degrades a discovered
+	// one to defaults with a warning), and running a scan under settings the
+	// operator did not choose — a different database, a different scope, a
+	// different rate limit — is worse than not running it. The old branch printed
+	// "Config file not found, using defaults", which was wrong twice: the file is
+	// usually found and unparseable, and "using defaults" was the problem.
+	settings, err := clicommon.LoadSettings(scanOpts.ConfigPath)
 	if err != nil {
-		if !scanOpts.Silent {
-			fmt.Fprintf(os.Stderr, "%s Config file not found, using defaults\n",
-				terminal.Gray(terminal.SymbolPending))
-		}
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	if scanOpts.ScopeOriginMode != "" {
 		settings.Scope.CLIOriginMode = scanOpts.ScopeOriginMode
 	}
 
-	// Propagate --rate-limit into the scanning pace so the known-issue-scan /
-	// nuclei limiter honors it. Copied unconditionally for the same reason as
-	// scanOpts.RateLimit above: the flag's default IS the applied default, and a
-	// config file that wants a different one sets scanning_pace.rate_limit, which
-	// this only overrides when the operator typed the flag.
 	scanOpts.RateLimitExplicitlySet = rateLimitKnob.globalChanged()
-	if scanOpts.RateLimitExplicitlySet {
-		settings.ScanningPace.RateLimit = globalRateLimit
-	}
 
 	// Override OAST URL if --oast-url flag is set
 	if scanOpts.OastURL != "" {
@@ -358,6 +361,19 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 		}
 		scanOpts.ScanningProfile = profileName
 		zap.L().Info("Applied scanning profile", zap.String("profile", profileName), zap.String("path", profilePath))
+	}
+
+	// Propagate --rate-limit into the scanning pace so the known-issue-scan /
+	// nuclei limiter honors it. Only when the operator typed the flag: the flag's
+	// default IS the applied default, and a config file that wants a different one
+	// sets scanning_pace.rate_limit.
+	//
+	// This has to run AFTER ApplyProfile. It used to run before, so a profile
+	// carrying its own scanning_pace.rate_limit overwrote the typed flag and
+	// known-issue-scan quietly paced itself at the profile's rate while the native
+	// scan honored the flag. A flag the operator typed outranks a profile.
+	if scanOpts.RateLimitExplicitlySet {
+		settings.ScanningPace.RateLimit = globalRateLimit
 	}
 
 	// Apply scanning strategy as baseline before per-phase overrides
@@ -457,6 +473,24 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 	// --split-by-host supplies a per-host base from each target's hostname.
 	if len(scanOpts.OutputFormats) > 1 && scanOpts.Output == "" && !splitByHostNaming {
 		return fmt.Errorf("multiple --format values require -o/--output to specify the base output path (or pass --split-by-host to name per-host files by hostname)")
+	}
+
+	// A negative budget is an already-expired deadline, not "unlimited": every
+	// consumer feeds it straight to context.WithTimeout, so the phase it governs
+	// does nothing and reports no error. Reject it before any side effect rather
+	// than silently running an empty scan. (Zero stays legal and means "default"
+	// for these two phases — see docs/configuration.md.)
+	for _, d := range []struct {
+		flag  string
+		value time.Duration
+	}{
+		{"discover-max-time", scanOpts.DiscoverMaxDuration},
+		{"spider-max-time", scanOpts.SpideringMaxDuration},
+		{"scanning-max-duration", globalScanningMaxDuration},
+	} {
+		if d.value < 0 {
+			return fmt.Errorf("--%s must not be negative, got %s", d.flag, d.value)
+		}
 	}
 
 	// Override scanning_pace.max_duration if --scanning-max-duration flag is set.
@@ -569,6 +603,12 @@ func runScanCmd(cmd *cobra.Command, args []string) (err error) {
 		if cmd.Flags().Changed("no-forms") {
 			settings.Spidering.NoForms = scanOpts.SpideringNoForms
 		}
+		if cmd.Flags().Changed("browser-insecure") {
+			settings.Spidering.BrowserCompat.SetAll(scanOpts.SpideringBrowserInsecure)
+		}
+		if cmd.Flags().Changed("require-auth") {
+			settings.Spidering.RequireAuth = scanOpts.SpideringRequireAuth
+		}
 		if err := settings.Spidering.Validate(); err != nil {
 			return fmt.Errorf("invalid spidering configuration: %w", err)
 		}
@@ -637,15 +677,34 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 		}
 		statelessDBPath = tmpFile.Name()
 		_ = tmpFile.Close()
-		defer func() {
-			_ = os.Remove(statelessDBPath)
-			_ = os.Remove(statelessDBPath + "-wal")
-			_ = os.Remove(statelessDBPath + "-shm")
-		}()
+		// Registered first, so it runs LAST (defers are LIFO) — after db.Close
+		// and after the db-isolate merge. Removing or preserving a database that
+		// still has an open handle would be the wrong order in both directions.
+		defer func() { err = releaseStatelessDB(statelessDBPath, err) }()
 
 		settings.Database.Driver = "sqlite"
 		settings.Database.SQLite.Path = statelessDBPath
 	}
+
+	// One signal handler for the whole invocation, installed before any of the
+	// setup below. The old one went in immediately before RunNativeScan, so a
+	// Ctrl+C during a schema migration, a session login or target expansion was
+	// not trapped by the scan at all.
+	signals := startScanSignals(scanStart)
+	defer signals.stop()
+
+	// The terminal event is emitted HERE, before --db-isolate registers its
+	// merge, so LIFO runs it after that merge has either landed or failed: the
+	// stream's last word on the scan must include whether the results reached
+	// the database the operator named. emitTerminalEvent is assigned later (the
+	// emitter needs the open database and the pinned uuid), so the holder is
+	// nil-checked rather than pre-filled.
+	var emitTerminalEvent func(error)
+	defer func() {
+		if emitTerminalEvent != nil {
+			emitTerminalEvent(err)
+		}
+	}()
 
 	// DB-isolate mode: scan into a private temporary SQLite database, then merge
 	// the results into the real --db (or default DB) once the scan finishes, so
@@ -707,15 +766,16 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 	scanOpts.ScanUUID = pinnedOrNewUUID(scanOpts.ScanUUID)
 
 	// Machine event stream (--events). Installed here, after the uuid is pinned
-	// and the database is open, so scan.started can name both. Registered as the
-	// OUTERMOST deferred emitter among the post-scan defers below, so the
-	// terminal scan.finished is the last line on the stream — a consumer treats
-	// it as end-of-stream, and anything emitted after it would be unreadable.
-	finishEvents, evErr := beginScanEventStream(db, scanOpts, settings, strategyName, scanStart)
+	// and the database is open, so scan.started can name both. The totals are
+	// gathered as the OUTERMOST of the post-scan defers below — while the
+	// database is still open — and the line itself is written by the holder
+	// registered above, after the db-isolate merge.
+	prepareTerminalEvent, emitEvents, evErr := beginScanEventStream(db, scanOpts, settings, strategyName, scanStart)
 	if evErr != nil {
 		return evErr
 	}
-	defer func() { finishEvents(err) }()
+	emitTerminalEvent = emitEvents
+	defer func() { prepareTerminalEvent(err) }()
 	// Print scan summary banner (after DB init so we can show HTTP record count)
 	printScanSummary(scanOpts, settings, strategyName, repo, "")
 	scanOpts.ScanConfigPrinted = true
@@ -742,21 +802,7 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 	// unified envelope post-scan instead of StandardWriter's live nuclei stream
 	// (suppressed via DeferredJSONLExport). No-ops for stateless and CI runs.
 	defer func() {
-		// Skip the deferred jsonl envelope when it would be misleading or
-		// redundant:
-		//  - stateless WITH -o: finishStatelessExport already materializes every
-		//    format to the file, and scanOpts.Output is temporarily blanked here,
-		//    so finishScanJSONLExport can't detect this case itself — without this
-		//    guard it would also stream the envelope to stdout (double output).
-		//  - a hard-failed persisted scan: don't write a success-looking
-		//    file/stream of stale or partial project data (mirrors the skipped
-		//    "completed" banner). Stateless is exempt — its temp DB is discarded
-		//    after the run, so the stdout stream is the only chance to surface
-		//    whatever was found.
-		if scanOpts.Stateless && statelessOutputPath != "" {
-			return
-		}
-		if err != nil && !scanOpts.Stateless {
+		if skipDeferredJSONLExport(err, scanOpts.Stateless, statelessOutputPath) {
 			return
 		}
 		recordExportFailure(&err, finishScanJSONLExport(db, scanOpts))
@@ -822,17 +868,14 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 					scanRunner.SetRepository(repo)
 				}
 
-				setupScanSignalHandler(scanRunner)
-
 				// Close before reporting (so any flush lands in the DB the reports
 				// read) — matching the main runner.New path below.
-				scanErr := scanRunner.RunNativeScan()
-				scanRunner.Close()
+				scanErr := runNativeScanPass(scanRunner)
 				if scanErr != nil {
 					return scanErr
 				}
-				reportNativeScanSuccess(db, settings, repo, scanStart)
-				return nil
+				recordExportFailure(&err, reportNativeScanSuccess(db, settings, repo, scanStart))
+				return err
 			}
 		}
 		// URLs — fall through to the runner.New() path below. Stdin is already
@@ -842,9 +885,14 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 		scanOpts.Stdin = false
 	}
 
+	// Returned, not zap.L().Fatal: Fatal calls os.Exit(1), which runs none of the
+	// defers above — the event stream never writes its scan.finished, the
+	// stateless export never materializes, the database is never closed, and the
+	// -j error envelope is never emitted. A consumer saw a truncated stream and
+	// exit 1 with no stated cause.
 	scanRunner, err := runner.New(scanOpts)
 	if err != nil {
-		zap.L().Fatal("Could not create runner", zap.Error(err))
+		return fmt.Errorf("failed to create scan runner: %w", err)
 	}
 	if scanRunner == nil {
 		return nil
@@ -856,10 +904,7 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 		scanRunner.SetRepository(repo)
 	}
 
-	setupScanSignalHandler(scanRunner)
-
-	scanErr := scanRunner.RunNativeScan()
-	scanRunner.Close()
+	scanErr := runNativeScanPass(scanRunner)
 	// A failed scan must abort visibly: returning the error makes cobra print it
 	// (it's an ErrorLevel-and-above world by default, so the old INFO log was
 	// invisible without --verbose) and exit non-zero, and skips the "completed"
@@ -869,8 +914,8 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 		return scanErr
 	}
 
-	reportNativeScanSuccess(db, settings, repo, scanStart)
-	return nil
+	recordExportFailure(&err, reportNativeScanSuccess(db, settings, repo, scanStart))
+	return err
 }
 
 // reportNativeScanSuccess runs the post-scan tail shared by every native-scan
@@ -880,17 +925,78 @@ func executeNativeScan(cmd *cobra.Command, settings *config.Settings, strategyNa
 // never paints over a scan that didn't actually run. A scan curtailed by
 // --scanning-max-duration returns nil (graceful), so time-boxed partial scans
 // still reach this path and keep their reports.
-func reportNativeScanSuccess(db *database.DB, settings *config.Settings, repo *database.Repository, scanStart time.Time) {
-	maybeGenerateReports(db, scanOpts)
-	finishFSExport(db, scanOpts)
-	uploadNativeScanResults(settings, scanOpts, repo)
-	if !scanOpts.Silent {
-		hosts := summaryScopeHosts(context.Background(), repo, settings, scanOpts.Targets, scanOpts.ProjectUUID, scanOpts.ScanUUID)
-		printScanCompletionSummary(repo, scanOpts.ProjectUUID, hosts, time.Since(scanStart))
+//
+// It returns the joined failures of the three artifact-producing steps. The
+// summary, the finding/traffic prints and the gate still run after one of them
+// fails, deliberately: the scan's results exist and are worth showing, and the
+// gate's verdict is about the findings rather than about the files. What changes
+// is that the caller folds the error in with recordExportFailure, so a run that
+// did not write what it was asked for exits non-zero instead of printing
+// "Failed to generate html" and exiting 0.
+func reportNativeScanSuccess(db *database.DB, settings *config.Settings, repo *database.Repository, scanStart time.Time) error {
+	// The upload is the one step that is NOT shared with the lightweight
+	// commands: it is opt-in on --upload-results, but it also fires the
+	// configured webhook unconditionally, and scan-url/scan-request have never
+	// done that. Keeping it here rather than in reportScanCompletion is what lets
+	// both callers share the rest without changing what either one emits.
+	return errors.Join(
+		reportScanCompletion(db, settings, repo, scanOpts, scanStart),
+		uploadNativeScanResults(settings, scanOpts, repo),
+	)
+}
+
+// reportScanCompletion is the artifact-and-report tail every native-scan entry
+// point runs, lightweight commands included: reports, the fs tree, the
+// completion summary, the optional finding/traffic prints, and the --fail-on
+// gate. opts is a parameter rather than the scanOpts global precisely so
+// runRunnerScan can call it — it was a hand-copy of this body for want of one
+// argument.
+func reportScanCompletion(
+	db *database.DB,
+	settings *config.Settings,
+	repo *database.Repository,
+	opts *types.Options,
+	scanStart time.Time,
+) error {
+	// maybeGenerateReports self-guards on opts.Output=="" (blanked on the
+	// stateless path, where finishStatelessExport handles reports instead).
+	artifacts := errors.Join(
+		maybeGenerateReports(db, opts),
+		finishFSExport(db, opts),
+	)
+	if !opts.Silent {
+		hosts := summaryScopeHosts(context.Background(), repo, settings, opts.Targets, opts.ProjectUUID, opts.ScanUUID)
+		printScanCompletionSummary(repo, opts.ProjectUUID, hosts, time.Since(scanStart))
 	}
-	maybePrintScanFindings(context.Background(), db, scanOpts.ProjectUUID, scanOpts.ScanUUID)
-	maybePrintScanTraffic(context.Background(), db, scanOpts.ProjectUUID)
-	evaluateFailOnGate(repo, scanOpts.ProjectUUID, scanOpts.ScanUUID, scanOpts.Silent)
+	maybePrintScanFindings(context.Background(), db, opts.ProjectUUID, opts.ScanUUID)
+	maybePrintScanTraffic(context.Background(), db, opts.ProjectUUID)
+	evaluateFailOnGate(repo, opts.ProjectUUID, opts.ScanUUID, opts.Silent)
+	return artifacts
+}
+
+// skipDeferredJSONLExport reports whether the deferred persisted-jsonl export
+// must not run.
+//
+// One predicate, because every native-scan entry point registers that defer and
+// the rule is subtle enough that a second copy drifts:
+//
+//   - stateless WITH -o: finishStatelessExport already materializes every format
+//     to the file, and opts.Output is temporarily blanked, so
+//     finishScanJSONLExport cannot detect this case itself — without this guard
+//     it would ALSO stream the envelope to stdout (double output).
+//   - a hard-failed persisted scan: don't write a success-looking file or stream
+//     of stale or partial project data (mirrors the skipped "completed" banner).
+//     Stateless is exempt — its temp DB is discarded after the run, so the stdout
+//     stream is the only chance to surface whatever was found.
+//   - an export failure is NOT a failed scan: an unwritable html path says
+//     nothing about the findings, and skipping the jsonl export over it loses the
+//     one format that would still have landed. Each --format is attempted
+//     independently (see isExportFailure).
+func skipDeferredJSONLExport(err error, stateless bool, statelessOutputPath string) bool {
+	if stateless && statelessOutputPath != "" {
+		return true
+	}
+	return err != nil && !stateless && !isExportFailure(err)
 }
 
 // runStatelessTargetFile iterates over each non-blank line in
@@ -1250,22 +1356,24 @@ func runScanWithIngest(settings *config.Settings, db *database.DB, repo *databas
 	if err != nil {
 		return fmt.Errorf("failed to create scan runner: %w", err)
 	}
-	defer scanRunner.Close()
-
 	scanRunner.SetSettings(settings)
 	scanRunner.SetRepository(repo)
-
-	setupScanSignalHandler(scanRunner)
 
 	// A failed scan must abort visibly (return non-zero, skip the success
 	// banner) rather than logging at INFO and claiming completion — matching the
 	// direct-target path. See reportNativeScanSuccess.
-	if err := scanRunner.RunNativeScan(); err != nil {
+	//
+	// runNativeScanPass owns the release, replacing a `defer Close()`: on the
+	// interrupted-before-start path the runner is Discarded, and a deferred
+	// Close would then block for the whole shutdown timeout waiting on a run
+	// that never happened.
+	if err := runNativeScanPass(scanRunner); err != nil {
 		return err
 	}
 
-	reportNativeScanSuccess(db, settings, repo, scanStart)
-	return nil
+	var tailErr error
+	recordExportFailure(&tailErr, reportNativeScanSuccess(db, settings, repo, scanStart))
+	return tailErr
 }
 
 // runDBScan scans records already in the database (no explicit targets).
@@ -1277,22 +1385,19 @@ func runDBScan(settings *config.Settings, db *database.DB, repo *database.Reposi
 	if err != nil {
 		return fmt.Errorf("failed to create scan runner: %w", err)
 	}
-	defer scanRunner.Close()
-
 	scanRunner.SetSettings(settings)
 	scanRunner.SetRepository(repo)
 
-	setupScanSignalHandler(scanRunner)
-
 	// A failed scan must abort visibly (return non-zero, skip the success
 	// banner) rather than logging at INFO and claiming completion — matching the
-	// direct-target path. See reportNativeScanSuccess.
-	if err := scanRunner.RunNativeScan(); err != nil {
+	// direct-target path. See reportNativeScanSuccess and runNativeScanPass.
+	if err := runNativeScanPass(scanRunner); err != nil {
 		return err
 	}
 
-	reportNativeScanSuccess(db, settings, repo, scanStart)
-	return nil
+	var tailErr error
+	recordExportFailure(&tailErr, reportNativeScanSuccess(db, settings, repo, scanStart))
+	return tailErr
 }
 
 // emptySource is an InputSource that immediately returns io.EOF.
@@ -1484,10 +1589,24 @@ func formatNeedsOutput(format string) bool {
 	return true
 }
 
-// maybeGenerateReports generates all requested file-based reports post-scan.
-func maybeGenerateReports(db *database.DB, opts *types.Options) {
+// maybeGenerateReports generates all requested file-based reports post-scan and
+// returns the joined per-format failures.
+//
+// Every format named on the command line is a requested output, and a scan that
+// could not write one did not do what it was asked. It used to print "Failed to
+// generate html" to stderr and exit 0, so a CI job that asked for a report and
+// read the exit code was told the run succeeded while the file it was about to
+// publish did not exist. The error now reaches the caller, which folds it in
+// with recordExportFailure.
+//
+// Nothing is printed for a failure here, for the same reason as
+// finishStatelessExport: the root handler renders the returned error once, and
+// printing as well announced the same cause twice in two wordings. Each format
+// is still attempted independently, so one unwritable destination does not cost
+// the others.
+func maybeGenerateReports(db *database.DB, opts *types.Options) error {
 	if opts.Output == "" {
-		return
+		return nil
 	}
 	ctx := context.Background()
 	// Scope the report's findings to this scan on a persisted (shared) DB, so a
@@ -1497,6 +1616,7 @@ func maybeGenerateReports(db *database.DB, opts *types.Options) {
 	if !opts.Stateless {
 		scanScope = opts.ScanUUID
 	}
+	var failures []error
 	for _, rf := range reportFormats {
 		if !opts.HasFormat(rf.format) {
 			continue
@@ -1506,11 +1626,12 @@ func maybeGenerateReports(db *database.DB, opts *types.Options) {
 			fmt.Fprintf(os.Stderr, "%s %s\n", terminal.InfoSymbol(), rf.beforeMsg)
 		}
 		if err := generateReportFromDB(ctx, db, outPath, opts.OmitResponse, exportProjectScope(opts), scanScope, rf, nil); err != nil {
-			fmt.Fprintf(os.Stderr, "%s Failed to generate %s: %v\n", terminal.ErrorPrefix(), rf.label, err)
-		} else {
-			fmt.Fprintf(os.Stderr, "%s %s: %s\n", terminal.InfoSymbol(), rf.label, terminal.Cyan(outPath))
+			failures = append(failures, fmt.Errorf("generate %s %s: %w", rf.label, outPath, err))
+			continue
 		}
+		fmt.Fprintf(os.Stderr, "%s %s: %s\n", terminal.InfoSymbol(), rf.label, terminal.Cyan(outPath))
 	}
+	return errors.Join(failures...)
 }
 
 // finishFSExport writes the post-scan flat filesystem tree (the `fs` format)
@@ -1518,9 +1639,12 @@ func maybeGenerateReports(db *database.DB, opts *types.Options) {
 // by finishStatelessExport (their temp DB is whole-run-scoped and opts.Output is
 // blanked), so this no-ops for them. The base defaults to "vigolium" in the cwd
 // when no -o was given, matching the documented fs behavior.
-func finishFSExport(db *database.DB, opts *types.Options) {
+//
+// Like maybeGenerateReports, a failure is returned rather than printed: `--format
+// fs` is a requested output, and a run that wrote no tree has not delivered it.
+func finishFSExport(db *database.DB, opts *types.Options) error {
 	if !opts.HasFormat("fs") || opts.Stateless {
-		return
+		return nil
 	}
 	base := opts.Output
 	if len(opts.OutputFormats) > 1 {
@@ -1529,10 +1653,10 @@ func finishFSExport(db *database.DB, opts *types.Options) {
 	filters := database.QueryFilters{ProjectUUID: exportProjectScope(opts)}
 	stats, err := writeFSExport(context.Background(), db, filters, base, fsExportOptions{omitResponse: opts.OmitResponse})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to export fs tree: %v\n", terminal.ErrorPrefix(), err)
-		return
+		return fmt.Errorf("export fs tree: %w", err)
 	}
 	fsPrintSummary(stats)
+	return nil
 }
 
 // exportedFile records one materialized file/directory for the unified stateless
@@ -1851,9 +1975,7 @@ func finishDBIsolateMerge(destCfg config.DatabaseConfig, scratchPath string, sil
 	}
 
 	// Success: discard the scratch database and its WAL sidecars.
-	_ = os.Remove(scratchPath)
-	_ = os.Remove(scratchPath + "-wal")
-	_ = os.Remove(scratchPath + "-shm")
+	removeWorkingDB(scratchPath)
 	if !silent && stats != nil {
 		fmt.Fprintf(os.Stderr, "%s Merged results into %s (%d records, %d findings)\n",
 			terminal.InfoSymbol(), terminal.Cyan(destCfg.SQLite.Path), stats.RecordsMerged, stats.FindingsMerged)
@@ -1861,20 +1983,47 @@ func finishDBIsolateMerge(destCfg config.DatabaseConfig, scratchPath string, sil
 	return scanErr
 }
 
-// dbIsolateMergeFailed preserves the scratch database (so results are never
-// silently lost), logs a recovery hint pointing at it, and returns the error
-// the command should exit with: the original scan error when the scan itself
+// dbIsolateMergeFailed moves the scratch database somewhere that outlives the
+// process, prints a recovery hint naming that path, and returns the error the
+// command should exit with: the original scan error when the scan itself
 // failed, otherwise the merge error.
+//
+// The move is the fix for a false promise. This used to print "This scan's
+// results are preserved in the temporary database: <scratch path>" — and that
+// path is inside the process scratch directory, which releaseScratch removes at
+// exit, moments later. The operator was told where to find results that were
+// already being deleted. The word "preserved" is now never printed next to a
+// scratch path: either the file has been moved out, or the message says it could
+// not be.
 func dbIsolateMergeFailed(scratchPath string, scanErr, mergeErr error) error {
-	fmt.Fprintf(os.Stderr,
-		"%s --db-isolate merge failed: %v\n   This scan's results are preserved in the temporary database:\n     %s\n",
-		terminal.ErrorPrefix(), mergeErr, terminal.Cyan(scratchPath))
-	zap.L().Error("db-isolate merge failed; scratch database preserved",
-		zap.String("scratch", scratchPath), zap.Error(mergeErr))
-	if scanErr != nil {
-		return scanErr
+	fmt.Fprintf(os.Stderr, "%s --db-isolate merge failed: %v\n", terminal.ErrorPrefix(), mergeErr)
+
+	dest, keepErr := preserveWorkingDB(scratchPath, "isolate")
+	if keepErr != nil {
+		fmt.Fprintf(os.Stderr, "   This scan's results could NOT be preserved: %v\n", keepErr)
+		zap.L().Error("db-isolate merge failed and the scratch database could not be preserved",
+			zap.String("scratch", scratchPath), zap.Error(mergeErr), zap.NamedError("preserve_error", keepErr))
+		if scanErr != nil {
+			return scanErr
+		}
+		// keepErr's text, not keepErr itself: it is an os error that may wrap
+		// os.ErrNotExist, and adding that to the chain would make the error
+		// classify as source_missing — telling a driver the database it had just
+		// been scanning is not there. mergeErr is the cause worth classifying.
+		return fmt.Errorf("db-isolate merge failed (results lost: %s): %w", keepErr.Error(), mergeErr)
 	}
-	return fmt.Errorf("db-isolate merge failed: %w", mergeErr)
+
+	fmt.Fprintf(os.Stderr,
+		"   This scan's results are preserved at:\n     %s\n   Merge them later with: %s\n",
+		terminal.Cyan(dest),
+		terminal.BoldCyan(fmt.Sprintf("vigolium import --db %s %s", dbIsolateDestPath, dest)))
+	zap.L().Error("db-isolate merge failed; working database preserved",
+		zap.String("scratch", scratchPath), zap.String("preserved", dest), zap.Error(mergeErr))
+
+	if scanErr != nil {
+		return fmt.Errorf("%w (db-isolate results kept at %s)", scanErr, dest)
+	}
+	return fmt.Errorf("db-isolate merge failed (results kept at %s): %w", dest, mergeErr)
 }
 
 // exportProjectScope returns the project filter for a post-scan export: empty
@@ -2148,32 +2297,17 @@ func shortContentType(ct string) string {
 	return ct
 }
 
-func setupScanSignalHandler(r *runner.Runner) {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	go func() {
-		// First Ctrl+C: graceful shutdown
-		<-c
-		zap.L().Info("CTRL+C pressed: Exiting")
-		zap.L().Info("Attempting graceful shutdown...")
-
-		// Start graceful Close in a goroutine
-		closeDone := make(chan struct{})
-		go func() {
-			r.Close()
-			close(closeDone)
-		}()
-
-		// Wait for Close to finish or a second Ctrl+C
-		select {
-		case <-closeDone:
-			// Graceful shutdown completed
-		case <-c:
-			zap.L().Warn("Second CTRL+C received, forcing exit")
-			os.Exit(1)
-		}
-	}()
-}
+// scanShutdownSignals are the signals that cancel a running scan.
+//
+// SIGTERM is here for parity with scanevents.TrapSignals, which has always
+// trapped both. Trapping only SIGINT meant a SIGTERM (a `timeout`, a container
+// stop, a supervisor) emitted a terminal scan.finished{interrupted} on the event
+// stream — latching the emitter shut — while the runner carried on to completion
+// and later wrote `completed | complete` to the scan row. The stream and the row
+// disagreed, and the row's real terminal event was dropped by the once-latch. Now
+// both paths take the same cancellation route — see scanSignalCoordinator, which
+// is the single handler both facts now come from.
+var scanShutdownSignals = []os.Signal{os.Interrupt, syscall.SIGTERM}
 
 // heapCeilingConfigLine renders the memory-ceiling detail shown inside the
 // Native Scan Configuration block under a parallel fan-out (-P > 1): plain
@@ -2313,7 +2447,7 @@ func printScanSummary(opts *types.Options, settings *config.Settings, strategyNa
 		terminal.Purple(terminal.SymbolInfo),
 		runner.PhaseLabel(settings, "ExternalHarvest", "external_harvester", ehEnabled, 0),
 		runner.PhaseLabel(settings, "Spidering", "spidering", spideringEnabled, runner.SpideringBudget(settings, opts)),
-		runner.PhaseLabel(settings, "Discovery", "discovery", discoveryEnabled, opts.DiscoverMaxDuration))
+		runner.PhaseLabel(settings, "Discovery", "discovery", discoveryEnabled, runner.DiscoveryBudget(settings, opts)))
 	fmt.Fprintf(os.Stderr, "           %s | %s\n",
 		runner.PhaseLabel(settings, "KnownIssueScan", "known-issue-scan", knownIssueScanEnabled, 0),
 		runner.PhaseLabel(settings, "DynamicAssessment", "dynamic-assessment", daEnabled, 0))

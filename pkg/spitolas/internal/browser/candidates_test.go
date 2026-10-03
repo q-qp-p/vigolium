@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -147,7 +148,7 @@ func TestBuildBrowserCandidatesPlatformMatrix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := labelsOf(buildBrowserCandidates(tt.goos, tt.goarch, "", sysBins, embedded))
+			got := labelsOf(buildBrowserCandidates(context.Background(), tt.goos, tt.goarch, "", sysBins, embedded))
 			if len(got) != len(tt.want) {
 				t.Fatalf("labels = %v, want %v", got, tt.want)
 			}
@@ -172,7 +173,7 @@ func TestBuildBrowserCandidatesPlatformMatrix(t *testing.T) {
 // sorts ahead of everything and resolves to the configured value.
 func TestBuildBrowserCandidatesConfigPathFirst(t *testing.T) {
 	embedded := func() (string, error) { return "", nil }
-	cands := buildBrowserCandidates("linux", "amd64", "/opt/cft/chrome", []string{"/usr/bin/chromium"}, embedded)
+	cands := buildBrowserCandidates(context.Background(), "linux", "amd64", "/opt/cft/chrome", []string{"/usr/bin/chromium"}, embedded)
 
 	if len(cands) == 0 || cands[0].label != "configured browser_path" {
 		t.Fatalf("configured browser_path should be first, got %v", labelsOf(cands))
@@ -182,7 +183,7 @@ func TestBuildBrowserCandidatesConfigPathFirst(t *testing.T) {
 		t.Fatalf("config candidate resolve = (%q, %v), want (/opt/cft/chrome, nil)", p, err)
 	}
 	// Without a config path, the first candidate is the embedded engine.
-	noCfg := buildBrowserCandidates("linux", "amd64", "", nil, embedded)
+	noCfg := buildBrowserCandidates(context.Background(), "linux", "amd64", "", nil, embedded)
 	if len(noCfg) == 0 || noCfg[0].label != "embedded browser" {
 		t.Fatalf("with no config path, embedded browser should lead, got %v", labelsOf(noCfg))
 	}
@@ -198,7 +199,7 @@ func TestLinuxARM64UsesSystemChromium(t *testing.T) {
 	embedded := func() (string, error) { return "", nil }
 
 	// With an apt-installed chromium, arm64 uses it just like any other host.
-	withChromium := labelsOf(buildBrowserCandidates("linux", "arm64", "", []string{"/usr/bin/chromium"}, embedded))
+	withChromium := labelsOf(buildBrowserCandidates(context.Background(), "linux", "arm64", "", []string{"/usr/bin/chromium"}, embedded))
 	if !slices.Contains(withChromium, "system browser /usr/bin/chromium") {
 		t.Fatalf("arm64 must try the installed system chromium, got %v", withChromium)
 	}
@@ -216,7 +217,7 @@ func TestLinuxARM64UsesSystemChromium(t *testing.T) {
 	// With NO browser installed, the ladder still self-skips the unavailable CfT
 	// rungs and offers no rod auto-download — so launch() emits the install hint
 	// rather than hanging.
-	bare := labelsOf(buildBrowserCandidates("linux", "arm64", "", nil, embedded))
+	bare := labelsOf(buildBrowserCandidates(context.Background(), "linux", "arm64", "", nil, embedded))
 	if slices.Contains(bare, "rod auto-download") {
 		t.Errorf("arm64 with no system browser must not offer rod auto-download, got %v", bare)
 	}

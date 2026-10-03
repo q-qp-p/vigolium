@@ -166,8 +166,10 @@ sessions:
 ## Step 8 — Save Browser State
 
 ```bash
-agent-browser state save --session-name auth-{{.Hostname}}
+agent-browser state save ./auth-{{.Hostname}}.json --session-name auth-{{.Hostname}}
 ```
+
+`state save` requires the output file path; `--state <path>` restores it later.
 
 This preserves the authenticated browser session for potential reuse by other agents.
 

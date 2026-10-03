@@ -51,7 +51,7 @@ func NewSpiderSession(ctx context.Context, base SpiderConfig, repo RecordSaver) 
 	writer := network.NewRepositoryWriter(repo, source, base.ProjectUUID)
 	writer.ScopeFilter = base.ScopeFilter
 
-	pool, err := browser.NewPool(crawlerCfg)
+	pool, err := browser.NewPoolWithContext(ctx, crawlerCfg)
 	if err != nil {
 		_ = writer.Close()
 		return nil, fmt.Errorf("spider session: create browser pool: %w", err)
@@ -77,6 +77,7 @@ func NewSpiderSession(ctx context.Context, base SpiderConfig, repo RecordSaver) 
 	// Keep several distinct query-value variants per endpoint shape (category/
 	// filter/tab/search links) rather than collapsing them to one representative.
 	capture.SetMaxParamValueVariants(crawlerCfg.MaxParamValueVariants)
+	capture.SetMaxBodyBytes(crawlerCfg.MaxCaptureBodyBytes)
 	if err := capture.Start(br.RodBrowser()); err != nil {
 		_ = pool.Close()
 		_ = writer.Close()
@@ -118,6 +119,7 @@ func (s *SpiderSession) Crawl(ctx context.Context, seedURL string) (*SpiderResul
 	// slightly undercount at the boundary; the session-final flush on Close makes
 	// the running total exact, and later seeds pick up any lag.
 	before := s.writer.Count()
+	rBefore := s.writer.Receipt()
 	result, err := c.RunOnBrowser(ctx, s.br, s.capture)
 	if err != nil {
 		return nil, err
@@ -126,7 +128,21 @@ func (s *SpiderSession) Crawl(ctx context.Context, seedURL string) (*SpiderResul
 	if saved < 0 {
 		saved = 0
 	}
-	return spiderResultFromCrawl(result, saved), nil
+	res := spiderResultFromCrawl(result, saved)
+	// This seed's share of the shared writer. The writer is still open, so the
+	// receipt is a running delta (DrainComplete false); Receipt after Close is
+	// the session's final account.
+	rAfter := s.writer.Receipt()
+	res.Capture = deltaCaptureReceipt(rBefore, rAfter, s.base.IncludeResponseBody, s.base.IncludeHeaders)
+	writeCrawlGraph(c, seedCfg, crawlerCfg, res.Capture)
+	return res, nil
+}
+
+// Receipt is the session's capture receipt across every seed: final once Close
+// has returned, a running snapshot (DrainComplete false) before that — which is
+// also the honest answer for a session abandoned without Close.
+func (s *SpiderSession) Receipt() CaptureReceipt {
+	return newCaptureReceipt(s.writer.Receipt(), s.base.IncludeResponseBody, s.base.IncludeHeaders)
 }
 
 // RecordsSaved reports the total records the session has persisted so far across
@@ -136,7 +152,8 @@ func (s *SpiderSession) RecordsSaved() int {
 }
 
 // Close flushes the shared writer (via the capture) and tears the browser down.
-// Safe to call more than once.
+// Safe to call more than once. A non-nil error carries the writer's drop tally
+// when records were lost; Receipt has the full account.
 func (s *SpiderSession) Close() error {
 	if s.closed {
 		return nil
@@ -153,4 +170,23 @@ func (s *SpiderSession) Close() error {
 		}
 	}
 	return err
+}
+
+// Kill terminates the session's browser process and removes its profile, without
+// waiting for or taking any lock a wedged Close might be holding.
+//
+// It is for the caller-side watchdog paths: a Crawl or a Close that did not
+// return within its budget is abandoned, and until now that left a Chromium
+// process (and its profile) alive for the rest of the scan — one per abandoned
+// crawl, each holding its share of memory and open sockets.
+//
+// It goes straight to the session's own browser rather than through Pool.Close,
+// which takes the pool mutex that a wedged teardown is already holding. Safe to
+// call concurrently with Close, more than once, and on a session that never
+// launched. A killed session must not be used again.
+func (s *SpiderSession) Kill() {
+	if s == nil {
+		return
+	}
+	s.br.Kill()
 }

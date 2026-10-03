@@ -91,9 +91,9 @@ func runLogLs(cmd *cobra.Command, args []string) error {
 	defer syncLogger()
 	defer closeDatabaseOnExit()
 
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// openReadDB, not getDB: `vigolium log` is a read command, so a shell pinned
@@ -307,9 +307,9 @@ func runLogShow(cmd *cobra.Command, args []string) error {
 // following when the session is still running (unless followOverride is true,
 // in which case the explicit --follow/no-follow flag value is honored).
 func showLogForUUID(uuid string, followExplicit bool) error {
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	src, err := resolveLogSource(uuid, settings)

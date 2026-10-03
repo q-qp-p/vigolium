@@ -68,6 +68,10 @@ func runLazyFrameCrawl(t *testing.T, primingOn bool) func(string) bool {
 	cfg.MaxStates = 1
 	cfg.MaxDuration = 20 * time.Second
 	cfg.IframePriming = primingOn
+	// The frame is below the fold so that only priming can load it; auto-scroll
+	// would bring it into view and Chromium would load it itself, turning the
+	// negative control into a permanent skip and the positive case into a tautology.
+	cfg.AutoScroll = false
 
 	c, err := New(cfg)
 	if err != nil {

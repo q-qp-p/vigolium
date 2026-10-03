@@ -77,6 +77,9 @@ var schemaTables = []string{
 		suspect_count INTEGER DEFAULT 0,
 		error_message TEXT,
 		storage_url TEXT,
+		completeness TEXT,
+		stop_reason TEXT,
+		phase_outcomes TEXT,
 		created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 	)`,

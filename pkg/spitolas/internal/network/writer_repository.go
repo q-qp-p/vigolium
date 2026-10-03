@@ -103,6 +103,14 @@ type RepositoryWriter struct {
 	// failed counts records dropped because their SaveRecordBatch failed, so a
 	// crawl that lost traffic to a failing DB doesn't silently report success.
 	failed int
+	// accepted counts records Write admitted to the queue; refused counts the
+	// ones it turned away with ErrWriterClosed. drainComplete is set once the
+	// final drain has given every admitted record an outcome within its budget
+	// (persisted or failed) — false while open, and after an abandoned drain.
+	accepted      int
+	refused       int
+	drainComplete bool
+	closed        bool
 	// specSeen tracks already-parsed spec content hashes to avoid re-parsing.
 	specSeen map[string]struct{}
 
@@ -185,7 +193,7 @@ func (w *RepositoryWriter) Write(entry *TrafficEntry) error {
 		// say so. This mirrors the capture's own post-Close drop of late Loading
 		// events, but the caller can now tell the difference between "stored" and
 		// "arrived too late".
-		return ErrWriterClosed
+		return w.refuse()
 	default:
 	}
 
@@ -195,13 +203,24 @@ func (w *RepositoryWriter) Write(entry *TrafficEntry) error {
 		// flip, the item is safe: the drainer cannot have taken the write lock
 		// while this producer holds the read lock, so the final drain has not
 		// started and will see this item.
+		w.mu.Lock()
+		w.accepted++
+		w.mu.Unlock()
 		return nil
 	case <-w.stop:
 		// Shutdown began while this producer was blocked on a full queue. Refuse
 		// explicitly rather than returning nil for a record nothing will store —
 		// returning nil here is precisely the bug this whole barrier is about.
-		return ErrWriterClosed
+		return w.refuse()
 	}
+}
+
+// refuse counts a record turned away after shutdown began.
+func (w *RepositoryWriter) refuse() error {
+	w.mu.Lock()
+	w.refused++
+	w.mu.Unlock()
+	return ErrWriterClosed
 }
 
 // flushLoop drains the write queue, coalescing records into SaveRecordBatch calls
@@ -285,6 +304,9 @@ func (w *RepositoryWriter) flushLoop() {
 				}
 			default:
 				flush(deadline)
+				w.mu.Lock()
+				w.drainComplete = true
+				w.mu.Unlock()
 				return
 			}
 		}
@@ -318,6 +340,11 @@ func (w *RepositoryWriter) abandonQueued(pending *[]writeItem) {
 		case <-w.queue:
 			dropped++
 		default:
+			w.mu.Lock()
+			// The budget ran out exactly as the queue emptied: nothing was left
+			// behind, so the drain did finish.
+			w.drainComplete = dropped == 0
+			w.mu.Unlock()
 			if dropped > 0 {
 				zap.L().Warn("RepositoryWriter shutdown budget exhausted; queued records abandoned",
 					zap.Int("abandoned", dropped),
@@ -419,26 +446,75 @@ func (w *RepositoryWriter) ingestSpecEndpoints(entry *TrafficEntry, httpRR *http
 // caller could have noticed. Existing callers discard or log the error, so the
 // change surfaces the loss without altering control flow.
 func (w *RepositoryWriter) Close() error {
-	w.closeOnce.Do(func() { close(w.stop) })
+	first := false
+	w.closeOnce.Do(func() { close(w.stop); first = true })
 	<-w.done
 
 	w.mu.Lock()
+	w.closed = true
 	saved, failed := w.count, w.failed
 	w.mu.Unlock()
 
-	if failed > 0 {
+	err := closeError(saved, failed, w.source)
+	if !first {
+		// Already reported by the first Close; later calls only return it.
+		return err
+	}
+	if err != nil {
 		zap.L().Warn("RepositoryWriter closed with dropped records (DB save failures)",
 			zap.Int("records_saved", saved),
 			zap.Int("records_dropped", failed),
 			zap.String("source", w.source))
-		return fmt.Errorf("repository writer: %d record(s) dropped to save failures (%d saved, source %q)",
-			failed, saved, w.source)
+		return err
 	}
 
 	zap.L().Debug("RepositoryWriter closed",
 		zap.Int("records_saved", saved),
 		zap.String("source", w.source))
 	return nil
+}
+
+// closeError is the error Close reports: non-nil when any admitted record
+// failed to persist. Carries counts only, never record content.
+func closeError(saved, failed int, source string) error {
+	if failed == 0 {
+		return nil
+	}
+	return fmt.Errorf("repository writer: %d record(s) dropped to save failures (%d saved, source %q)",
+		failed, saved, source)
+}
+
+// Receipt is a writer's own account of what it retained. Persisted can exceed
+// Accepted: it also counts endpoints ingested from a captured API spec.
+type Receipt struct {
+	Accepted  int // records Write admitted
+	Persisted int // rows the repository confirmed
+	Refused   int // records turned away with ErrWriterClosed
+	Failed    int // save failures plus records abandoned by an over-budget drain
+	// DrainComplete: Close drained the queue within its budget, so every
+	// admitted record has an outcome. False while the writer is open.
+	DrainComplete bool
+	Closed        bool
+	Err           string // Close's error text when records were lost
+}
+
+// Receipt returns the writer's current account. It is final once Close has
+// returned; before that it is a running snapshot. Safe for concurrent use.
+func (w *RepositoryWriter) Receipt() Receipt {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	r := Receipt{
+		Accepted:      w.accepted,
+		Persisted:     w.count,
+		Refused:       w.refused,
+		Failed:        w.failed,
+		DrainComplete: w.drainComplete,
+		Closed:        w.closed,
+	}
+	if err := closeError(w.count, w.failed, w.source); w.closed && err != nil {
+		r.Err = err.Error()
+	}
+	return r
 }
 
 // Count returns the number of records saved so far.

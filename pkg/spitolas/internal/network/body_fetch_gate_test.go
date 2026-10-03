@@ -4,6 +4,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/vigolium/vigolium/pkg/modules/modkit/specutil"
 )
 
 // TestShouldFetchResponseBody locks in the body-fetch skip gate: HTML/JS/JSON/
@@ -41,10 +43,51 @@ func TestShouldFetchResponseBody(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldFetchResponseBody(tc.entry, tc.includeBody, tc.encodedLen); got != tc.want {
+			if got, _ := shouldFetchResponseBody(tc.entry, tc.includeBody, tc.encodedLen, 0); got != tc.want {
 				t.Errorf("shouldFetchResponseBody = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDynamicBodyCeiling: text/API bodies are fetched up to the ceiling, and a
+// skipped one says why, so a missing body is never read as an empty one.
+func TestDynamicBodyCeiling(t *testing.T) {
+	const mib = 1024 * 1024
+	json := &TrafficEntry{ContentType: "application/json", Request: RequestData{URL: "https://x/api/export"}, Response: &ResponseData{Status: 200}}
+	png := &TrafficEntry{ContentType: "image/png", Request: RequestData{URL: "https://x/logo.png"}, Response: &ResponseData{Status: 200}}
+
+	cases := []struct {
+		name        string
+		entry       *TrafficEntry
+		includeBody bool
+		encodedLen  float64
+		max         int64
+		want        bool
+		source      string
+	}{
+		{"json 1 MiB, default ceiling → fetch", json, true, 1 * mib, 0, true, ""},
+		{"json over the default ceiling → too-large", json, true, DefaultMaxDynamicBodyBytes + 1, 0, false, BodySourceTooLarge},
+		{"json 32 MiB, configured 64 MiB → fetch", json, false, 32 * mib, 64 * mib, true, ""},
+		{"json 2 MiB, configured 1 MiB → too-large", json, false, 2 * mib, 1 * mib, false, BodySourceTooLarge},
+		{"json 64 MiB, ceiling removed → fetch", json, false, 64 * mib, -1, true, ""},
+		{"unknown length → fetch", json, false, 0, 1 * mib, true, ""},
+		{"static over its own cap → too-large (unchanged decision)", png, true, maxStaticBodyFetchBytes + 1, 0, false, BodySourceTooLarge},
+		{"static discarded → skipped-static", png, false, 10, 0, false, BodySourceSkippedStatic},
+		{"no response → unavailable", &TrafficEntry{}, true, 0, 0, false, BodySourceUnavailable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, source := shouldFetchResponseBody(tc.entry, tc.includeBody, tc.encodedLen, tc.max)
+			if got != tc.want || source != tc.source {
+				t.Errorf("shouldFetchResponseBody = (%v, %q), want (%v, %q)", got, source, tc.want, tc.source)
+			}
+		})
+	}
+
+	if DefaultMaxDynamicBodyBytes <= specutil.MaxSpecBodySize {
+		t.Errorf("the default ceiling (%d) must stay above the spec-ingest window (%d) "+
+			"or a spec the writer would parse is skipped first", DefaultMaxDynamicBodyBytes, specutil.MaxSpecBodySize)
 	}
 }
 
@@ -106,7 +149,7 @@ func TestBodyGateSeesContentTypeFromHeaders(t *testing.T) {
 				t.Fatalf("computeHeaderFields did not resolve Content-Type: got %q, want %q",
 					entry.ContentType, tc.ct)
 			}
-			if got := shouldFetchResponseBody(entry, tc.includeBody, tc.encodedLen); got != tc.want {
+			if got, _ := shouldFetchResponseBody(entry, tc.includeBody, tc.encodedLen, 0); got != tc.want {
 				t.Errorf("shouldFetchResponseBody = %v, want %v (content-type %q, url %q)",
 					got, tc.want, tc.ct, tc.url)
 			}

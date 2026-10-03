@@ -3,9 +3,12 @@ package scratch
 import (
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,7 +132,10 @@ func TestProcessDirectoryNameIsNotJustThePID(t *testing.T) {
 // sweep is the only thing that ever removes them.
 func TestSweepDirRemovesAbandonedProcessDirectories(t *testing.T) {
 	dir := t.TempDir()
-	stale := mkdirAged(t, dir, "p4242-deadbeef", 48*time.Hour)
+	// A pid that has provably exited: the sweeper now asks whether the owner is
+	// alive, so a hardcoded number that happens to be in use on the test machine
+	// would be correctly spared and fail this assertion for the wrong reason.
+	stale := mkdirAged(t, dir, "p"+strconv.Itoa(deadPID(t))+"-deadbeef", 48*time.Hour)
 
 	removed, err := sweepDir(dir, DefaultMaxAge, farFuture(), nil)
 	require.NoError(t, err)
@@ -137,11 +143,12 @@ func TestSweepDirRemovesAbandonedProcessDirectories(t *testing.T) {
 	assert.NoDirExists(t, stale)
 }
 
-// mtime doubles as the liveness check: scratch belonging to a running scan is
-// being written to, so it must survive.
+// Age is the backstop for a directory with no lease and no live pid: young
+// scratch is still spared, which is what keeps a just-started run's working set
+// safe before its lease is visible to a concurrent sweeper.
 func TestSweepDirKeepsYoungScratch(t *testing.T) {
 	dir := t.TempDir()
-	live := mkdirAged(t, dir, "p4242-cafe0000", time.Minute)
+	live := mkdirAged(t, dir, "p"+strconv.Itoa(deadPID(t))+"-cafe0000", time.Minute)
 
 	removed, err := sweepDir(dir, DefaultMaxAge, farFuture(), nil)
 	require.NoError(t, err)
@@ -281,4 +288,155 @@ func TestIsHmapTempDir(t *testing.T) {
 	} {
 		assert.False(t, isHmapTempDir(name), name)
 	}
+}
+
+// --- WP6: liveness is a lease, not an age ----------------------------------
+
+// deadPID returns the pid of a process that has definitely exited: a short
+// re-exec of this test binary that runs no tests.
+//
+// A hardcoded number would be a latent flake — now that the sweeper asks
+// whether the owner is alive, a directory named for a pid that happens to be in
+// use on the machine running the test is correctly spared, and the assertion
+// fails for a reason that has nothing to do with the code.
+func deadPID(t *testing.T) int {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	require.NoError(t, cmd.Run())
+	pid := cmd.ProcessState.Pid()
+	require.Positive(t, pid)
+	return pid
+}
+
+// A leased directory is in use by a live process, whatever its mtime says.
+//
+// Holding the lease in-process is enough to test with: flock locks belong to
+// the open file description, so the sweeper's own second open of the file
+// conflicts with the lease this test holds.
+func TestSweepSkipsLeasedDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no flock on windows; collection there stays age-only")
+	}
+	dir := t.TempDir()
+	leased := mkdirAged(t, dir, "p"+strconv.Itoa(deadPID(t))+"-deadbeef", 48*time.Hour)
+
+	lease, err := acquireLease(leased)
+	require.NoError(t, err)
+	// The lease file itself is new, so backdate the directory again: creating an
+	// entry in a directory updates its mtime.
+	backdate(t, leased, 48*time.Hour)
+
+	removed, err := sweepDir(dir, DefaultMaxAge, farFuture(), nil)
+	require.NoError(t, err)
+	assert.Zero(t, removed, "a leased directory belongs to a live owner")
+	assert.DirExists(t, leased)
+
+	// Dropping the lease makes it collectable, which is the half that proves the
+	// skip above came from the lease and not from something else.
+	require.NoError(t, lease.Close())
+	backdate(t, leased, 48*time.Hour)
+
+	removed, err = sweepDir(dir, DefaultMaxAge, farFuture(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed)
+	assert.NoDirExists(t, leased)
+}
+
+// A directory from a version before the lease has only its pid to go on, and a
+// live pid is reason enough to leave it alone. This is the case the old
+// age-only sweep got wrong: a long scan's directory mtime stops advancing once
+// it has created its subdirectories, so DefaultMaxAge made a running scan's
+// working set a collection candidate.
+func TestSweepKeepsLivePIDLegacyDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no signal-0 liveness probe on windows")
+	}
+	dir := t.TempDir()
+	live := mkdirAged(t, dir, "p"+strconv.Itoa(os.Getpid())+"-feedface", 90*24*time.Hour)
+
+	removed, err := sweepDir(dir, DefaultMaxAge, farFuture(), nil)
+	require.NoError(t, err)
+	assert.Zero(t, removed)
+	assert.DirExists(t, live, "a running owner's scratch must survive any age")
+}
+
+// With no lease and a dead pid, the age check decides as it always did.
+func TestSweepRemovesDeadPIDLegacyDir(t *testing.T) {
+	dir := t.TempDir()
+	stale := mkdirAged(t, dir, "p"+strconv.Itoa(deadPID(t))+"-0badc0de", 48*time.Hour)
+
+	removed, err := sweepDir(dir, DefaultMaxAge, farFuture(), nil)
+	require.NoError(t, err)
+	assert.Equal(t, 1, removed)
+	assert.NoDirExists(t, stale)
+}
+
+// A name that is not a process directory carries no owner to ask about, so it
+// falls straight through to the age check — including a name whose digits could
+// be read as a pid by a looser matcher.
+func TestOwnerIsAliveOnlyAnswersForProcessDirectories(t *testing.T) {
+	selfPID := strconv.Itoa(os.Getpid())
+	cases := []struct {
+		name string
+		want bool
+	}{
+		{name: "p" + selfPID + "-deadbeef", want: runtime.GOOS != "windows"},
+		{name: "vigolium-diskset-" + selfPID, want: false},
+		{name: "p" + selfPID, want: false},
+		{name: "p" + selfPID + "-notahex!", want: false},
+		{name: "reqcache-" + selfPID, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "entry")
+			require.NoError(t, os.Mkdir(path, 0o700))
+			assert.Equal(t, tc.want, ownerIsAlive(path, tc.name))
+		})
+	}
+}
+
+// Acquire/Release/reprovision and the sweep all touch the same package state,
+// and the lease adds a file handle to it. Run under -race.
+func TestConcurrentAcquireReleaseSweep(t *testing.T) {
+	require.NoError(t, Acquire())
+	t.Cleanup(func() { Release() })
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 25 {
+				if f, err := CreateTemp("probe-*"); err == nil {
+					_ = f.Close()
+				}
+			}
+		}()
+	}
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 25 {
+				require.NoError(t, Acquire())
+				Release()
+			}
+		}()
+	}
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 25 {
+				_, _ = sweepDir(Root(), DefaultMaxAge, farFuture(), nil)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// The directory still belongs to this process and is still usable.
+	dir, err := processDir()
+	require.NoError(t, err)
+	assert.DirExists(t, dir)
 }

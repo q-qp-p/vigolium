@@ -198,11 +198,21 @@ func TestMergeAttachesPathsWithURIMetacharacters(t *testing.T) {
 // silently loses `mode=ro`. Reporting that beats either alternative — the
 // pre-existing behavior was a merge that succeeded having copied nothing.
 func TestMergeRejectsPathsNoSpellingCanAddress(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "scan?draft")
+	root := t.TempDir()
+	dir := filepath.Join(root, "scan?draft")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	src := writeGlobSQLiteFixture(t, dir, "a.example", 2)
+	// The fixture is BUILT in an addressable directory and then moved into the
+	// '?' one: NewDB now refuses such a path for the same reason attachSpec does,
+	// so writing the source in place is no longer possible. Moving it afterwards
+	// is also the realistic shape — the file exists, the operator renamed a
+	// folder, and only now does vigolium have to say something.
+	staged := writeGlobSQLiteFixture(t, root, "a.example", 2)
+	src := filepath.Join(dir, filepath.Base(staged))
+	if err := os.Rename(staged, src); err != nil {
+		t.Fatalf("stage fixture into %q: %v", dir, err)
+	}
 
 	ctx := context.Background()
 	dest, destDir, err := newTempDB("merge-uri-bad")

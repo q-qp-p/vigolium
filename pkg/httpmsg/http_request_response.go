@@ -431,8 +431,12 @@ func ParseRawRequest(raw string) (rr *HttpRequestResponse, err error) {
 	}
 	hostValue := hostLine[sep+2:]
 
-	// Build raw request with all headers
-	rr.request.raw = []byte(raw)
+	// Build raw request with all headers, with the body reconciled against the
+	// Content-Length the request declares. ParseRawRequest is the designated
+	// parser for UNTRUSTED external bytes (NewRequestResponseRaw is the trusted
+	// fast path for raws this process built), and external raw requests are
+	// exactly where the two disagree — see declared_body.go.
+	rr.request.raw = ReconcileDeclaredBody([]byte(raw))
 
 	// Populate Service from host and URL scheme.
 	// Raw HTTP request lines use origin-form (no scheme), so we infer the scheme

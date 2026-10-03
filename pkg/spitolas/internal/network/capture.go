@@ -86,6 +86,11 @@ type Capture struct {
 	silent                 bool         // Disable stderr output
 	includeResponseBody    bool         // Include response body in output
 	includeResponseHeaders bool         // Include response headers in output
+	// maxBodyBytes caps the encoded size of a dynamic (text/API) response body
+	// worth pulling over CDP; see SetMaxBodyBytes. 0 means DefaultMaxDynamicBodyBytes.
+	maxBodyBytes int64
+	// bodiesTooLarge counts responses whose body was skipped by that cap.
+	bodiesTooLarge int
 	// targetHost is the hostname used by the cross-origin stderr-log filter.
 	// It starts as the input URL's host but is re-pointed via SetTargetHost when
 	// the crawler adopts an off-host redirect target into scope, so the adopted
@@ -101,7 +106,10 @@ type Capture struct {
 type pendingEntry struct {
 	entry     *TrafficEntry
 	startTime time.Time
-	sessionID proto.TargetSessionID // Track which page this request came from
+	// responseAt is when the response headers arrived (Network.responseReceived)
+	// — the end of the response's latency, before any body is pulled over CDP.
+	responseAt time.Time
+	sessionID  proto.TargetSessionID // Track which page this request came from
 }
 
 // New creates a new traffic capture instance with the given Writer.
@@ -124,6 +132,16 @@ func New(writer Writer, noColor, silent, verbose, includeResponseBody, includeRe
 	}
 	c.SetTargetHost(targetHost)
 	return c
+}
+
+// SetMaxBodyBytes sets the ceiling on the encoded size of a dynamic response
+// body the capture pulls over CDP (n == 0 keeps DefaultMaxDynamicBodyBytes,
+// n < 0 removes the ceiling). Over it the body is skipped and the entry marked
+// BodySourceTooLarge. Call once before the crawl starts.
+func (c *Capture) SetMaxBodyBytes(n int64) {
+	c.mu.Lock()
+	c.maxBodyBytes = n
+	c.mu.Unlock()
 }
 
 // SetMaxParamValueVariants sets how many distinct query-value variants of one
@@ -412,6 +430,8 @@ func (c *Capture) onRequestWillBeSent(e *proto.NetworkRequestWillBeSent, session
 				Headers: convertHeaders(e.RedirectResponse.Headers),
 			}
 			prev.entry.DurationMs = elapsedMs(prev.startTime)
+			// CDP keeps no body for a redirect hop.
+			prev.entry.BodySource = BodySourceUnavailable
 			computeHTTPXFields(prev.entry)
 			if !c.includeResponseBody {
 				prev.entry.Response.Body = nil
@@ -474,6 +494,7 @@ func (c *Capture) onResponseReceived(e *proto.NetworkResponseReceived, sessionID
 		Status:  e.Response.Status,
 		Headers: headers,
 	}
+	pending.responseAt = time.Now()
 
 	zap.L().Debug("Network response received",
 		zap.Int("status", e.Response.Status),
@@ -543,6 +564,7 @@ func (c *Capture) onLoadingFinished(e *proto.NetworkLoadingFinished, sessionID p
 	delete(c.pending, e.RequestID)
 	includeBody := c.includeResponseBody
 	includeHeaders := c.includeResponseHeaders
+	maxBody := c.maxBodyBytes
 	c.mu.Unlock()
 
 	if pending.entry.Response != nil {
@@ -553,24 +575,39 @@ func (c *Capture) onLoadingFinished(e *proto.NetworkLoadingFinished, sessionID p
 		computeHeaderFields(pending.entry)
 
 		// Fetch the body only when it's worth it: HTML/JS/JSON/XML/API responses
-		// (always) or a retained, reasonably-sized static asset. Skipping a static
-		// body we'd discard also skips this response's page enumeration + CDP body
-		// transfer — the dominant per-response cost — instead of fetching every
-		// image/font/media body just to throw it away.
-		if !shouldFetchResponseBody(pending.entry, includeBody, e.EncodedDataLength) {
-			zap.L().Debug("Skipping body fetch for static/discarded response",
+		// under the dynamic ceiling, or a retained, reasonably-sized static asset.
+		// Skipping a static body we'd discard also skips this response's page
+		// enumeration + CDP body transfer — the dominant per-response cost —
+		// instead of fetching every image/font/media body just to throw it away.
+		var bodyFetch time.Duration
+		if fetch, skipped := shouldFetchResponseBody(pending.entry, includeBody, e.EncodedDataLength, maxBody); !fetch {
+			pending.entry.BodySource = skipped
+			if skipped == BodySourceTooLarge {
+				// Keep the size so a missing body reads as "not kept", not "empty".
+				pending.entry.ContentLength = int(e.EncodedDataLength)
+				c.mu.Lock()
+				c.bodiesTooLarge++
+				c.mu.Unlock()
+			}
+			zap.L().Debug("Skipping body fetch",
 				zap.String("url", pending.entry.Request.URL),
-				zap.String("content_type", pending.entry.ContentType))
+				zap.String("content_type", pending.entry.ContentType),
+				zap.String("reason", skipped),
+				zap.Float64("encoded_bytes", e.EncodedDataLength))
 		} else if !c.isSessionValid(pending.sessionID) {
 			// Validate session BEFORE attempting to fetch response body.
+			pending.entry.BodySource = BodySourceUnavailable
 			zap.L().Debug("Skipping body fetch for invalid session",
 				zap.String("sessionID", string(pending.sessionID)),
 				zap.String("requestID", string(e.RequestID)),
 				zap.String("url", pending.entry.Request.URL),
 				zap.Duration("age", time.Since(pending.startTime)))
 		} else {
+			fetchStart := time.Now()
 			body, err := c.fetchResponseBody(pending.sessionID, e.RequestID)
+			bodyFetch = time.Since(fetchStart)
 			if err != nil {
+				pending.entry.BodySource = BodySourceFailed
 				// Categorize error types for better debugging
 				if errors.Is(err, context.DeadlineExceeded) {
 					zap.L().Warn("Response body fetch timed out",
@@ -586,16 +623,21 @@ func (c *Capture) onLoadingFinished(e *proto.NetworkLoadingFinished, sessionID p
 				}
 			} else {
 				pending.entry.Response.Body = body
+				pending.entry.BodySource = BodySourceCDP
 			}
 		}
 
-		pending.entry.DurationMs = elapsedMs(pending.startTime)
+		finalizeTimings(pending, bodyFetch)
 
 		// Compute httpx fields BEFORE potentially discarding data
 		computeHTTPXFields(pending.entry)
 
 		// Now apply flags to control what gets saved to parquet
 		if !includeBody {
+			if pending.entry.BodySource == BodySourceCDP {
+				// Fetched for the metrics above, not kept.
+				pending.entry.BodySource = BodySourceOmittedPolicy
+			}
 			pending.entry.Response.Body = nil
 		}
 		if !includeHeaders {
@@ -742,24 +784,57 @@ func hasStaticExtension(rawURL string) bool {
 	return staticExtensions[strings.ToLower(rawURL[dot:])]
 }
 
-// shouldFetchResponseBody decides whether to pull a response body over CDP.
-// Fetching a body we won't retain AND can't derive useful text metrics from
-// (binary media/fonts/static assets) is pure overhead — and it's the dominant
-// per-response cost because the fetch also enumerates browser pages. HTML/JS/
-// JSON/XML/API responses are always fetched (they drive discovery); static
-// bodies are fetched only when retained (includeBody) and under a size cap.
-func shouldFetchResponseBody(entry *TrafficEntry, includeBody bool, encodedLen float64) bool {
+// DefaultMaxDynamicBodyBytes is the default ceiling on a dynamic (text/API)
+// response body pulled over CDP. Kept above specutil.MaxSpecBodySize so an API
+// spec the writer would ingest is never skipped by the capture first.
+const DefaultMaxDynamicBodyBytes = 16 * 1024 * 1024
+
+// shouldFetchResponseBody decides whether to pull a response body over CDP and,
+// when not, which BodySource the entry carries instead. Fetching a body we
+// won't retain AND can't derive useful text metrics from (binary media/fonts/
+// static assets) is pure overhead — and it's the dominant per-response cost
+// because the fetch also enumerates browser pages. HTML/JS/JSON/XML/API
+// responses are fetched (they drive discovery) up to maxDynamic encoded bytes
+// (0 = DefaultMaxDynamicBodyBytes, < 0 = no ceiling); static bodies only when
+// retained (includeBody) and under maxStaticBodyFetchBytes.
+func shouldFetchResponseBody(entry *TrafficEntry, includeBody bool, encodedLen float64, maxDynamic int64) (bool, string) {
 	if entry == nil || entry.Response == nil {
-		return false
+		return false, BodySourceUnavailable
 	}
 	if !isBinaryStaticContentType(entry.ContentType) && !hasStaticExtension(entry.Request.URL) {
-		return true // prioritize HTML/JS/JSON/XML/API — always fetch
+		if maxDynamic == 0 {
+			maxDynamic = DefaultMaxDynamicBodyBytes
+		}
+		if maxDynamic > 0 && encodedLen > float64(maxDynamic) {
+			return false, BodySourceTooLarge
+		}
+		return true, ""
 	}
 	// Static/binary asset.
 	if !includeBody {
-		return false // body would be discarded; skip the fetch (and its page scan)
+		return false, BodySourceSkippedStatic // body would be discarded; skip the fetch (and its page scan)
 	}
-	return encodedLen <= 0 || encodedLen <= maxStaticBodyFetchBytes
+	if encodedLen > maxStaticBodyFetchBytes {
+		return false, BodySourceTooLarge
+	}
+	return true, ""
+}
+
+// finalizeTimings sets an entry's timings once its body has been dealt with.
+// DurationMs is request → response headers, the response's own latency; the CDP
+// body retrieval that follows is the crawler's overhead and goes to BodyFetchMs
+// instead of inflating the latency. An entry whose response event was never
+// seen falls back to the time until loading finished, minus the body fetch.
+func finalizeTimings(p *pendingEntry, bodyFetch time.Duration) {
+	switch {
+	case p.startTime.IsZero():
+		p.entry.DurationMs = 0 // never measured
+	case !p.responseAt.IsZero():
+		p.entry.DurationMs = httpmsg.MeasuredMillis(p.responseAt.Sub(p.startTime))
+	default:
+		p.entry.DurationMs = httpmsg.MeasuredMillis(time.Since(p.startTime) - bodyFetch)
+	}
+	p.entry.BodyFetchMs = httpmsg.MeasuredMillis(bodyFetch)
 }
 
 // staticExtensions lists URL path extensions for static resources suppressed from stderr.
@@ -1245,8 +1320,15 @@ func (c *Capture) Close() error {
 	writer := c.writer
 	writtenCount := c.writtenCount
 	duplicateCount := c.duplicateCount
+	tooLarge := c.bodiesTooLarge
 	c.writer = nil
 	c.mu.Unlock()
+
+	if tooLarge > 0 {
+		zap.L().Info("Response bodies over the capture ceiling were recorded without their body",
+			zap.Int("responses", tooLarge),
+			zap.String("setting", "spidering.max_capture_body_bytes"))
+	}
 
 	// Log statistics BEFORE closing writer (only if duplicates exist)
 	if duplicateCount > 0 {

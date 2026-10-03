@@ -27,9 +27,36 @@ import (
 // the existing 'deparos' source literals in this file.
 const secretDetectModuleID = "secret-detect"
 
+// Every record-dedup pass below partitions on (hostname, scheme, port, …) rather
+// than hostname alone. A hostname is not an origin: http://h/x and https://h/x,
+// or https://h/x and https://h:8443/x, are different services that routinely
+// return byte-identical responses (a shared error page, a redirect stub, an
+// identical 401). Keying on hostname collapsed them into one survivor and threw
+// away the other origin's evidence entirely. Both columns are NOT NULL
+// (schema_ddl.go), so they are safe to key on without a COALESCE.
+
+// recordUnreferencedSQL is the predicate that holds for an http_record no
+// finding and no analysis artifact points at. The automatic discovery-cleanup
+// passes delete only records satisfying it, so pruning noise can never remove an
+// exchange that some finding cites as its evidence (or that JSTangle and friends
+// derived an artifact from). Both sub-selects are index-backed —
+// idx_finding_records_record_uuid and the analysis_artifacts record index — and
+// the form is dialect-agnostic (SQLite and PostgreSQL).
+const recordUnreferencedSQL = `NOT EXISTS (
+		SELECT 1 FROM finding_records fr WHERE fr.record_uuid = http_records.uuid
+	)
+	AND NOT EXISTS (
+		SELECT 1 FROM analysis_artifacts aa WHERE aa.http_record_uuid = http_records.uuid
+	)`
+
 // deleteRecordsByUUIDsTx deletes the http_records identified by uuids and their
 // finding_records junction rows inside tx, chunking the IN lists so a large set
-// never exceeds the bound-parameter limit. Shared by the record-dedup passes.
+// never exceeds the bound-parameter limit.
+//
+// This is the DESTRUCTIVE variant: it removes a record even when a finding cites
+// it, severing that evidence link. It is reserved for the operator-driven traffic
+// delete (query.go), where removing evidence is the point. The automatic
+// discovery-cleanup passes use deleteUnreferencedRecords instead.
 func deleteRecordsByUUIDsTx(ctx context.Context, tx bun.Tx, uuids []string) error {
 	for chunk := range slices.Chunk(uuids, SQLChunkSize) {
 		if _, err := tx.NewRaw("DELETE FROM finding_records WHERE record_uuid IN (?)", bun.List(chunk)).Exec(ctx); err != nil {
@@ -104,7 +131,7 @@ func (r *Repository) DeduplicateRecordsBySource(ctx context.Context, projectUUID
 	dupQuery := `
 		SELECT uuid FROM (
 			SELECT uuid, ROW_NUMBER() OVER (
-				PARTITION BY hostname, method, status_code, response_content_length, response_hash
+				PARTITION BY hostname, scheme, port, method, status_code, response_content_length, response_hash
 				ORDER BY LENGTH(path) ASC, created_at ASC
 			) AS rn
 			FROM http_records
@@ -123,15 +150,13 @@ func (r *Repository) DeduplicateRecordsBySource(ctx context.Context, projectUUID
 		return 0, nil
 	}
 
-	// Delete junction rows and records in a transaction (chunked IN lists).
-	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		return deleteRecordsByUUIDsTx(ctx, tx, uuids)
-	})
+	// Records a finding or artifact references are kept (see deleteUnreferencedRecords).
+	res, err := r.deleteUnreferencedRecords(ctx, uuids)
 	if err != nil {
 		return 0, err
 	}
 
-	return int64(len(uuids)), nil
+	return res.Deleted, nil
 }
 
 // DeduplicateDeparosRecords removes duplicate deparos HTTP records.
@@ -149,7 +174,7 @@ func (r *Repository) DeduplicateDeparosRecords(ctx context.Context, projectUUID 
 // otherwise-identical family into singletons (the very case this pass exists to collapse) —
 // word count + content type + status + path prefix is the stable shape signal.
 // Only groups with 3+ members are collapsed. The shortest path per group is kept.
-func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectUUID string) (int64, map[int]int64, error) {
+func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectUUID string) (RecordCleanupResult, error) {
 	projectUUID = defaultProjectUUID(projectUUID)
 
 	// Path prefix extraction: first 2 segments (SQLite/PG compatible).
@@ -163,12 +188,12 @@ func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectU
 		SELECT uuid FROM (
 			SELECT uuid,
 				ROW_NUMBER() OVER (
-					PARTITION BY hostname, method, status_code,
+					PARTITION BY hostname, scheme, port, method, status_code,
 						response_words, response_content_type, %s
 					ORDER BY LENGTH(path) ASC, created_at ASC
 				) AS rn,
 				COUNT(*) OVER (
-					PARTITION BY hostname, method, status_code,
+					PARTITION BY hostname, scheme, port, method, status_code,
 						response_words, response_content_type, %s
 				) AS group_size
 			FROM http_records
@@ -179,17 +204,13 @@ func (r *Repository) DeduplicateSoftDeparosRecords(ctx context.Context, projectU
 
 	var uuids []string
 	if err := r.db.NewRaw(dupQuery, projectUUID).Scan(ctx, &uuids); err != nil {
-		return 0, nil, fmt.Errorf("failed to identify soft-duplicate deparos records: %w", err)
+		return RecordCleanupResult{}, fmt.Errorf("failed to identify soft-duplicate deparos records: %w", err)
 	}
 
 	if len(uuids) == 0 {
-		return 0, nil, nil
+		return RecordCleanupResult{}, nil
 	}
-	statusCodes, err := r.deleteRecordsWithStatusBreakdown(ctx, uuids)
-	if err != nil {
-		return 0, nil, err
-	}
-	return int64(len(uuids)), statusCodes, nil
+	return r.deleteUnreferencedRecords(ctx, uuids)
 }
 
 // DeparosStatusPolicy controls how discovery client-error (4xx) records are
@@ -241,7 +262,7 @@ func dedupeInts(in []int) []int {
 // 4xx and losing the signal.
 //
 // Returns the number of deleted records and a status-code breakdown of them.
-func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID string, policy DeparosStatusPolicy) (int64, map[int]int64, error) {
+func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID string, policy DeparosStatusPolicy) (RecordCleanupResult, error) {
 	projectUUID = defaultProjectUUID(projectUUID)
 
 	keepOne := dedupeInts(policy.KeepOnePerHost)
@@ -280,7 +301,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 	}
 	var dropUUIDs []string
 	if err := r.db.NewRaw(dropQuery, dropArgs...).Scan(ctx, &dropUUIDs); err != nil {
-		return 0, nil, fmt.Errorf("failed to identify client-error deparos records: %w", err)
+		return RecordCleanupResult{}, fmt.Errorf("failed to identify client-error deparos records: %w", err)
 	}
 	for _, u := range dropUUIDs {
 		uuidSet[u] = struct{}{}
@@ -291,7 +312,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 		collapseQuery := `
 			SELECT uuid FROM (
 				SELECT uuid, ROW_NUMBER() OVER (
-					PARTITION BY hostname, status_code
+					PARTITION BY hostname, scheme, port, status_code
 					ORDER BY LENGTH(path) ASC, created_at ASC
 				) AS rn
 				FROM http_records
@@ -300,7 +321,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 			) sub WHERE rn > 1`
 		var collapseUUIDs []string
 		if err := r.db.NewRaw(collapseQuery, projectUUID, bun.List(keepOne)).Scan(ctx, &collapseUUIDs); err != nil {
-			return 0, nil, fmt.Errorf("failed to identify collapsible deparos records: %w", err)
+			return RecordCleanupResult{}, fmt.Errorf("failed to identify collapsible deparos records: %w", err)
 		}
 		for _, u := range collapseUUIDs {
 			uuidSet[u] = struct{}{}
@@ -314,7 +335,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 		pathDupQuery := `
 			SELECT uuid FROM (
 				SELECT uuid, ROW_NUMBER() OVER (
-					PARTITION BY hostname, status_code, path
+					PARTITION BY hostname, scheme, port, status_code, path
 					ORDER BY created_at ASC
 				) AS rn
 				FROM http_records
@@ -323,7 +344,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 			) sub WHERE rn > 1`
 		var pathDupUUIDs []string
 		if err := r.db.NewRaw(pathDupQuery, projectUUID, bun.List(keepPath)).Scan(ctx, &pathDupUUIDs); err != nil {
-			return 0, nil, fmt.Errorf("failed to identify duplicate-path deparos records: %w", err)
+			return RecordCleanupResult{}, fmt.Errorf("failed to identify duplicate-path deparos records: %w", err)
 		}
 		for _, u := range pathDupUUIDs {
 			uuidSet[u] = struct{}{}
@@ -336,7 +357,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 			capQuery := `
 				SELECT uuid FROM (
 					SELECT uuid, DENSE_RANK() OVER (
-						PARTITION BY hostname, status_code
+						PARTITION BY hostname, scheme, port, status_code
 						ORDER BY LENGTH(path) ASC, path ASC
 					) AS pr
 					FROM http_records
@@ -345,7 +366,7 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 				) sub WHERE pr > ?`
 			var capUUIDs []string
 			if err := r.db.NewRaw(capQuery, projectUUID, bun.List(keepPath), policy.PerPathCap).Scan(ctx, &capUUIDs); err != nil {
-				return 0, nil, fmt.Errorf("failed to identify over-cap deparos records: %w", err)
+				return RecordCleanupResult{}, fmt.Errorf("failed to identify over-cap deparos records: %w", err)
 			}
 			for _, u := range capUUIDs {
 				uuidSet[u] = struct{}{}
@@ -354,17 +375,13 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 	}
 
 	if len(uuidSet) == 0 {
-		return 0, nil, nil
+		return RecordCleanupResult{}, nil
 	}
 	uuids := make([]string, 0, len(uuidSet))
 	for u := range uuidSet {
 		uuids = append(uuids, u)
 	}
-	statusCodes, err := r.deleteRecordsWithStatusBreakdown(ctx, uuids)
-	if err != nil {
-		return 0, nil, err
-	}
-	return int64(len(uuids)), statusCodes, nil
+	return r.deleteUnreferencedRecords(ctx, uuids)
 }
 
 // DeduplicateDeparosByNormHash collapses deparos records whose NORMALIZED
@@ -380,13 +397,13 @@ func (r *Repository) ApplyDeparosStatusPolicy(ctx context.Context, projectUUID s
 // response_norm_hash); the shortest path per group survives. Records with no
 // normalized hash (empty bodies) are left to exact-hash dedup. Returns the number
 // of deleted records and a status-code breakdown.
-func (r *Repository) DeduplicateDeparosByNormHash(ctx context.Context, projectUUID string) (int64, map[int]int64, error) {
+func (r *Repository) DeduplicateDeparosByNormHash(ctx context.Context, projectUUID string) (RecordCleanupResult, error) {
 	projectUUID = defaultProjectUUID(projectUUID)
 
 	dupQuery := `
 		SELECT uuid FROM (
 			SELECT uuid, ROW_NUMBER() OVER (
-				PARTITION BY hostname, method, status_code, response_content_type, response_norm_hash
+				PARTITION BY hostname, scheme, port, method, status_code, response_content_type, response_norm_hash
 				ORDER BY LENGTH(path) ASC, created_at ASC
 			) AS rn
 			FROM http_records
@@ -399,50 +416,83 @@ func (r *Repository) DeduplicateDeparosByNormHash(ctx context.Context, projectUU
 
 	var uuids []string
 	if err := r.db.NewRaw(dupQuery, projectUUID).Scan(ctx, &uuids); err != nil {
-		return 0, nil, fmt.Errorf("failed to identify reflected-URL-duplicate deparos records: %w", err)
+		return RecordCleanupResult{}, fmt.Errorf("failed to identify reflected-URL-duplicate deparos records: %w", err)
 	}
 	if len(uuids) == 0 {
-		return 0, nil, nil
+		return RecordCleanupResult{}, nil
 	}
-	statusCodes, err := r.deleteRecordsWithStatusBreakdown(ctx, uuids)
-	if err != nil {
-		return 0, nil, err
-	}
-	return int64(len(uuids)), statusCodes, nil
+	return r.deleteUnreferencedRecords(ctx, uuids)
 }
 
-// deleteRecordsWithStatusBreakdown counts the to-be-deleted records by status
-// code (for operator feedback), then deletes them and their finding_records
-// junction rows in one transaction. Shared by the deparos record-dedup passes.
-func (r *Repository) deleteRecordsWithStatusBreakdown(ctx context.Context, uuids []string) (map[int]int64, error) {
+// RecordCleanupResult reports what one discovery record-cleanup pass removed and
+// what it deliberately spared.
+type RecordCleanupResult struct {
+	// Deleted is the number of http_records rows actually removed.
+	Deleted int64
+	// KeptReferenced counts records the pass selected as redundant but left in
+	// place because a finding or an analysis artifact still references them.
+	KeptReferenced int64
+	// ByStatus breaks Deleted down by HTTP status code, for operator feedback.
+	ByStatus map[int]int64
+}
+
+// deleteUnreferencedRecords deletes the subset of uuids that no finding and no
+// analysis artifact references, counting them by status code for operator
+// feedback. Records that ARE referenced are left in place with their links
+// intact — a dedup pass may consider an exchange redundant traffic, but a finding
+// that cites it still needs it for replay, export, and `finding --with-records`.
+//
+// Counting and deleting share one transaction and the same predicate, so the
+// breakdown always describes exactly what was removed.
+//
+// Shared by the discovery record-dedup passes. For the destructive operator-driven
+// delete see deleteRecordsByUUIDsTx.
+func (r *Repository) deleteUnreferencedRecords(ctx context.Context, uuids []string) (RecordCleanupResult, error) {
 	if len(uuids) == 0 {
-		return nil, nil
+		return RecordCleanupResult{}, nil
 	}
 	type statusCount struct {
 		StatusCode int   `bun:"status_code"`
 		Count      int64 `bun:"cnt"`
 	}
-	statusCodes := make(map[int]int64)
-	for chunk := range slices.Chunk(uuids, SQLChunkSize) {
-		var counts []statusCount
-		if err := r.db.NewRaw(
-			"SELECT status_code, COUNT(*) AS cnt FROM http_records WHERE uuid IN (?) GROUP BY status_code",
-			bun.List(chunk),
-		).Scan(ctx, &counts); err != nil {
-			zap.L().Debug("Failed to collect status code stats for dedup", zap.Error(err))
-		}
-		for _, c := range counts {
-			statusCodes[c.StatusCode] += c.Count
-		}
-	}
-
+	var (
+		deleted     int64
+		statusCodes = make(map[int]int64)
+	)
 	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
-		return deleteRecordsByUUIDsTx(ctx, tx, uuids)
+		for chunk := range slices.Chunk(uuids, SQLChunkSize) {
+			var counts []statusCount
+			if err := tx.NewRaw(
+				"SELECT status_code, COUNT(*) AS cnt FROM http_records WHERE uuid IN (?) AND "+
+					recordUnreferencedSQL+" GROUP BY status_code",
+				bun.List(chunk),
+			).Scan(ctx, &counts); err != nil {
+				zap.L().Debug("Failed to collect status code stats for dedup", zap.Error(err))
+			}
+			res, err := tx.NewRaw(
+				"DELETE FROM http_records WHERE uuid IN (?) AND "+recordUnreferencedSQL,
+				bun.List(chunk),
+			).Exec(ctx)
+			if err != nil {
+				return fmt.Errorf("failed to delete records: %w", err)
+			}
+			if n, err := res.RowsAffected(); err == nil {
+				deleted += n
+			}
+			for _, c := range counts {
+				statusCodes[c.StatusCode] += c.Count
+			}
+		}
+		return nil
 	})
 	if err != nil {
-		return nil, err
+		return RecordCleanupResult{}, err
 	}
-	return statusCodes, nil
+	return RecordCleanupResult{
+		Deleted:        deleted,
+		KeptReferenced: int64(len(uuids)) - deleted,
+		ByStatus:       statusCodes,
+	}, nil
 }
 
 // findingHostnameFilter builds an optional "AND hostname IN (?)" SQL fragment and

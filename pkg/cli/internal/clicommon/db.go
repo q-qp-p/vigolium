@@ -87,10 +87,15 @@ func GetDB(configPath, dbPath string) (*database.DB, error) {
 		return nil, err
 	}
 
-	settings, err := config.LoadSettings(configPath)
+	// LoadSettings, not config.LoadSettings: a broken --config decides which
+	// DATABASE this opens, so falling back to defaults here silently pointed the
+	// command at ~/.vigolium/database-vgnm.sqlite — creating it if absent — while
+	// the operator believed they were working in the store their config names.
+	// A discovered-but-unreadable config still degrades to defaults, with a
+	// warning; that is the helper's job, not this function's.
+	settings, err := LoadSettings(configPath)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return nil, err
 	}
 
 	// If database is not explicitly enabled, default to SQLite
@@ -156,6 +161,7 @@ func GetDB(configPath, dbPath string) (*database.DB, error) {
 	}
 
 	dbConn = db
+	openedDBDriver = settings.Database.Driver
 	openedDBPath = config.ExpandPath(settings.Database.SQLite.Path)
 	if settings.Database.Driver != "sqlite" {
 		openedDBPath = settings.Database.Driver
@@ -195,14 +201,28 @@ func checkSourceExists() error {
 // trusting that its pin survived a subprocess chain.
 var openedDBPath string
 
+// openedDBDriver records which driver backed that open, because OpenedDBPath
+// alone cannot be told apart: for PostgreSQL it returns the literal "postgres",
+// which is also a perfectly legal relative filename. Anything deciding whether
+// the opened store can be named on a command line — a `--db` in a follow-up
+// query — has to ask the driver, not pattern-match the path.
+var openedDBDriver string
+
 // OpenedDBPath returns the resolved path of the database currently open, or ""
 // before any open. For a non-SQLite driver it returns the driver name, since
 // there is no single file to name.
 func OpenedDBPath() string { return openedDBPath }
 
+// OpenedDBDriver returns the driver that backed the current open ("sqlite",
+// "postgres", …), or "" before any open.
+func OpenedDBDriver() string { return openedDBDriver }
+
 // SetOpenedDBPath overrides the recorded path. For tests that exercise what is
 // reported about a read without opening a database to produce it.
 func SetOpenedDBPath(path string) { openedDBPath = path }
+
+// SetOpenedDBDriver overrides the recorded driver, for the same reason.
+func SetOpenedDBDriver(driver string) { openedDBDriver = driver }
 
 // CloseDatabaseOnExit closes the cached connection if open. Safe to defer.
 func CloseDatabaseOnExit() {

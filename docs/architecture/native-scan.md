@@ -886,8 +886,8 @@ type RecordWriter struct {
 |------|---------------|
 | `all` | No restriction |
 | `strict` | Exact hostname match |
-| `balanced` | eTLD+1 must match (e.g., `*.example.com`) |
-| `relaxed` (default) | Host contains target keyword |
+| `balanced` (default) | eTLD+1 must match (e.g., `*.example.com`) |
+| `relaxed` | Host contains target keyword |
 
 ### Rate Limiting — `pkg/core/ratelimit/host_limiter.go`
 

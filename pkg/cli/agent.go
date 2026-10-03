@@ -76,10 +76,9 @@ Docs: https://docs.vigolium.com`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		defer syncLogger()
 
-		settings, err := config.LoadSettings(globalConfig)
+		settings, err := clicommon.LoadSettings(globalConfig)
 		if err != nil {
-			zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-			settings = config.DefaultSettings()
+			return err
 		}
 
 		// Handle --list-agents
@@ -167,10 +166,9 @@ func runAgentQuery(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("either a prompt (argument, --prompt/-p, --stdin) or a template (--prompt-template, --prompt-file) is required")
 	}
 
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// Per-run olium overrides — only applied when the operator passed an

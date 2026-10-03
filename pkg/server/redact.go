@@ -4,49 +4,19 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+
+	"github.com/vigolium/vigolium/internal/redact"
 )
 
-// redactedPlaceholder is the literal substituted for a sensitive value in
-// logs. Distinct from "***" so an operator can grep for the exact string
-// when debugging whether redaction fired.
-const redactedPlaceholder = "<redacted>"
+// redactedPlaceholder, sensitiveJSONFields and sensitiveHeaderNames come from
+// the shared internal/redact table, which the browser crawl's artifact
+// redaction also reads — one table, two consumers.
+const redactedPlaceholder = redact.Placeholder
 
-// sensitiveJSONFields is the set of JSON object keys whose value must be
-// redacted before a request body lands in any operator-visible log. Keys
-// are compared case-insensitively.
-//
-// Keep this set in sync with:
-//   - the BYOK fields on AgentAuditRequest / AgentAutopilotRequest /
-//     AgentSwarmRequest / AgentAuditDriverRequest / AgenticScanRequest
-//   - the cred fields on OliumConfig (agent.olium.*) since the same body
-//     can be sent to the config-write endpoint
-var sensitiveJSONFields = map[string]struct{}{
-	"api_key":            {},
-	"oauth_token":        {},
-	"oauth_cred_file":    {},
-	"oauth_cred_json":    {},
-	"llm_api_key":        {},
-	"password":           {},
-	"secret":             {},
-	"anthropic_api_key":  {},
-	"openai_api_key":     {},
-	"claude_oauth_token": {},
-}
-
-// sensitiveHeaderNames is the set of request/response header names whose
-// value must be redacted before logging. Compared case-insensitively.
-//
-// Authorization is the obvious one but BYOK proxy deployments often pipe
-// keys through one of the X-* shapes too, so we mask all of them.
-var sensitiveHeaderNames = map[string]struct{}{
-	"authorization":       {},
-	"cookie":              {},
-	"set-cookie":          {},
-	"x-api-key":           {},
-	"x-anthropic-key":     {},
-	"x-openai-key":        {},
-	"proxy-authorization": {},
-}
+var (
+	sensitiveJSONFields  = redact.JSONFields
+	sensitiveHeaderNames = redact.HeaderNames
+)
 
 // redactJSONBody parses body as JSON, scrubs values for any key in
 // sensitiveJSONFields (recursively, including inside arrays and nested

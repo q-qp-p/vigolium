@@ -45,6 +45,10 @@ func crawlIndex(t *testing.T, server *testutil.TestServer) {
 	cfg.Silent = true
 	cfg.MaxStates = 1
 	cfg.MaxDuration = 20 * time.Second
+	// The fixtures put their frames far below the fold so that only priming
+	// can load them; auto-scroll would bring them into view and let the browser
+	// load them itself, which would make every assertion here vacuous.
+	cfg.AutoScroll = false
 
 	c, err := New(cfg)
 	if err != nil {

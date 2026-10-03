@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/storage"
 )
 
@@ -46,9 +47,9 @@ func openStorageClient() (*storage.Client, string, error) {
 // storage subcommands (via openStorageClient) and where storage is mandatory
 // (e.g. the user passed a gs:// URL).
 func requireStorageClient() (*storage.Client, error) {
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		settings = config.DefaultSettings()
+		return nil, err
 	}
 	if !settings.Storage.IsEnabled() {
 		return nil, fmt.Errorf("cloud storage is not enabled; enable with `vigolium config set storage.enabled true` "+

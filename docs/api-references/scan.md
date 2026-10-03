@@ -397,6 +397,25 @@ curl -s 'http://localhost:9002/api/scans?limit=10&offset=0' \
       "uuid": "scan-abc123",
       "name": "api-scan",
       "status": "completed",
+      "completeness": "partial",
+      "stop_reason": "scan_budget",
+      "phase_outcomes": [
+        {
+          "phase": "discovery",
+          "state": "partial",
+          "reasons": ["targets_failed"],
+          "limits": ["target_budget"],
+          "errors": 2,
+          "message": "dial tcp: no such host",
+          "duration_ms": 41233
+        },
+        {
+          "phase": "known-issue-scan",
+          "state": "skipped",
+          "reasons": ["scan_budget"],
+          "duration_ms": 0
+        }
+      ],
       "scan_source": "api",
       "scan_mode": "incremental",
       "source_type": "local",
@@ -414,6 +433,54 @@ curl -s 'http://localhost:9002/api/scans?limit=10&offset=0' \
   "has_more": false
 }
 ```
+
+#### Scan completeness
+
+`status` says whether the scan process reached its end. `completeness` says
+whether the run actually covered the input it was given. They are independent,
+and both are needed: a scan can reach its end having scanned half its records.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `completeness` | string | `complete`, `partial`, or **absent** — absent means *unknown*, which is what a row written by an older binary (or by a caller with no outcome data) honestly is. Never read an absent value as `complete`. |
+| `stop_reason` | string | The single most useful explanation for a partial run: `scan_budget`, `cancelled`, or the first reason the first incomplete phase recorded. Absent on a complete run. |
+| `phase_outcomes` | array | One object per phase that ran, plus one per planned phase that was never launched. |
+
+Each phase outcome carries:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `phase` | string | Canonical phase id, the same vocabulary `--only`/`--skip` use. |
+| `state` | string | `completed`, `partial`, `failed`, or `skipped`. |
+| `reasons` | array | Why coverage was lost. Sorted and deduplicated. |
+| `limits` | array | Configured bounds that were reached. A limit is **designed behaviour** and never downgrades a phase — a per-target time box firing is the scan working as asked. |
+| `errors` | int | How many failures the phase reported. |
+| `message` | string | The first error's text, truncated to 512 bytes. |
+| `unprocessed` | int | Work items a worker dequeued and deliberately did not acknowledge, so a later run re-serves them. |
+| `duration_ms` | int | Wall-clock time in the phase. |
+| `persistence` | object | What became of the writes the phase's writers accepted: `accepted`, `committed`, `failed`, `unknown` (still in flight when the close deadline passed), `timed_out`. |
+
+Reason and limit codes are a compatibility surface: codes are **added, never
+renamed**. The current set is `phase_deadline`, `scan_budget`, `cancelled`,
+`error`, `no_modules`, `drain_stalled`, `workers_abandoned`,
+`deferred_flush_skipped`, `producer_abandoned`, `targets_failed`,
+`targets_skipped`, `persistence_incomplete`, `round_error`,
+`checkpoint_failed`, `input_incomplete`, `auth_unavailable`, `login_budget`,
+and the limit `target_budget`.
+
+`auth_unavailable` means configured authentication never reached the scan, so
+the assessment probed an authenticated application anonymously; it always
+appears alongside the specific cause when there is one (`login_budget` for the
+2-minute total login budget, else `cancelled` or `scan_budget`). A wall of 401s
+on such a scan is attributable rather than a finding about the application.
+
+Record delivery is at-least-once: a curtailed phase leaves its durable cursor
+*behind* the records it did not finish, so a `scan-on-receive` or `--scan-uuid`
+successor re-serves them rather than skipping them. `unprocessed` says how many
+that was; `checkpoint_failed` means the cursor could not be written at all and
+the whole round will be re-served. `completeness` still matters beyond
+reporting — a partial predecessor covered less than its target list, so it is not
+a trustworthy baseline for "everything up to here was scanned".
 
 ---
 

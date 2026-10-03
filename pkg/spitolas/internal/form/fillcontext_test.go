@@ -145,9 +145,10 @@ func TestExampleValuePrefersDefaultThenDatalist(t *testing.T) {
 }
 
 // TestResponseAwareValueTargetDerived verifies that, WITH a FillContext, an email
-// field is filled with a target-derived address and reused consistently, while a
-// username is derived from the domain. Without a FillContext the original fixed
-// values are preserved.
+// field is filled with the crawl's address at the identity domain — never the
+// target's own domain — and reused consistently, while a username is derived
+// from the domain. Without a FillContext the original fixed values are
+// preserved.
 func TestResponseAwareValueTargetDerived(t *testing.T) {
 	h := newTestHandler(config.FormFillNormal)
 
@@ -156,11 +157,11 @@ func TestResponseAwareValueTargetDerived(t *testing.T) {
 		t.Errorf("without FillContext email = %q, want FixedEmail %q", got, FixedEmail)
 	}
 
-	// With FillContext → target-derived + consistent reuse.
+	// With FillContext → identity-domain address + consistent reuse.
 	h.SetFillContext(NewFillContext(mustURL(t, "https://acme.com")))
 	email := h.getValueForInput(detectedInput(action.InputTypeEmail, "email"))
-	if email != "vigolium-crawl@acme.com" {
-		t.Errorf("email = %q, want vigolium-crawl@acme.com", email)
+	if email != "vigolium-crawl@example.com" {
+		t.Errorf("email = %q, want vigolium-crawl@example.com (never the target's domain)", email)
 	}
 	// A second, differently-named email field reuses the same value.
 	if again := h.getValueForInput(detectedInput(action.InputTypeText, "user_email")); again != email {

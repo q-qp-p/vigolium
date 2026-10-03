@@ -54,6 +54,10 @@ func runWithWatch(fn func() error) error {
 	opts := clicommon.WatchOptions{Raw: globalWatchRaw, JSON: globalJSON}
 	if interval, err := clicommon.ParseWatchInterval(globalWatchRaw); err == nil && interval > 0 && globalJSON {
 		jsonStreamMode = true
+		// jsonStreamFramed outlives the loop on purpose: emitJSONError runs after
+		// this function returns, and it needs to know stdout is a line stream that
+		// one more line cannot corrupt. See its declaration in agentview.go.
+		jsonStreamFramed = true
 		defer func() { jsonStreamMode = false }()
 	}
 	err := clicommon.RunWithWatchOptions(opts, fn)

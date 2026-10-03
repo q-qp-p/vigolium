@@ -123,6 +123,14 @@ vigolium import ./src/vigolium-results --format html -o audit-report.html
 
 > To **read** a colleague's export without merging it into your DB, open it in place with `-S --db <file>.sqlite` or `--glob-db '<glob>'` on `finding` / `traffic` / `export` instead (see those commands).
 
+**Imports are idempotent and loud about loss.** Re-importing the same JSONL or
+SQLite skips the duplicates (`records_skipped_duplicate`) rather than failing on
+a UNIQUE constraint. An import that could not read everything — a truncated
+JSONL, a corrupt member of a glob — prints its full summary and then **exits 1**
+with `error.code: "ingest_incomplete"`, so a zero exit means the whole source
+landed. A glob read reports `glob_sources` naming every file it skipped and why;
+`--glob-strict` turns the first such skip into a hard failure instead.
+
 ### import flags
 
 | Flag | Short | Type | Default | Description |
@@ -130,6 +138,7 @@ vigolium import ./src/vigolium-results --format html -o audit-report.html
 | `--format` | — | string | — | Also write a report after import: `html`, `report`, `pdf`, or `markdown` (`md`). Same generators as `vigolium export --format`, but one value only (no comma list) |
 | `--output` | `-o` | string | — | Report output path or `gs://<project>/<key>` URL (required when `--format` is set; supports `{ts}`) |
 | `--glob-db` | — | string | — | Glob of local files to import alongside any positional paths (one format per run) |
+| `--glob-strict` | — | bool | `false` | Fail on the first `--glob-db` source that cannot be imported, instead of skipping it with a warning |
 | `--burp-bridge-url` | `-B` | string | `$VIGOLIUM_BURP_BRIDGE_URL` | Import live Burp/Caido Proxy history from this loopback bridge URL. **Requires a filter or `--all-hosts`** — see below |
 | `--host` / `--path` / `--method` / `--status` / `--search` / `--exclude-search` / `--from` / `--to` / `-n` | — | — | — | With `-B`: narrow which live records are imported (same spellings as `traffic -B`) |
 | `--all-hosts` | — | bool | `false` | With `-B`: import the **entire** proxy history, unfiltered. Required when no filter is given |
@@ -345,7 +354,7 @@ List database records with filtering, sorting, and display options. The target t
 
 ### Agent JSON output flags
 
-With `-j`/`--json`, `db ls` emits the same compact, token-aware object as `finding`/`traffic` and accepts the shared shaping flags: `--compact` (metadata only), `--fields a,b,c` (project top-level keys), `--full-body` (complete bodies). `--with-records` is finding-only. Most `-j` commands (including `db stats`) use the **same envelope** — `{schema_version, command, project_uuid, db_path, total, offset, limit, items, query}`, with `items` canonical and the old row key (`records`/`findings`/`scans`/`rows`) kept as a deprecated alias that ships a **second full copy of the array** on the wire. See [agent-loop.md → The `-j` envelope](agent-loop.md#the--j-envelope).
+With `-j`/`--json`, `db ls` emits the same compact, token-aware object as `finding`/`traffic` and accepts the shared shaping flags: `--compact` (metadata only), `--fields a,b,c` (project top-level keys), `--full-body` (complete bodies), `--max-output-bytes N` (cap the whole document at N bytes, dropping whole trailing items). `--with-records` is finding-only. Most `-j` commands (including `db stats`) use the **same envelope** — `{schema_version, command, project_uuid, project_scoped, db_path, total, offset, limit, items, query, query_argv, generated_at, generated_at_ms}`, with `items` canonical. The old row key (`records`/`findings`/`scans`/`rows`) is no longer emitted by default — it shipped a **second full copy of the array** on the wire; `--json-legacy-keys` (or `VIGOLIUM_JSON_LEGACY_KEYS=1`) restores it at that cost. See [agent-loop.md → The `-j` envelope](agent-loop.md#the--j-envelope).
 
 Notes on this command:
 

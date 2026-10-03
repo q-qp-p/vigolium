@@ -428,9 +428,7 @@ func (h *Handlers) HandleScanAllRecords(c fiber.Ctx) error {
 	if req.ScanningMaxDuration != "" {
 		settings.ScanningPace.MaxDuration = req.ScanningMaxDuration
 	}
-	if req.RateLimit > 0 {
-		settings.ScanningPace.RateLimit = req.RateLimit
-	}
+	applyRequestRateLimit(opts, &settings.ScanningPace, req.RateLimit)
 
 	// Resolve per-phase durations from scanning_pace (mirrors CLI behavior in scan.go)
 	applyResolvedPhaseDurations(opts, &settings.ScanningPace)

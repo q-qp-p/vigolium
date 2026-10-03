@@ -310,6 +310,7 @@ func (h *Handlers) buildAutopilotPipelineConfig(req AgentAutopilotRequest, proje
 	}
 
 	cfg.BrowserEnabled = h.settings.Agent.Browser.IsEnabled()
+	cfg.BrowserBinaryPath = h.settings.Agent.Browser.BinaryPath
 	if req.Browser {
 		cfg.BrowserEnabled = true
 	}

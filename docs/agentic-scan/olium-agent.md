@@ -133,8 +133,10 @@ The built-in registry currently contains nine tools:
 | `ls` | yes | List a directory. |
 | `grep` | yes | Regex search — uses ripgrep when available, else native Go regex. Params: `pattern`, `path`, `glob`, `max_matches` (200), `ignore_case`. |
 | `glob` | yes | Glob pattern → paths. |
-| `web_fetch` | yes | Fetch a URL. Two modes: `http` (default, fast) and `browser` (delegates to `agent-browser` for SPA / JS-heavy pages). Params: `url`, `method`, `headers`, `body`, `max_bytes`, `mode`, `wait_selector`, `wait_ms`. |
-| `browser_probe` | yes | Probe a page with the browser integration and capture browser-visible behavior. |
+| `web_fetch` | no | Fetch a URL. Two modes: `http` (default, fast) and `browser` (renders in headless Chromium via the in-process browser engine for SPA / JS-heavy pages). Params: `url`, `method`, `headers`, `body`, `max_bytes`, `mode`, `wait_selector`, `wait_ms`. It accepts state-changing methods and runs page script, so it is never read-only. `RegisterReadOnlyBuiltins` (used by the candidate verifier) registers a restricted variant instead: GET/HEAD only, no browser mode, nothing persisted, refused calls return an error naming the restriction — that variant is read-only. |
+| `browser_probe` | no | Probe a page with the browser integration and capture browser-visible behavior. |
+
+There is no web-search builtin: `web_fetch` retrieves a URL it is given, and the agent has no way to query a public search engine.
 
 The `IsReadOnly()` flag is what the engine uses to decide whether to fan out a turn's tool calls in parallel. `bash` runs **without an approval prompt** (yolo mode) — only the catastrophic-pattern guard prevents disasters. The `ApprovalFn` parameter on `RegisterBuiltins` is wired but unused today; it's there for future plugin-installed tools.
 
@@ -241,7 +243,7 @@ agent:
 Adjacent config blocks worth knowing:
 
 - `agent.sessions_dir` — where per-run session directories go. Default `~/.vigolium/agent-sessions/`.
-- `agent.browser` — toggles `agent-browser` integration (the binary `web_fetch` shells out to in `mode: browser`).
+- `agent.browser` — toggles the `agent-browser` integration: the prompt's browser section and the typed `browser_auth` tool (`enable: false` removes the tool; `binary_path` picks the binary, else `agent-browser` on `PATH`). `browser_auth` checks `agent-browser --version` once and refuses a release outside the supported range (currently `>=0.26.0 <1.0.0`) instead of emitting argv it was not verified against. `web_fetch mode: browser` does not use it — it renders in-process.
 - `agent.audit` — controls the optional vigolium-audit prep step that autopilot/swarm can stack ahead of the olium loop.
 
 ---

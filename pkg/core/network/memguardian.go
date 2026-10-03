@@ -14,8 +14,16 @@ import (
 var (
 	MaxThreadsOnLowMemory          = env.GetEnvOrDefault("MEMGUARDIAN_THREADS", 30)
 	MaxBytesBufferAllocOnLowMemory = env.GetEnvOrDefault("MEMGUARDIAN_ALLOC", 200)
-	memTimer                       *time.Ticker
-	cancelFunc                     context.CancelFunc
+
+	// memMu guards the guardian's lifecycle handles. They are package globals
+	// written by Start and read by Stop, while the goroutine Start launched is
+	// still running — so two overlapping scan lifecycles in one process (a server
+	// starting a second scan as the first tears down) raced on them, and a Start
+	// arriving before the previous goroutine noticed its cancellation left that
+	// goroutine on a ticker nothing would ever stop.
+	memMu      sync.Mutex
+	memTimer   *time.Ticker
+	cancelFunc context.CancelFunc
 )
 
 func StartActiveMemGuardian(ctx context.Context) {
@@ -24,14 +32,26 @@ func StartActiveMemGuardian(ctx context.Context) {
 		return
 	}
 
-	memTimer = time.NewTicker(time.Second * 15) // default 30s
-	ctx, cancelFunc = context.WithCancel(ctx)
+	memMu.Lock()
+	defer memMu.Unlock()
+	// Already running: a second Start would orphan the first goroutine.
+	if cancelFunc != nil {
+		return
+	}
+
+	timer := time.NewTicker(time.Second * 15) // default 30s
+	ctx, cancel := context.WithCancel(ctx)
+	memTimer, cancelFunc = timer, cancel
+
+	// The ticker and context are CAPTURED rather than read from the globals: a
+	// later Stop/Start pair reassigns those while this goroutine still runs.
 	go func() {
+		defer timer.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-memTimer.C:
+			case <-timer.C:
 				if IsLowOnMemory() {
 					_ = GlobalGuardBytesBufferAlloc()
 				} else {
@@ -47,9 +67,16 @@ func StopActiveMemGuardian() {
 		return
 	}
 
-	if memTimer != nil {
-		memTimer.Stop()
-		cancelFunc()
+	memMu.Lock()
+	timer, cancel := memTimer, cancelFunc
+	memTimer, cancelFunc = nil, nil
+	memMu.Unlock()
+
+	if timer != nil {
+		timer.Stop()
+	}
+	if cancel != nil {
+		cancel()
 	}
 }
 

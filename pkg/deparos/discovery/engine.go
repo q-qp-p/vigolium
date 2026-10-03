@@ -285,6 +285,55 @@ type EngineMetrics struct {
 	PrefixesBroken   int // Number of path prefixes tripped by the breaker
 }
 
+// engineMiddleware builds the engine client's middleware chain.
+//
+// Order is load-bearing, and index 0 is the OUTERMOST wrapper:
+//
+//  1. Filter — refuses a request the caller's policy denies. Outermost so a
+//     refused request is never retried and never waits for a rate-limit token
+//     (there is nothing to pace: no request goes out).
+//  2. Rate limit — the caller's explicit requests-per-second ceiling. Above retry
+//     so a retry also has to take a token; a burst of 503s must not be allowed to
+//     outrun the configured rate.
+//  3. Retry — the engine's existing behaviour, unchanged.
+//  4. Counting — innermost, so it sees every physical attempt including each
+//     retry, which is what a server's access log would show.
+//
+// The optional rungs are omitted entirely when unconfigured rather than wrapping
+// with a no-op, so a run that uses none has the exact chain it had before.
+func engineMiddleware(eng *config.EngineConfig) []pkghttp.Middleware {
+	mw := make([]pkghttp.Middleware, 0, 4)
+	if eng.RequestFilter != nil {
+		mw = append(mw, pkghttp.FilterMiddleware(eng.RequestFilter))
+	}
+	if eng.RequestsPerSecond > 0 {
+		// BurstSize = the rate: one second's worth of credit, so a crawl starting
+		// from idle does not open with an unbounded spike. newTokenBucket turns a
+		// non-positive burst into the rate anyway; naming it keeps the intent in
+		// the code rather than in the bucket's fallback.
+		mw = append(mw, pkghttp.RateLimitMiddleware(&pkghttp.RateLimitConfig{
+			RequestsPerSecond: eng.RequestsPerSecond,
+			BurstSize:         max(1, eng.RequestsPerSecond),
+		}))
+	}
+	mw = append(mw, pkghttp.RetryMiddleware(pkghttp.DefaultRetryConfig()))
+	if eng.RequestCounter != nil {
+		mw = append(mw, pkghttp.CountingMiddleware(eng.RequestCounter))
+	}
+	return mw
+}
+
+// excludeFromRequestFilter turns an allow-predicate into the deny-predicate
+// scope.Config.Exclude wants, so the two sides of the egress seam cannot drift
+// apart: there is one caller-supplied function and this is the only place its
+// sense is inverted.
+func excludeFromRequestFilter(allow func(*url.URL) bool) func(*url.URL) bool {
+	if allow == nil {
+		return nil
+	}
+	return func(u *url.URL) bool { return !allow(u) }
+}
+
 // NewEngine creates discovery engine with configuration.
 func NewEngine(cfg *config.Config, st storage.Storage) (*Engine, error) {
 	return NewEngineWithContext(context.Background(), cfg, st)
@@ -324,10 +373,8 @@ func NewEngineWithContext(parentCtx context.Context, cfg *config.Config, st stor
 	}
 
 	httpClient := pkghttp.NewClient(&pkghttp.ClientConfig{
-		PoolConfig: poolConfig,
-		Middleware: []pkghttp.Middleware{
-			pkghttp.RetryMiddleware(pkghttp.DefaultRetryConfig()),
-		},
+		PoolConfig:          poolConfig,
+		Middleware:          engineMiddleware(&cfg.Engine),
 		RequestTimeout:      cfg.Engine.Timeout,
 		DisableAutoRedirect: true,
 		MaxRedirects:        0,
@@ -350,6 +397,12 @@ func NewEngineWithContext(parentCtx context.Context, cfg *config.Config, st stor
 	spiderScope := scope.NewChecker(scope.Config{
 		TargetHost: startURL.Host,
 		Mode:       scope.Mode(cfg.Target.ScopeMode),
+		// Same predicate as the egress filter, negated: a URL the client would
+		// refuse is also a URL the spider must never queue. Enforcing it in both
+		// places is deliberate — the queue check saves the work, the client check is
+		// the guarantee, since not every request the engine makes comes off the
+		// spider queue (wordlist probes, the startup probe, robots.txt).
+		Exclude: excludeFromRequestFilter(cfg.Engine.RequestFilter),
 	})
 
 	spiderFactory := spider.NewExtractorFactory(spiderResolver)

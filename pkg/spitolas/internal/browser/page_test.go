@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vigolium/vigolium/pkg/spitolas/internal/config"
 	"golang.org/x/net/html"
 )
 
@@ -934,74 +935,84 @@ func TestPageAlertDialog(t *testing.T) {
 	}
 }
 
-// TestPageConfirmDialog tests handling confirm dialogs.
+// TestPageConfirmDialog tests handling confirm dialogs: the default
+// record-dismiss policy cancels a confirm, accept-all confirms it, and the
+// dialog is recorded either way.
 func TestPageConfirmDialog(t *testing.T) {
-	server := setupTestServer(t)
-	defer server.Close()
-
-	b := setupBrowser(t, server.URL)
-	page, err := b.NewPage()
-	if err != nil {
-		t.Fatalf("NewPage() failed: %v", err)
-	}
-
-	if err := page.Navigate(server.URL + "/simple.html"); err != nil {
-		t.Fatalf("Navigate() failed: %v", err)
-	}
-
-	// Set up dialog handler
-	if err := page.HandlePopups(); err != nil {
-		t.Fatalf("HandlePopups() failed: %v", err)
-	}
-
-	// Give time for handler to be set
-	time.Sleep(100 * time.Millisecond)
-
-	// Trigger confirm - should be auto-accepted and return true
-	result, err := page.Eval("(() => confirm('test confirm'))()")
-	if err != nil {
-		t.Fatalf("Eval confirm failed: %v", err)
-	}
-
-	// With HandlePopups accepting all dialogs, confirm must return true
-	if result != true {
-		t.Errorf("Expected confirm to return true, got %v", result)
+	for _, c := range []struct {
+		policy config.DialogPolicy
+		want   any
+	}{
+		{config.DialogRecordDismiss, false},
+		{config.DialogAcceptAll, true},
+	} {
+		t.Run(string(c.policy), func(t *testing.T) {
+			page := newDialogTestPage(t, c.policy)
+			result, err := page.Eval("(() => confirm('test confirm'))()")
+			if err != nil {
+				t.Fatalf("Eval confirm failed: %v", err)
+			}
+			if result != c.want {
+				t.Errorf("confirm returned %v under %s, want %v", result, c.policy, c.want)
+			}
+			if got := page.DialogEvents(); len(got) != 1 || got[0].Type != "confirm" {
+				t.Errorf("dialog not recorded: %+v", got)
+			}
+		})
 	}
 }
 
-// TestPagePromptDialog tests handling prompt dialogs.
+// TestPagePromptDialog tests handling prompt dialogs: dismissed (null) by
+// default, accepted with empty text under accept-all.
 func TestPagePromptDialog(t *testing.T) {
-	server := setupTestServer(t)
-	defer server.Close()
+	for _, c := range []struct {
+		policy config.DialogPolicy
+		want   any
+	}{
+		{config.DialogRecordDismiss, nil},
+		{config.DialogAcceptAll, ""},
+	} {
+		t.Run(string(c.policy), func(t *testing.T) {
+			page := newDialogTestPage(t, c.policy)
+			result, err := page.Eval("(() => prompt('test prompt', 'default'))()")
+			if err != nil {
+				t.Fatalf("Eval prompt failed: %v", err)
+			}
+			if result != c.want {
+				t.Errorf("prompt returned %#v under %s, want %#v", result, c.policy, c.want)
+			}
+		})
+	}
+}
 
-	b := setupBrowser(t, server.URL)
+// newDialogTestPage opens simple.html in a browser whose dialog policy is
+// policy, with the auto-dialog handler given time to attach.
+func newDialogTestPage(t *testing.T, policy config.DialogPolicy) *Page {
+	t.Helper()
+	server := setupTestServer(t)
+	t.Cleanup(server.Close)
+
+	cfg, err := config.New(server.URL)
+	if err != nil {
+		t.Fatalf("Failed to create config: %v", err)
+	}
+	cfg.Headless = true
+	cfg.Policy.DialogResponse = policy
+	b, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create browser: %v", err)
+	}
+	t.Cleanup(func() { b.Close() })
+
 	page, err := b.NewPage()
 	if err != nil {
 		t.Fatalf("NewPage() failed: %v", err)
 	}
-
 	if err := page.Navigate(server.URL + "/simple.html"); err != nil {
 		t.Fatalf("Navigate() failed: %v", err)
 	}
-
-	// Set up dialog handler
-	if err := page.HandlePopups(); err != nil {
-		t.Fatalf("HandlePopups() failed: %v", err)
-	}
-
-	// Give time for handler to be set
 	time.Sleep(100 * time.Millisecond)
-
-	// Trigger prompt - should be auto-accepted with empty promptText (per setupAutoDialogHandler)
-	result, err := page.Eval("(() => prompt('test prompt', 'default'))()")
-	if err != nil {
-		t.Fatalf("Eval prompt failed: %v", err)
-	}
-
-	// setupAutoDialogHandler accepts with empty PromptText, so prompt returns ""
-	if result != "" {
-		t.Errorf("Expected prompt to return '' (auto-accepted with empty promptText), got %v", result)
-	}
+	return page
 }
 
 // TestPageClose tests page close.

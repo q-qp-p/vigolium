@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -54,9 +55,11 @@ func registerScanOnReceiveFlags(flags *pflag.FlagSet, usage string) {
 // applyDeprecatedScanOnReceive folds the deprecated -S into the real flag and
 // warns once. Called from the root PersistentPreRunE so every command that
 // registered the alias is covered without repeating the check.
+// The value matters, not just the spelling: `ingest -S=false` is an operator
+// saying "do not scan what you receive", and folding it in on Changed alone
+// turned ingestion into a scanner against an explicit instruction.
 func applyDeprecatedScanOnReceive(cmd *cobra.Command) {
-	f := cmd.Flags().Lookup("scan-on-receive-shorthand")
-	if f == nil || !f.Changed {
+	if !flagOn(cmd, "scan-on-receive-shorthand") {
 		return
 	}
 	globalScanOnReceive = true
@@ -120,4 +123,52 @@ func addStatelessShorthand(c *cobra.Command) {
 	c.Flags().BoolVarP(&globalStateless, "stateless", "S", false,
 		"Read from --db (a .jsonl export or standalone .sqlite) with project scoping off; ignored where it does not apply")
 	_ = c.Flags().MarkHidden("stateless")
+	statelessInjected[c] = true
+}
+
+// statelessInjected records the commands addStatelessShorthand gave an injected
+// -S to. They are exactly the commands where the letter is accepted because it
+// is accepted everywhere, not because the command does anything with it — and
+// so exactly the set where it may be a no-op.
+//
+// Recorded at registration rather than listed by name: the injection has two
+// structural guards and no exemption table, so a hand-written list of "commands
+// without real -S" would be a second, drifting copy of a decision already made
+// here.
+var statelessInjected = map[*cobra.Command]bool{}
+
+// statelessReaderCommands are the injected-'-S' commands where the flag still
+// means something, as command paths without the root name.
+//
+// These reach a read path that consults statelessReadRequested even though they
+// never registered -S themselves, so the injected flag is live on them.
+var statelessReaderCommands = []string{
+	"log", "log ls", "fuzz", "db list",
+}
+
+// warnNoOpStateless tells the operator when -S/--stateless was accepted and
+// ignored.
+//
+// The flag parses on every command so that a driver passing it for safety never
+// gets "unknown shorthand flag" — a non-zero exit with no output. But silence
+// has its own failure mode: `-S` reads as "do not touch my project database",
+// and on a command that writes, it does not mean that. One line naming the
+// command is the difference between a wrong belief and a corrected one.
+//
+// Not in a machine-output mode, and not for the commands that genuinely honor
+// it. Rejecting instead of warning is deferred: it would break command lines
+// that work today.
+func warnNoOpStateless(cmd *cobra.Command) {
+	if !globalStateless || machineOutputMode() {
+		return
+	}
+	if !statelessInjected[cmd] {
+		return // the command registered its own -S, so it means something here
+	}
+	path := commandPathWithoutRoot(cmd)
+	if slices.Contains(statelessReaderCommands, path) {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "%s %s has no effect on %q and is ignored\n",
+		terminal.WarnPrefix(), terminal.BoldCyan("-S/--stateless"), path)
 }

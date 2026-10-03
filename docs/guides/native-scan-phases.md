@@ -56,15 +56,23 @@ Crawls the target using a headless browser to discover pages, forms, and JavaScr
 vigolium run spidering -t https://example.com
 ```
 
-Control the browser engine and parallelism:
+Control the browser engine, time budget and what the crawl may change:
 
 ```bash
 vigolium run spidering -t https://example.com \
   -E chromium \
-  -b 3 \
   --spider-max-time 20m \
   --no-forms
 ```
+
+The crawler drives one browser (`-b`/`--browsers` above 1 is clamped to 1).
+Under the phase header it prints the resolved interaction `Policy:` and the
+`Browser security:` posture (see [Browser policy](browser-policy.md)). Its
+completion line is built from capture receipts: when records were lost it says
+`run incomplete` instead of reporting the stored count as the whole crawl, and
+per-target notes call out authentication that could not be applied, credential
+headers withheld from out-of-scope hosts, and readiness conditions that never
+met.
 
 The alias `spitolas` also works:
 

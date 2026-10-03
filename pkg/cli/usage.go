@@ -221,7 +221,7 @@ var scanFlagGroups = []flagGroup{
 	{"Module Selection", []string{"modules", "module-tag", "module-id", "passive-only", "no-passive", "no-tech-filter"}},
 	{"Scanning", []string{"only", "skip", "strategy", "scanning-profile", "intensity", "scope-origin", "scanning-max-duration", "heuristics-check", "skip-heuristics", "oast-url"}},
 	{"Discovery", []string{"discover", "discover-max-time", "discovery-wordlist", "no-discovery-fuzz", "no-prefix-breaker", "follow-subdomains", "port-sweep-ports"}},
-	{"Spidering", []string{"spider", "spider-max-time", "browser-engine", "browsers", "headless", "headed", "no-cdp", "no-forms", "no-carry-browser-session"}},
+	{"Spidering", []string{"spider", "spider-max-time", "browser-engine", "browsers", "headless", "headed", "no-cdp", "no-forms", "browser-insecure", "require-auth", "no-carry-browser-session"}},
 	{"Probe (host sweep)", []string{"probe", "tls-probe", "redirect-mode", "record-redirect-chain"}},
 	{"Harvest", []string{"external-harvest"}},
 	{"KnownIssueScan", []string{"known-issue-scan", "known-issue-scan-tags", "known-issue-scan-exclude-tags", "known-issue-scan-severities", "known-issue-scan-templates-dir"}},
@@ -229,7 +229,7 @@ var scanFlagGroups = []flagGroup{
 	{"Authentication", []string{"auth", "auth-file"}},
 	{"Speed Control", []string{"timeout", "concurrency", "rate-limit", "max-per-host", "no-waf-pacing", "max-host-error", "max-findings-per-module", "no-clustering"}},
 	{"Output", []string{"output", "stats", "fail-on", "events", "include-response", "omit-response", "export-only", "report-url", "upload-results", "print-finding", "print-traffic", "print-traffic-tree"}},
-	{"Stateless & Parallel", []string{"stateless", "split-by-host", "db-isolate", "parallel", "resume"}},
+	{"Stateless & Parallel", []string{"stateless", "keep-db-on-error", "split-by-host", "db-isolate", "parallel", "resume"}},
 }
 
 // --- Agent-subcommand flag groups ---
@@ -324,9 +324,9 @@ var listQueryFlagGroups = []flagGroup{
 	{"Search", []string{"search", "header", "body", "exclude-search", "exclude-header", "exclude-body"}},
 	{"Date Range", []string{"from", "to"}},
 	{"Display", []string{"tree", "raw", "burp", "markdown", "group-by", "group-limit", "columns", "exclude-columns", "tui", "no-tui"}},
-	{"Output", []string{"fields", "compact", "full-body", "output", "with-records", "record-fields", "record-limit"}},
+	{"Output", []string{"fields", "compact", "full-body", "max-output-bytes", "output", "with-records", "record-fields", "record-limit"}},
 	{"Pagination & Sort", []string{"limit", "offset", "sort", "asc", "pick", "all"}},
-	{"Data Source", []string{"stateless", "glob-db", "table", "list-tables", "list-columns"}},
+	{"Data Source", []string{"stateless", "glob-db", "glob-strict", "table", "list-tables", "list-columns"}},
 	{"Replay", []string{"replay", "concurrency", "with-browser", "burp-bridge-url", "save-to-vigolium-db", "save-to-burp", "in-replace", "timeout"}},
 	{"Burp Push", []string{"push-to-burp", "to-repeater", "send-via-burp", "http-mode"}},
 }
@@ -389,10 +389,10 @@ var serverFlagGroups = []flagGroup{
 
 // exportFlagGroups categorizes `vigolium export`.
 var exportFlagGroups = []flagGroup{
-	{"Output Format", []string{"format", "output", "omit-response"}},
+	{"Output Format", []string{"format", "output", "omit-response", "no-url-dedup"}},
 	{"Filter", []string{"search", "exclude", "severity", "scan-uuid", "only", "limit"}},
 	{"Report Metadata", []string{"report-title", "report-target", "report-duration", "report-generated-at", "report-url"}},
-	{"Data Source", []string{"db", "stateless", "glob-db"}},
+	{"Data Source", []string{"db", "stateless", "glob-db", "glob-strict"}},
 }
 
 // importFlagGroups categorizes `vigolium import`.

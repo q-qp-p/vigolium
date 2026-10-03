@@ -98,7 +98,10 @@ func warnInertProbeFlags(opts *types.Options, cmd *cobra.Command) {
 		{"tls-probe", "no TLS handshake is performed"},
 		{"record-redirect-chain", "redirect hops are not recorded"},
 	} {
-		if flag := cmd.Flags().Lookup(f.name); flag != nil && flag.Changed {
+		// flagOn, not Changed: `--tls-probe=false` is an operator saying they do
+		// NOT want the probe behaviour, and warning that their off switch has no
+		// effect on a phase that is not running is noise about a non-problem.
+		if flagOn(cmd, f.name) {
 			fmt.Fprintf(os.Stderr, "%s %s only affects the %s phase, which this run does not include — %s. Add %s or use %s.\n",
 				terminal.WarnPrefix(),
 				terminal.BoldCyan("--"+f.name),

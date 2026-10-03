@@ -12,17 +12,31 @@ import (
 )
 
 func TestGraphOutputPathFor(t *testing.T) {
-	if got := GraphOutputPathFor("", "app.test"); got != "" {
+	if got := GraphOutputPathFor("", "app.test", "run1", "001"); got != "" {
 		t.Errorf("no directory should disable the dump, got %q", got)
 	}
-	if got := GraphOutputPathFor("/out", ""); got != filepath.Join("/out", defaultGraphFileName) {
-		t.Errorf("unknown host should fall back to the default name, got %q", got)
+	if got := GraphOutputPathFor("/out", "app.test", "run1", "001"); got != filepath.Join("/out", "crawl-graph-app.test-run1-001.json") {
+		t.Errorf("path = %q", got)
 	}
-	// Two hosts in one run must not write to the same file.
-	a := GraphOutputPathFor("/out", "a.test")
-	b := GraphOutputPathFor("/out", "b.test")
-	if a == b {
-		t.Errorf("per-host paths collided: %q", a)
+	if got := GraphOutputPathFor("/out", "", "run1", "001"); got != filepath.Join("/out", "crawl-graph-run1-001.json") {
+		t.Errorf("unknown host should drop the component, got %q", got)
+	}
+	// Two hosts, two seeds on one host, and two runs: no two may share a file.
+	seen := map[string]bool{}
+	for _, p := range []string{
+		GraphOutputPathFor("/out", "a.test", "run1", "001"),
+		GraphOutputPathFor("/out", "b.test", "run1", "002"),
+		GraphOutputPathFor("/out", "a.test", "run1", "003"),
+		GraphOutputPathFor("/out", "a.test", "run2", "001"),
+	} {
+		if seen[p] {
+			t.Errorf("graph paths collided: %q", p)
+		}
+		seen[p] = true
+	}
+	// Components are reduced to file-name-safe characters.
+	if got := GraphOutputPathFor("/out", "::1", "../../etc", "001"); filepath.Dir(got) != "/out" {
+		t.Errorf("unsafe components escaped the directory: %q", got)
 	}
 }
 
@@ -90,7 +104,6 @@ func TestWriteGraphDumpProducesReadableJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("config.New: %v", err)
 	}
-	cfg.GraphOutputPath = path
 
 	g := state.NewGraph()
 	index := state.New("https://app.test/", "<html></html>", "html", 0)
@@ -101,7 +114,17 @@ func TestWriteGraphDumpProducesReadableJSON(t *testing.T) {
 		action.NewIdentification(action.HowXPath, "//a[@id='admin']"), action.EventTypeClick))
 
 	c := &Crawler{config: cfg, graph: g}
-	c.writeGraphDump()
+	c.stats.FormsSubmitted, c.stats.FormSubmitsPrevented, c.stats.FormSubmitsUncertain = 3, 2, 1
+	m := GraphManifest{
+		RunID:    "scan-uuid",
+		Seed:     "001",
+		Policy:   map[string]any{"submit_forms": true},
+		Security: map[string]any{"sandbox": "on"},
+		Capture:  map[string]any{"persisted": 12, "drain_complete": true},
+	}
+	if werr := c.WriteGraphDump(path, m, false); werr != nil {
+		t.Fatalf("WriteGraphDump: %v", werr)
+	}
 
 	data, rerr := os.ReadFile(path)
 	if rerr != nil {
@@ -118,11 +141,31 @@ func TestWriteGraphDumpProducesReadableJSON(t *testing.T) {
 	if dump.Stats.States != 2 || len(dump.States) != 2 {
 		t.Errorf("expected 2 states, got %d (%d in stats)", len(dump.States), dump.Stats.States)
 	}
+	if dump.Version != 2 {
+		t.Errorf("version = %d, want 2 (forms_submitted changed meaning)", dump.Version)
+	}
+	if dump.Stats.FormsSubmitted != 3 || dump.Stats.FormSubmitsPrevented != 2 || dump.Stats.FormSubmitsUncertain != 1 {
+		t.Errorf("submission counters not carried: %+v", dump.Stats)
+	}
 	if dump.Stats.Edges != 1 || len(dump.Edges) != 1 {
 		t.Errorf("expected 1 edge, got %d (%d in stats)", len(dump.Edges), dump.Stats.Edges)
 	}
 	if dump.Edges[0].Selector.Value != "//a[@id='admin']" {
 		t.Errorf("edge selector lost through serialization: %+v", dump.Edges[0])
+	}
+	// The manifest says which run this is, what it was allowed to do, and what
+	// its capture kept.
+	if dump.RunID != "scan-uuid" || dump.Seed != "001" || !dump.Redacted ||
+		dump.Policy["submit_forms"] != true || dump.Security["sandbox"] != "on" || dump.Capture == nil {
+		t.Errorf("manifest not carried: run=%q seed=%q redacted=%v policy=%v security=%v capture=%v",
+			dump.RunID, dump.Seed, dump.Redacted, dump.Policy, dump.Security, dump.Capture)
+	}
+	info, serr := os.Stat(path)
+	if serr != nil {
+		t.Fatal(serr)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("graph mode = %o, want 600", perm)
 	}
 	// The DOM is deliberately excluded — it is large and already represented by
 	// the captured responses.
@@ -137,5 +180,29 @@ func TestWriteGraphDumpNoOpWithoutPath(t *testing.T) {
 		t.Fatalf("config.New: %v", err)
 	}
 	c := &Crawler{config: cfg, graph: state.NewGraph()}
-	c.writeGraphDump() // must not panic when no output was requested
+	if err := c.WriteGraphDump("", GraphManifest{}, false); err != nil { // no output requested
+		t.Errorf("WriteGraphDump with no path = %v", err)
+	}
+}
+
+// TestWriteGraphDumpFailureKeepsPreviousGraph: the write is temp-and-rename, so
+// a serialization failure leaves an earlier good graph exactly as it was.
+func TestWriteGraphDumpFailureKeepsPreviousGraph(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "graph.json")
+	if err := os.WriteFile(path, []byte(`{"previous":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := config.New("https://app.test")
+	c := &Crawler{config: cfg, graph: state.NewGraph()}
+	// A channel cannot be marshalled.
+	if err := c.WriteGraphDump(path, GraphManifest{Capture: make(chan int)}, false); err == nil {
+		t.Fatal("expected the unmarshallable manifest to fail the write")
+	}
+	if data, _ := os.ReadFile(path); string(data) != `{"previous":true}` {
+		t.Errorf("previous graph damaged: %q", data)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(path))
+	if len(entries) != 1 {
+		t.Errorf("temp file left behind: %d entries", len(entries))
+	}
 }

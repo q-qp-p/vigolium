@@ -489,7 +489,7 @@ func (r *Runner) printScanConfig() {
 		terminal.Purple(terminal.SymbolInfo),
 		PhaseLabel(settings, "ExternalHarvest", "external_harvester", opts.ExternalHarvestEnabled, 0),
 		PhaseLabel(settings, "Spidering", "spidering", opts.SpideringEnabled, SpideringBudget(settings, opts)),
-		PhaseLabel(settings, "Discovery", "discovery", opts.DiscoverEnabled, opts.DiscoverMaxDuration))
+		PhaseLabel(settings, "Discovery", "discovery", opts.DiscoverEnabled, DiscoveryBudget(settings, opts)))
 	fmt.Fprintf(os.Stderr, "           %s | %s\n",
 		PhaseLabel(settings, "KnownIssueScan", "known-issue-scan", opts.KnownIssueScanEnabled, 0),
 		PhaseLabel(settings, "DynamicAssessment", "dynamic-assessment", !opts.SkipDynamicAssessment, 0))
@@ -511,8 +511,8 @@ func (r *Runner) printScanConfig() {
 			terminal.HiTeal(opts.HeuristicsCheck))
 	}
 
-	// Speed
-	rateLimit := settings.ScanningPace.RateLimit
+	// Speed — same source as the limiter that enforces it (effectiveRateLimit).
+	rateLimit := effectiveRateLimit(opts)
 	fmt.Fprintf(os.Stderr, "  %s Speed: concurrency=%s | rate-limit=%s | max-per-host=%s\n",
 		terminal.Purple(terminal.SymbolInfo),
 		terminal.HiBlue(fmt.Sprintf("%d", opts.Concurrency)),
@@ -598,14 +598,22 @@ func (r *Runner) printScanConfig() {
 // metadata entry in the scan logs. This allows API consumers to inspect what
 // settings were active for any historical scan.
 func (r *Runner) logConfigSnapshot() {
+	r.scanLogger.InfoWithMeta("config", "scan configuration snapshot", r.configSnapshotMeta())
+}
+
+// configSnapshotMeta builds the snapshot's key/value map. Split out from the log
+// call so a test can assert what the snapshot claims without a logger, which is
+// how the rate-limit disagreement went unnoticed: the snapshot reported the
+// configured pace while the scan ran at the option's rate.
+func (r *Runner) configSnapshotMeta() map[string]any {
 	opts := r.options
 	settings := r.settings
 
 	strategy := ""
-	rateLimit := 0
+	kisRateLimit := 0
 	if settings != nil {
 		strategy = settings.ScanningStrategy.DefaultStrategy
-		rateLimit = settings.ScanningPace.RateLimit
+		kisRateLimit = settings.ScanningPace.ResolvePhase("known-issue-scan").RateLimit
 	}
 
 	var activeMods []modules.ActiveModule
@@ -621,26 +629,30 @@ func (r *Runner) logConfigSnapshot() {
 	activeCount, passiveCount, _ := HygieneBannerCounts(opts, settings, activeMods, passiveMods)
 	hygieneSuppressed := (len(activeMods) - activeCount) + (len(passiveMods) - passiveCount)
 
-	meta := map[string]interface{}{
-		"project_uuid":             opts.ProjectUUID,
-		"targets":                  opts.Targets,
-		"strategy":                 strategy,
-		"scanning_profile":         opts.ScanningProfile,
-		"concurrency":              opts.Concurrency,
-		"rate_limit":               rateLimit,
-		"max_per_host":             opts.MaxPerHost,
-		"heuristics_check":         opts.HeuristicsCheck,
-		"scope_origin_mode":        r.resolvedScopeOriginMode(),
-		"active_modules":           activeCount,
-		"passive_modules":          passiveCount,
-		"hygiene_modules_off":      hygieneSuppressed,
-		"spidering_enabled":        opts.SpideringEnabled,
-		"discovery_enabled":        opts.DiscoverEnabled,
-		"known_issue_scan_enabled": opts.KnownIssueScanEnabled,
-		"external_harvest":         opts.ExternalHarvestEnabled,
-		"skip_dynamic":             opts.SkipDynamicAssessment,
+	meta := map[string]any{
+		"project_uuid":     opts.ProjectUUID,
+		"targets":          opts.Targets,
+		"strategy":         strategy,
+		"scanning_profile": opts.ScanningProfile,
+		"concurrency":      opts.Concurrency,
+		// The rate the scan's limiter actually enforces, not the configured pace.
+		"rate_limit": effectiveRateLimit(opts),
+		// Known-issue-scan builds its own limiter from the resolved phase pace, so
+		// it is the one phase whose rate can legitimately differ from the above.
+		"rate_limit_known_issue_scan": kisRateLimit,
+		"max_per_host":                opts.MaxPerHost,
+		"heuristics_check":            opts.HeuristicsCheck,
+		"scope_origin_mode":           r.resolvedScopeOriginMode(),
+		"active_modules":              activeCount,
+		"passive_modules":             passiveCount,
+		"hygiene_modules_off":         hygieneSuppressed,
+		"spidering_enabled":           opts.SpideringEnabled,
+		"discovery_enabled":           opts.DiscoverEnabled,
+		"known_issue_scan_enabled":    opts.KnownIssueScanEnabled,
+		"external_harvest":            opts.ExternalHarvestEnabled,
+		"skip_dynamic":                opts.SkipDynamicAssessment,
 	}
-	r.scanLogger.InfoWithMeta("config", "scan configuration snapshot", meta)
+	return meta
 }
 
 // printVerboseTargets prints up to the first 10 targets when verbose mode is enabled.

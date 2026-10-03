@@ -235,6 +235,105 @@ func TestSessionToAuthenticationHostname_Roundtrip(t *testing.T) {
 	if restored.Login.Extract[0].ApplyAs != original.Login.Extract[0].ApplyAs {
 		t.Errorf("apply_as mismatch: %q vs %q", restored.Login.Extract[0].ApplyAs, original.Login.Extract[0].ApplyAs)
 	}
+
+	// The two facts that make a DB login session usable at all. The row carries
+	// BOTH the login flow and the headers that flow produced; a Session may name
+	// only one credential source, so the restored session must drop the stored
+	// headers:
+	//   - with both, Validate rejects the session and initSessions fails for the
+	//     WHOLE scan, so a DB-sourced login session never worked.
+	//   - with headers alone, IsHydrated is true and the login never re-runs, so
+	//     the scan reuses a token from an earlier run and collects 401s.
+	if err := restored.Validate(); err != nil {
+		t.Errorf("restored session does not validate: %v", err)
+	}
+	if restored.IsHydrated() {
+		t.Error("a restored login session must NOT read as hydrated, or the login will not re-run")
+	}
+	if len(restored.Headers) != 0 {
+		t.Errorf("restored Headers = %v, want none alongside a login flow", restored.Headers)
+	}
+	// The row itself still carries the headers — they are what `vigolium session`
+	// shows the operator, and dropping them on write would lose that.
+	if sh.Headers["Authorization"] != "Bearer xyz" {
+		t.Errorf("row Headers = %v, want the last hydrated token preserved", sh.Headers)
+	}
+}
+
+// A row that carries a raw login request alongside stored headers restores with
+// the raw request and no headers, for the same single-source reason.
+func TestAuthenticationHostnameToSession_RawLoginDropsStoredHeaders(t *testing.T) {
+	sh := &AuthenticationHostname{
+		SessionName:  "raw",
+		SessionRole:  "primary",
+		LoginRequest: "POST /login HTTP/1.1\r\nHost: app.test\r\n\r\nu=a&p=b",
+		Headers:      map[string]string{"Authorization": "Bearer stale"},
+	}
+	s := AuthenticationHostnameToSession(sh)
+	if s == nil {
+		t.Fatal("expected non-nil session")
+	}
+	if s.LoginRequest == "" {
+		t.Error("expected the raw login request to be restored")
+	}
+	if len(s.Headers) != 0 {
+		t.Errorf("Headers = %v, want none alongside a raw login request", s.Headers)
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("restored session does not validate: %v", err)
+	}
+}
+
+// A row with a login flow AND a raw login request restores with the flow only:
+// the flow is the executable form (HydrateSessions runs Session.Login and
+// nothing else), the raw request is provenance, and naming both fails Validate.
+func TestAuthenticationHostnameToSession_LoginFlowOutranksRawRequest(t *testing.T) {
+	sh := &AuthenticationHostname{
+		SessionName:  "both",
+		SessionRole:  "primary",
+		LoginURL:     "https://app.test/login",
+		LoginMethod:  "POST",
+		LoginBody:    `{"u":"a"}`,
+		ExtractRules: `[{"source":"json","path":"$.token","apply_as":"Authorization: Bearer {value}"}]`,
+		LoginRequest: "POST /login HTTP/1.1\r\nHost: app.test\r\n\r\n{\"u\":\"a\"}",
+		Headers:      map[string]string{"Authorization": "Bearer stale"},
+	}
+	s := AuthenticationHostnameToSession(sh)
+	if s == nil || s.Login == nil {
+		t.Fatal("expected a restored session with a login flow")
+	}
+	if s.LoginRequest != "" {
+		t.Error("the raw request must not be carried alongside the login flow")
+	}
+	if len(s.Headers) != 0 {
+		t.Errorf("Headers = %v, want none", s.Headers)
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("restored session does not validate: %v", err)
+	}
+}
+
+// A static-header row (no login flow at all) keeps its headers and reads as
+// hydrated — there is nothing to re-run.
+func TestAuthenticationHostnameToSession_StaticHeadersStayHydrated(t *testing.T) {
+	sh := &AuthenticationHostname{
+		SessionName: "static",
+		SessionRole: "primary",
+		Headers:     map[string]string{"X-API-Key": "k"},
+	}
+	s := AuthenticationHostnameToSession(sh)
+	if s == nil {
+		t.Fatal("expected non-nil session")
+	}
+	if s.Headers["X-API-Key"] != "k" {
+		t.Errorf("Headers = %v, want the static header kept", s.Headers)
+	}
+	if !s.IsHydrated() {
+		t.Error("a static-header session is hydrated by definition")
+	}
+	if err := s.Validate(); err != nil {
+		t.Errorf("restored session does not validate: %v", err)
+	}
 }
 
 // TestSessionToAuthenticationHostname_TokenPathShorthand verifies that a

@@ -91,6 +91,20 @@ const (
 	// well exist, they just did not reach the file the caller asked for, and a
 	// driver's correct response is to retry the export rather than the scan.
 	errCodeExportFailed = "export_failed"
+	// errCodeIngestIncomplete: the ingest ran, but not every record it read
+	// reached the database — a write the store refused, or a request with no
+	// response to store. Distinct from a generic failure because the caller's
+	// remedy is about the records, not the command: re-ingest the capture, or
+	// check that the origins it replays against are still reachable. It exists
+	// because the alternative was the shape it replaces — "30 records ingested",
+	// exit 0, zero rows in the table.
+	errCodeIngestIncomplete = "ingest_incomplete"
+	// errCodeOutputTooLarge: --max-output-bytes is smaller than the result
+	// document's fixed parts, so not even a zero-item page fits. Distinct from
+	// a usage error because the flag value is well formed and the command ran
+	// — the caller's remedy is a larger budget or a narrower projection, not a
+	// corrected command line.
+	errCodeOutputTooLarge = "output_too_large"
 )
 
 // codedError carries a stable error code alongside its message, for conditions
@@ -182,8 +196,18 @@ func emitJSONError(err error, exitCode int, cmd *cobra.Command) {
 	// already on stdout; appending a second top-level object to it produces a
 	// stream no single json.Unmarshal can read. The exit code reports the
 	// outcome in those cases.
-	if jsonResultEmitted {
+	//
+	// The exception is --watch, where stdout is already NDJSON (jsonStreamFramed):
+	// one more line is the frame, not a violation of it, and a stream that ends
+	// because the read broke should say why on the stream. Encode compactly so
+	// the error occupies exactly one line like every tick before it.
+	if jsonResultEmitted && !jsonStreamFramed {
 		return
+	}
+	if jsonStreamFramed {
+		prev := jsonStreamMode
+		jsonStreamMode = true
+		defer func() { jsonStreamMode = prev }()
 	}
 	name := "vigolium"
 	if cmd != nil {

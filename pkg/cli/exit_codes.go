@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
 
@@ -118,7 +119,41 @@ func recordExportFailure(err *error, exportErr error) {
 			terminal.ErrorPrefix(), exportErr)
 		return
 	}
-	*err = codedErrorf(errCodeExportFailed, "%w", exportErr)
+	*err = codedError{code: errCodeExportFailed, err: exportErr}
+}
+
+// writeRequestedFile publishes an artifact the caller asked for with -o, and
+// codes a failure as errCodeExportFailed.
+//
+// The code is the point, and it is why this is one function rather than the
+// two-line pair it replaces at each site. The work ran and its result exists; it
+// just did not reach the file that was asked for, and the caller's correct
+// response is to retry the WRITE rather than the read. Left to inference, a
+// missing parent directory wraps os.ErrNotExist and classifies as
+// source_missing — which tells a driver the database it just read successfully
+// is not there. docs/coding-agent.md promises export_failed for any -o that
+// cannot be written, and a promise that general cannot be kept by remembering to
+// wrap at each call site.
+func writeRequestedFile(dest string, data []byte) error {
+	if err := atomicfile.WriteBytes(dest, data); err != nil {
+		return codedErrorf(errCodeExportFailed, "write %s: %w", dest, err)
+	}
+	return nil
+}
+
+// isExportFailure reports whether err is a failure to write a requested output
+// rather than a failure of the work that produced it.
+//
+// The distinction matters to the defers that materialize the remaining formats.
+// They skip on a failed scan, because a success-looking file of stale or partial
+// project data is worse than no file — but an unwritable html path says nothing
+// about the findings, and cancelling the jsonl export over it loses the one
+// format that would still have landed. Each --format is attempted
+// independently; this is what keeps that true once one of them starts failing
+// the command.
+func isExportFailure(err error) bool {
+	var coded codedError
+	return errors.As(err, &coded) && coded.Code() == errCodeExportFailed
 }
 
 // classifyExitCode maps a command's error to its exit code.

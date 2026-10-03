@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/harvester"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
@@ -65,7 +66,7 @@ func runKitHarvest(cmd *cobra.Command, args []string) error {
 
 	// Source list + API keys come from the user's config so the utility offers
 	// exactly what the scan phase would; --source narrows it for this run.
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}

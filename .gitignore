@@ -122,7 +122,12 @@ internal/resources/spitolas/chromium/*
 build/dist-license/
 build/dist-public/
 build/dist-npm/
+build/dist-packages/
+build/packaging/__pycache__/
 build/public-install.sh
+
+# Local planning documents
+/docs/planning/
 
 # Archon audit SAST working artifacts
 /archon/codeql-artifacts/

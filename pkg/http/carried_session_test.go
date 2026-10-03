@@ -164,3 +164,84 @@ func mustHost(t *testing.T, rawURL string) string {
 	}
 	return u.Host
 }
+
+// TestCarriedSession_SecureCookieNotSentOverHTTP is the WP9 statement on the
+// HTTP path: the flat Cookie header the session used to carry had no attributes,
+// so a Secure cookie and a /admin cookie rode on every request to the host,
+// including plain-http ones. With the harvested jar carried, the requester
+// evaluates it per request the way a browser does.
+func TestCarriedSession_SecureCookieNotSentOverHTTP(t *testing.T) {
+	var gotCookie string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotCookie = req.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newTestRequester(t)
+	host := httpmsg.NormalizeHost(mustHost(t, srv.URL))
+	r.SetCarriedSessions(map[string]httpmsg.CarriedSession{
+		host: {
+			// The flat header is deliberately everything, to prove the
+			// per-request evaluation — not the fallback — is what runs.
+			CookieHeader: "sid=s; tracker=t; admin_csrf=c",
+			Cookies: []httpmsg.CarriedCookie{
+				{Name: "sid", Value: "s", Domain: host, Path: "/", HostOnly: true},
+				{Name: "tracker", Value: "t", Domain: host, Path: "/", Secure: true},
+				{Name: "admin_csrf", Value: "c", Domain: host, Path: "/admin"},
+			},
+		},
+	})
+
+	// httptest.NewServer is http, and the request path is /.
+	rr, err := httpmsg.GetRawRequestFromURL(srv.URL)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if _, _, err := r.Execute(rr, Options{NoClustering: true}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if gotCookie != "sid=s" {
+		t.Errorf("Cookie = %q, want only the site-wide non-Secure cookie", gotCookie)
+	}
+
+	// The same session on /admin does send the path-scoped cookie.
+	rr, err = httpmsg.GetRawRequestFromURL(srv.URL + "/admin")
+	if err != nil {
+		t.Fatalf("build /admin request: %v", err)
+	}
+	if _, _, err := r.Execute(rr, Options{NoClustering: true}); err != nil {
+		t.Fatalf("Execute /admin: %v", err)
+	}
+	if gotCookie != "admin_csrf=c; sid=s" {
+		t.Errorf("/admin Cookie = %q, want the path-scoped cookie too", gotCookie)
+	}
+}
+
+// A session harvested before attributes were recorded still sends its flat
+// header, unchanged.
+func TestCarriedSession_FlatHarvestUnchanged(t *testing.T) {
+	var gotCookie string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotCookie = req.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	r := newTestRequester(t)
+	host := httpmsg.NormalizeHost(mustHost(t, srv.URL))
+	r.SetCarriedSessions(map[string]httpmsg.CarriedSession{
+		host: {CookieHeader: "cf_clearance=abc; sess=1"},
+	})
+
+	rr, err := httpmsg.GetRawRequestFromURL(srv.URL)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	if _, _, err := r.Execute(rr, Options{NoClustering: true}); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if gotCookie != "cf_clearance=abc; sess=1" {
+		t.Errorf("Cookie = %q, want the flat harvest unchanged", gotCookie)
+	}
+}

@@ -110,7 +110,9 @@ A vulnerability is confirmed when injected payloads cause measurable, consistent
 
 ## Per-Module Finding Cap
 
-To prevent noisy modules from flooding results, the executor caps findings emitted per module. Once a module reaches the limit, additional findings from that module are suppressed for the remainder of the scan.
+To prevent noisy modules from flooding results, the executor caps findings emitted per module. Once a module reaches the limit, additional findings from that module are suppressed for the remainder of the **dynamic-assessment phase** — the cap is shared across every feedback round, not reset per round. Other phases are uncapped.
+
+The count is of distinct finding identities admitted per module: repeated evidence for a root cause already admitted is still persisted (so the repository can merge it) but does not consume cap, and does not re-fire result callbacks or notifications — including when a later feedback round re-finds it.
 
 ```bash
 # Override the default cap (default: 10)

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/jsext"
 )
 
@@ -48,9 +48,9 @@ func runExtensionsEval(cmd *cobra.Command, args []string) error {
 	}
 
 	// Load settings
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// Build the API surface (DB, scope, HTTP stack) shared with

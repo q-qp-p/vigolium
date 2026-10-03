@@ -117,3 +117,30 @@ func TestHandleRunScan_ResolvesPhases(t *testing.T) {
 		})
 	}
 }
+
+// TestApplyRequestRateLimit is the F19 REST half: writing only the pace left
+// DefaultOptions.RateLimit at 0, so an API caller's rate_limit paced
+// known-issue-scan and the native scan ran unlimited.
+func TestApplyRequestRateLimit(t *testing.T) {
+	t.Run("sets both the pace and the native limiter source", func(t *testing.T) {
+		opts := &types.Options{}
+		pace := config.DefaultScanningPaceConfig()
+		applyRequestRateLimit(opts, pace, 7)
+		if pace.RateLimit != 7 {
+			t.Errorf("pace rate_limit = %d, want 7", pace.RateLimit)
+		}
+		if opts.RateLimit != 7 {
+			t.Errorf("opts.RateLimit = %d, want 7 (the native limiter reads this)", opts.RateLimit)
+		}
+	})
+
+	t.Run("unset leaves throughput unchanged", func(t *testing.T) {
+		opts := &types.Options{RateLimit: 3}
+		pace := config.DefaultScanningPaceConfig()
+		before := pace.RateLimit
+		applyRequestRateLimit(opts, pace, 0)
+		if pace.RateLimit != before || opts.RateLimit != 3 {
+			t.Errorf("n<=0 must be a no-op, got pace=%d opts=%d", pace.RateLimit, opts.RateLimit)
+		}
+	})
+}

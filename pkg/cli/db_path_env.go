@@ -55,12 +55,14 @@ var statelessWriteCommands = map[string]bool{
 // throwaway-database flavor of -S. It reads the flag rather than globalStateless
 // because that variable is only one of the bindings behind the name: `audit -S`
 // sets auditStateless and `ingest -S` is --scan-on-receive entirely.
+// flagOn, not Changed: `scan --stateless=false VIGOLIUM_DB_PATH=…` means "I know
+// about -S and I do not want it", and reading Changed as enabled dropped the pin
+// and sent the scan's writes to the default database instead.
 func statelessWriteRequested(cmd *cobra.Command) bool {
 	if !statelessWriteCommands[cmd.Name()] {
 		return false
 	}
-	f := cmd.Flags().Lookup("stateless")
-	return f != nil && f.Changed
+	return flagOn(cmd, "stateless")
 }
 
 // applyDBPathEnv resolves dbPathEnvVar into the --db global (and, for reads, the

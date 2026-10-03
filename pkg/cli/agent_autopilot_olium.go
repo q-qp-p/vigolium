@@ -283,17 +283,18 @@ func runAutopilotOlium(parentCtx context.Context, settings *config.Settings, rep
 		// --max-commands bounds tool calls, which is what it says and what
 		// an operator budgets for. The turn ceiling stays as a separate
 		// backstop so a model that never calls a tool still terminates.
-		MaxToolCalls:     autopilotMaxCommands,
-		MaxTurns:         autopilotMaxCommands,
-		MaxWallTime:      autopilotMaxDuration,
-		Out:              streamWriter,
-		Verbose:          autopilotVerbose,
-		SystemPrompt:     effectiveSystemPrompt,
-		BrowserAvailable: settings.Agent.Browser.IsEnabled(),
-		SkillNames:       autopilotSkills,
-		SkillTags:        autopilotSkillTags,
-		NoSkillFilter:    autopilotNoSkillFilter,
-		AlwaysOnSkills:   settings.Agent.Olium.EffectiveAlwaysOnSkills(),
+		MaxToolCalls:      autopilotMaxCommands,
+		MaxTurns:          autopilotMaxCommands,
+		MaxWallTime:       autopilotMaxDuration,
+		Out:               streamWriter,
+		Verbose:           autopilotVerbose,
+		SystemPrompt:      effectiveSystemPrompt,
+		BrowserAvailable:  settings.Agent.Browser.IsEnabled(),
+		BrowserBinaryPath: settings.Agent.Browser.BinaryPath,
+		SkillNames:        autopilotSkills,
+		SkillTags:         autopilotSkillTags,
+		NoSkillFilter:     autopilotNoSkillFilter,
+		AlwaysOnSkills:    settings.Agent.Olium.EffectiveAlwaysOnSkills(),
 		// Durable-autopilot mode (legacy default). Enables bounded operator
 		// sections with context rotation + verify-before-promote when the
 		// operator opts in via agent.olium.autopilot_mode.
@@ -675,6 +676,7 @@ func runAutopilotOliumPipeline(
 		Audit:                 auditCfg,
 		AuditHarness:          harness,
 		BrowserEnabled:        settings.Agent.Browser.IsEnabled(),
+		BrowserBinaryPath:     settings.Agent.Browser.BinaryPath,
 		BrowserRequested:      autopilotRequiresBrowser,
 		RequiresBrowser:       autopilotRequiresBrowser,
 		// Browser is always-on for autopilot (runAutopilotOlium forces

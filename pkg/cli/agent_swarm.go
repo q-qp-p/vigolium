@@ -343,10 +343,9 @@ func runAgentSwarm(cmd *cobra.Command, args []string) (err error) {
 		swarmCodeAudit = true
 	}
 
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 	// Layer the global --ext / --ext-dir flags onto settings so user-supplied
 	// extensions ride alongside any agent-generated ones in the swarm pipeline.

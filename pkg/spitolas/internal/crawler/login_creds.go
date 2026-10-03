@@ -159,7 +159,8 @@ const loginSubmitFallbackScript = `(() => {
 
 // attemptLoginCredentials tries a small list of common default credentials
 // against a confirmed local login form so the crawl can proceed authenticated.
-// It is a no-op unless enabled (deep intensity), only ever runs against a
+// It is a no-op unless the policy permits login attempts (by default at
+// balanced and deep intensity), only ever runs against a
 // confirmed single-password local login form, is single-flighted per host, and
 // is negative-control gated. On success the browser session stays logged in
 // (cookies persist) and the page is returned to the login URL so the crawl loop
@@ -347,6 +348,10 @@ func (c *Crawler) submitLoginAttempt(ctx context.Context, page *browser.Page, us
 
 	urlBefore, _ := page.URL()
 
+	// Credential attempts are authorized by their own policy category, so they
+	// pass the page's submit guard even when ordinary submits are denied.
+	page.AllowAuthorizedSubmit()
+	c.countSubmitDispatched(submitMechLoginAttempt, 1)
 	if submitElem, serr := page.ElementPiercing(`[data-vgo-login-submit="1"]`); serr == nil && submitElem != nil {
 		if cerr := submitElem.Click(); cerr != nil {
 			zap.L().Debug("Login-cred: submit click failed, trying form.submit()", zap.Error(cerr))

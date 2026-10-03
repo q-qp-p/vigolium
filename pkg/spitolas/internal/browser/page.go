@@ -12,6 +12,7 @@ import (
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/config"
+	"github.com/ysmood/gson"
 )
 
 // maxRecordedDialogs caps per-page dialog history so a malicious page can't
@@ -20,20 +21,32 @@ const maxRecordedDialogs = 64
 
 // DialogEvent describes a JavaScript dialog (alert/confirm/prompt/beforeunload)
 // that opened on the page. Captured by setupAutoDialogHandler before the
-// dialog is auto-accepted, so consumers can confirm XSS by observing fired
-// alerts without blocking the page.
+// dialog is answered, so consumers can confirm XSS by observing fired alerts
+// without blocking the page — and regardless of how the policy answers it.
 type DialogEvent struct {
 	Type    string    // "alert", "confirm", "prompt", "beforeunload"
 	Message string    // The dialog message text
 	URL     string    // Frame URL where the dialog originated
 	At      time.Time // When the dialog opened
+	// Answered is how the dialog policy told the browser to answer it:
+	// DialogAccepted or DialogDismissed.
+	Answered string
 }
+
+// DialogEvent.Answered values.
+const (
+	DialogAccepted  = "accepted"
+	DialogDismissed = "dismissed"
+)
 
 // Page wraps rod.Page with additional functionality.
 type Page struct {
 	rodPage *rod.Page
 	config  *config.Config
 	browser *Browser
+	// release ends the context of the browser handle that created this tab
+	// (see Browser.createRodPage); nil for pages not created by NewPage.
+	release context.CancelFunc
 
 	dialogMu sync.Mutex
 	dialogs  []DialogEvent
@@ -230,7 +243,7 @@ func (p *Page) WaitVisible(selector string, timeout time.Duration) error {
 }
 
 // SetCookies sets cookies on the page from http.Cookie slice.
-// Converts net/http cookies to rod's NetworkCookieParam format.
+// Converts net/http cookies to rod's NetworkCookieParam format (cookieParams).
 func (p *Page) SetCookies(cookies []*http.Cookie) error {
 	if len(cookies) == 0 {
 		return nil
@@ -242,9 +255,22 @@ func (p *Page) SetCookies(cookies []*http.Cookie) error {
 		targetURL = p.config.URL.String()
 	}
 
-	// Convert http.Cookie to proto.NetworkCookieParam
+	return p.boundedPage(0).SetCookies(cookieParams(cookies, targetURL))
+}
+
+// cookieParams converts net/http cookies to CDP cookie parameters, keeping the
+// attributes that decide where a cookie is sent. A cookie with a Domain is
+// installed for that domain (a leading dot or not, exactly as given) and its
+// Path ("/" when unset) — never also with URL, which CDP reconciles with
+// Domain inconsistently. A host-only cookie (no Domain) is bound to targetURL,
+// the pre-navigation case: CDP derives the host from it, and a Path, when the
+// cookie has one, narrows it.
+func cookieParams(cookies []*http.Cookie, targetURL string) []*proto.NetworkCookieParam {
 	params := make([]*proto.NetworkCookieParam, 0, len(cookies))
 	for _, c := range cookies {
+		if c == nil {
+			continue
+		}
 		// Map SameSite from http to proto
 		sameSite := proto.NetworkCookieSameSiteLax // Default
 		switch c.SameSite {
@@ -257,22 +283,41 @@ func (p *Page) SetCookies(cookies []*http.Cookie) error {
 		param := &proto.NetworkCookieParam{
 			Name:     c.Name,
 			Value:    c.Value,
-			URL:      targetURL, // Use URL instead of Domain for pre-navigation cookies
+			Path:     c.Path,
 			Secure:   c.Secure,
 			HTTPOnly: c.HttpOnly,
 			SameSite: sameSite,
 		}
+		if c.Domain != "" {
+			param.Domain = c.Domain
+			if param.Path == "" {
+				param.Path = "/"
+			}
+		} else {
+			param.URL = targetURL
+		}
 
 		// Set expiry if present
 		if !c.Expires.IsZero() {
-			expires := proto.TimeSinceEpoch(c.Expires.Unix())
-			param.Expires = expires
+			param.Expires = proto.TimeSinceEpoch(c.Expires.Unix())
 		}
 
 		params = append(params, param)
 	}
+	return params
+}
 
-	return p.boundedPage(0).SetCookies(params)
+// SetExtraHeaders replaces the page's extra request headers (CDP
+// Network.setExtraHTTPHeaders) — they ride on every request the page makes.
+// An empty map clears them. Unlike rod's Page.SetExtraHeaders this returns no
+// cleanup: rod's handle restores the Network domain's enabled state, not the
+// headers, so calling it would stop the page's network events instead.
+func (p *Page) SetExtraHeaders(headers map[string]string) error {
+	h := proto.NetworkHeaders{}
+	for k, v := range headers {
+		h[k] = gson.New(v)
+	}
+	return proto.NetworkSetExtraHTTPHeaders{Headers: h}.Call(p.boundedPage(0))
 }
 
 // ShadowUIDAttr is the attribute the shadow-piercing queries stamp on each element
@@ -611,7 +656,11 @@ func (p *Page) ScreenshotCompact(quality int) ([]byte, error) {
 // closePageWithTimeout runs the close in a goroutine and abandons it after a
 // bound, so teardown can never hang the scan forever even against a stuck browser.
 func (p *Page) Close() error {
-	return closePageWithTimeout(p.rodPage.Context(context.Background()), browserOpTimeout, 1)
+	err := closePageWithTimeout(p.rodPage.Context(context.Background()), browserOpTimeout, 1)
+	if p.release != nil {
+		p.release()
+	}
+	return err
 }
 
 // Browser returns the parent browser.
@@ -974,7 +1023,8 @@ func matchesFramePattern(pattern, frameIdent string) bool {
 // setupAutoDialogHandler sets up automatic dialog handling for alert/confirm/prompt.
 // Must be called when page is created to ensure dialogs don't block crawl.
 // The handler runs in a background goroutine: it records the event so XSS
-// confirmation can observe it, then auto-accepts the dialog.
+// confirmation can observe it, then answers the dialog per the configured
+// dialog policy (see dialogResponse).
 func (p *Page) setupAutoDialogHandler() {
 	// Enable Page domain for dialog events
 	_ = proto.PageEnable{}.Call(p.boundedPage(0))
@@ -982,18 +1032,60 @@ func (p *Page) setupAutoDialogHandler() {
 	// Start background goroutine to handle all dialogs.
 	// Callback returns bool: false = keep listening, true = stop.
 	go p.rodPage.EachEvent(func(e *proto.PageJavascriptDialogOpening) bool {
-		p.recordDialog(DialogEvent{
-			Type:    string(e.Type),
-			Message: e.Message,
-			URL:     e.URL,
-			At:      time.Now(),
+		p.handleDialog(e, func(accept bool, promptText string) error {
+			return proto.PageHandleJavaScriptDialog{
+				Accept:     accept,
+				PromptText: promptText,
+			}.Call(p.boundedPage(0))
 		})
-		_ = proto.PageHandleJavaScriptDialog{
-			Accept:     true,
-			PromptText: "",
-		}.Call(p.boundedPage(0))
 		return false
 	})()
+}
+
+// handleDialog records a dialog and only then answers it through respond.
+// Recording first is load-bearing: dialog-based XSS confirmation depends on the
+// event alone, so it must never wait on — or be lost to — the answer.
+func (p *Page) handleDialog(e *proto.PageJavascriptDialogOpening, respond func(accept bool, promptText string) error) {
+	policy := config.DialogRecordDismiss
+	if p.config != nil {
+		policy = p.config.Policy.DialogResponse
+	}
+	kind := string(e.Type)
+	accept, promptText := dialogResponse(policy, kind)
+	answered := DialogDismissed
+	if accept {
+		answered = DialogAccepted
+	}
+	p.recordDialog(DialogEvent{
+		Type:     kind,
+		Message:  e.Message,
+		URL:      e.URL,
+		At:       time.Now(),
+		Answered: answered,
+	})
+	_ = respond(accept, promptText)
+}
+
+// dialogResponse decides how a dialog of kind is answered under policy.
+//
+// record-dismiss (the default, and what an empty or unknown policy means):
+//   - alert accepts — it has only one button, so there is nothing to cancel;
+//   - confirm and prompt dismiss — the only answer that cannot authorize an
+//     application change ("Delete this account?");
+//   - beforeunload accepts — dismissing it cancels the crawler's own
+//     navigation and wedges the loop on the page.
+//
+// accept-all accepts everything, the pre-policy behavior.
+func dialogResponse(policy config.DialogPolicy, kind string) (accept bool, promptText string) {
+	if policy == config.DialogAcceptAll {
+		return true, ""
+	}
+	switch kind {
+	case string(proto.PageDialogTypeAlert), string(proto.PageDialogTypeBeforeunload):
+		return true, ""
+	default:
+		return false, ""
+	}
 }
 
 // recordDialog appends a dialog event to the page log, dropping the oldest

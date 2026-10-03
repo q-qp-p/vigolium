@@ -504,8 +504,8 @@ func TestHandlerFillInputsResult(t *testing.T) {
 	// Verify result counts
 	expectedSucceeded := 1
 	expectedFailed := 1
-	if result.Succeeded != expectedSucceeded {
-		t.Errorf("Expected %d succeeded, got %d", expectedSucceeded, result.Succeeded)
+	if result.Succeeded() != expectedSucceeded {
+		t.Errorf("Expected %d succeeded, got %d", expectedSucceeded, result.Succeeded())
 	}
 	if result.Failed != expectedFailed {
 		t.Errorf("Expected %d failed, got %d", expectedFailed, result.Failed)

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -220,5 +222,191 @@ func TestImportPathSQLiteMerge(t *testing.T) {
 	}
 	if res2.MergeStats == nil || res2.MergeStats.FindingsDeduped != 1 {
 		t.Errorf("re-import should dedup the 1 existing finding, got %+v", res2.MergeStats)
+	}
+}
+
+// jsonlRecordLine builds one http_record envelope line for the given uuid.
+func jsonlRecordLine(t *testing.T, uuid string) string {
+	t.Helper()
+	return jsonlEnvelope(t, "http_record", database.HTTPRecord{
+		UUID:        uuid,
+		Scheme:      "https",
+		Hostname:    "example.com",
+		Port:        443,
+		Method:      "GET",
+		Path:        "/" + uuid,
+		URL:         "https://example.com/" + uuid,
+		HTTPVersion: "HTTP/1.1",
+		RequestHash: "h-" + uuid,
+		StatusCode:  200,
+	})
+}
+
+// TestImportJSONLDuplicateUUIDIsIdempotent covers the two ways a record uuid
+// repeats in practice: twice inside one file, and across two runs over the same
+// file. Both used to abort the import with a UNIQUE constraint error AFTER an
+// arbitrary number of earlier batches had already committed.
+func TestImportJSONLDuplicateUUIDIsIdempotent(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	// 501 lines, one of which repeats an earlier uuid, so the duplicate lands in
+	// the second flush batch rather than the first.
+	var b strings.Builder
+	for i := 0; i < 500; i++ {
+		b.WriteString(jsonlRecordLine(t, fmt.Sprintf("rec-%03d", i)))
+		b.WriteByte('\n')
+	}
+	b.WriteString(jsonlRecordLine(t, "rec-000"))
+	b.WriteByte('\n')
+	stream := b.String()
+
+	res, err := ImportJSONL(ctx, repo, strings.NewReader(stream), "", Options{})
+	if err != nil {
+		t.Fatalf("ImportJSONL with a duplicate uuid: %v", err)
+	}
+	if res.RecordsImported != 500 {
+		t.Errorf("RecordsImported = %d, want 500", res.RecordsImported)
+	}
+	if res.RecordsSkippedDuplicate != 1 {
+		t.Errorf("RecordsSkippedDuplicate = %d, want 1", res.RecordsSkippedDuplicate)
+	}
+
+	var stored int
+	if err := repo.DB().NewSelect().Model((*database.HTTPRecord)(nil)).
+		ColumnExpr("COUNT(*)").Scan(ctx, &stored); err != nil {
+		t.Fatalf("count records: %v", err)
+	}
+	if stored != 500 {
+		t.Errorf("stored rows = %d, want 500", stored)
+	}
+
+	// Re-importing the identical bytes inserts nothing and skips everything.
+	res2, err := ImportJSONL(ctx, repo, strings.NewReader(stream), "", Options{})
+	if err != nil {
+		t.Fatalf("ImportJSONL re-import: %v", err)
+	}
+	if res2.RecordsImported != 0 || res2.RecordsSkippedDuplicate != 501 {
+		t.Errorf("re-import: imported=%d skipped=%d, want 0/501",
+			res2.RecordsImported, res2.RecordsSkippedDuplicate)
+	}
+}
+
+// TestImportJSONLLineCap checks the ceiling on a single line and, as importantly,
+// that the error says how much of the file already reached the database — the
+// operator's next question after "this import failed" is "what is in there now".
+func TestImportJSONLLineCap(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	// One good line (flushed only at the end — under the batch size), then a line
+	// well past the cap. The cap is below the reader's 1 MiB buffer, so this also
+	// exercises the non-ErrBufferFull branch of the check.
+	stream := jsonlRecordLine(t, "rec-ok") + "\n" +
+		`{"type":"http_record","data":{"uuid":"` + strings.Repeat("x", 8*1024) + `"}}` + "\n"
+
+	_, err := ImportJSONL(ctx, repo, strings.NewReader(stream), "", Options{MaxLineBytes: 4096})
+	if err == nil {
+		t.Fatal("expected an error for a line over MaxLineBytes")
+	}
+	for _, want := range []string{"line 2", "4096 bytes", "already committed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err, want)
+		}
+	}
+
+	// The same stream is fine with the cap raised, which proves the cap is what
+	// rejected it rather than the content.
+	res, err := ImportJSONL(ctx, repo, strings.NewReader(stream), "", Options{MaxLineBytes: 1 << 20})
+	if err != nil {
+		t.Fatalf("ImportJSONL with a raised cap: %v", err)
+	}
+	if res.RecordsImported != 2 {
+		t.Errorf("RecordsImported = %d, want 2", res.RecordsImported)
+	}
+}
+
+// TestImportJSONLLineCapAcrossBufferRefills drives the accumulate branch: a line
+// longer than the reader's own buffer, so the cap has to be enforced during the
+// refill loop rather than once on a finished line.
+func TestImportJSONLLineCapAcrossBufferRefills(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	// 3 MiB on one line against a 1 MiB reader buffer and a 2 MiB cap.
+	stream := `{"type":"http_record","data":{"uuid":"` + strings.Repeat("x", 3<<20) + `"}}` + "\n"
+	_, err := ImportJSONL(ctx, repo, strings.NewReader(stream), "", Options{MaxLineBytes: 2 << 20})
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("err = %v, want an 'exceeds' error", err)
+	}
+}
+
+// TestImportJSONLFlushesWhileParsing asserts records reach the database before
+// the stream ends. Buffering the whole file first is what made a large export an
+// out-of-memory failure instead of a slow import.
+func TestImportJSONLFlushesWhileParsing(t *testing.T) {
+	repo := newTestRepo(t)
+	ctx := context.Background()
+
+	// recordFlushBatch good lines, then an over-long one. The first batch must
+	// already be committed when the failure is reported.
+	var b strings.Builder
+	for i := 0; i < recordFlushBatch; i++ {
+		b.WriteString(jsonlRecordLine(t, fmt.Sprintf("flush-%03d", i)))
+		b.WriteByte('\n')
+	}
+	b.WriteString(`{"type":"http_record","data":{"uuid":"` + strings.Repeat("y", 8*1024) + `"}}` + "\n")
+
+	_, err := ImportJSONL(ctx, repo, strings.NewReader(b.String()), "", Options{MaxLineBytes: 4096})
+	if err == nil {
+		t.Fatal("expected the over-long line to fail the import")
+	}
+	if want := fmt.Sprintf("(%d records already committed)", recordFlushBatch); !strings.Contains(err.Error(), want) {
+		t.Errorf("error %q should report %q", err, want)
+	}
+
+	var stored int
+	if err := repo.DB().NewSelect().Model((*database.HTTPRecord)(nil)).
+		ColumnExpr("COUNT(*)").Scan(ctx, &stored); err != nil {
+		t.Fatalf("count records: %v", err)
+	}
+	if stored != recordFlushBatch {
+		t.Errorf("stored rows = %d, want %d (the flushed batch)", stored, recordFlushBatch)
+	}
+}
+
+// TestTallyFindingSavesSeparatesFailures pins the three-way split. A deduped
+// finding is already in the destination; a failed one is nowhere, and reporting
+// both as "skipped" described a lossy import as a clean one.
+func TestTallyFindingSavesSeparatesFailures(t *testing.T) {
+	findings := []*database.Finding{
+		{Severity: "high"},
+		{Severity: "low"},
+		{Severity: "critical"},
+		{Severity: "medium"},
+	}
+	results := []database.FindingSaveResult{
+		{Inserted: true},
+		{Inserted: false},
+		{Err: errors.New("constraint failed")},
+		{Inserted: true},
+	}
+	sev := map[string]int{}
+	saved, deduped, failed := tallyFindingSaves(findings, results, sev)
+	if saved != 2 || deduped != 1 || failed != 1 {
+		t.Fatalf("saved=%d deduped=%d failed=%d, want 2/1/1", saved, deduped, failed)
+	}
+	// A failed finding contributes no severity: it is not in the database, and
+	// counting it would make the severity breakdown sum past what was stored.
+	if sev["critical"] != 0 {
+		t.Errorf("failed finding tallied into severity: %v", sev)
+	}
+	if sev["high"] != 1 || sev["low"] != 1 || sev["medium"] != 1 {
+		t.Errorf("severity tally wrong: %v", sev)
+	}
+
+	// A short results slice is a caller bug; it must not panic mid-import.
+	if s, d, f := tallyFindingSaves(findings, results[:1], map[string]int{}); s != 1 || d != 0 || f != 0 {
+		t.Errorf("short results: %d/%d/%d, want 1/0/0", s, d, f)
 	}
 }

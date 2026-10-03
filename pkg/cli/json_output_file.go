@@ -3,11 +3,9 @@ package cli
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/vigolium/vigolium/internal/atomicfile"
 )
 
 // -o/--output for the -j read commands.
@@ -76,8 +74,8 @@ func jsonOutputDestination() string {
 // transcript cost the flag exists to remove, and a caller that wanted both can
 // ask twice.
 func writeJSONResultToFile(dest string, doc []byte, paged bool) error {
-	if err := atomicfile.WriteBytes(dest, doc); err != nil {
-		return fmt.Errorf("write %s: %w", dest, err)
+	if err := writeRequestedFile(dest, doc); err != nil {
+		return err
 	}
 	sum := sha256.Sum256(doc)
 	receipt := map[string]any{
@@ -102,15 +100,9 @@ func writeJSONResultToFile(dest string, doc []byte, paged bool) error {
 // Anything that is not a row-list envelope (db stats emits an object) is
 // complete by definition: there is no page to be a fraction of.
 func resultIsPaged(v any) bool {
-	env, ok := v.(*agentEnvelope)
+	env, items, ok := envelopeItemSlice(v)
 	if !ok {
 		return false
 	}
-	switch items := env.Items.(type) {
-	case []map[string]any:
-		return env.Total > int64(len(items))
-	case []any:
-		return env.Total > int64(len(items))
-	}
-	return false
+	return env.Total > int64(items.Len())
 }

@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
 	oliumresources "github.com/vigolium/vigolium/internal/resources/olium"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/diagnostics"
 	"github.com/vigolium/vigolium/pkg/olium/skill"
@@ -37,9 +39,18 @@ func writeInitMarker(vigoliumDir string) error {
 	return os.WriteFile(path, []byte(payload), 0644)
 }
 
-// initializeVigolium initializes Vigolium on first run
-// Creates default settings file and initializes database
-func initializeVigolium() error {
+// initializeVigolium initializes Vigolium on first run: it writes the default
+// config, profiles, extensions, prompts and skills into ~/.vigolium.
+//
+// createDefaultDB decides whether ~/.vigolium/database-vgnm.sqlite is created
+// too. It is false when the invocation has pinned a different store with --db
+// (or VIGOLIUM_DB_PATH, which applyDBPathEnv has already folded into globalDB
+// by the time ensureInitialized runs): creating the default database there
+// produces a seeded, schema-migrated file the run will never open, in the one
+// directory a user is most likely to inspect to find out where their data went.
+// The pinned store is created and seeded by whichever path first opens it,
+// exactly as it already is on a warm $HOME.
+func initializeVigolium(createDefaultDB bool) error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("failed to get home directory: %w", err)
@@ -85,7 +96,7 @@ func initializeVigolium() error {
 		zap.String("path", settingsPath))
 
 	// Initialize database
-	if settings.Database.Enabled {
+	if createDefaultDB && settings.Database.Enabled {
 		fmt.Fprintf(os.Stderr, "  %s Creating database schema...\n", terminal.InfoSymbol())
 		zap.L().Info("Initializing database...")
 
@@ -132,7 +143,14 @@ func initializeVigolium() error {
 	// Print success message
 	fmt.Fprintf(os.Stderr, "%s %s\n", terminal.SuccessSymbol(), terminal.BoldGreen("Mandatory configuration initialized."))
 	fmt.Fprintf(os.Stderr, "  %s Config: %s\n", terminal.InfoSymbol(), terminal.Cyan(config.ContractPath(settingsPath)))
-	fmt.Fprintf(os.Stderr, "  %s Database: %s\n", terminal.InfoSymbol(), terminal.Cyan(config.ContractPath(config.ExpandPath(settings.Database.SQLite.Path))))
+	// Only name the default database when this run actually created it. Naming
+	// a file that is not there, on a run that is deliberately using a different
+	// store, is the opposite of informative.
+	if createDefaultDB {
+		fmt.Fprintf(os.Stderr, "  %s Database: %s\n", terminal.InfoSymbol(), terminal.Cyan(config.ContractPath(config.ExpandPath(settings.Database.SQLite.Path))))
+	} else {
+		fmt.Fprintf(os.Stderr, "  %s Database: %s\n", terminal.InfoSymbol(), terminal.Cyan(config.ContractPath(config.ExpandPath(globalDB))))
+	}
 	fmt.Fprintf(os.Stderr, "  %s Docs & guides: %s\n", terminal.InfoSymbol(), terminal.Cyan("https://docs.vigolium.com"))
 	fmt.Fprintf(os.Stderr, "  %s Run %s for a full setup (browser, templates, and agentic-scan runtimes).\n",
 		terminal.TipSymbol(), terminal.BoldCyan("vigolium doctor --fix"))
@@ -311,10 +329,9 @@ func ensureCoreDeps() error {
 		return nil
 	}
 
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Debug("Core dep check: failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// DB intentionally omitted — neither the chromium nor nuclei-templates
@@ -431,7 +448,7 @@ func skipCoreDepCheck() bool {
 }
 
 // ensureInitialized checks if Vigolium is initialized and initializes if needed
-// This is called before any command runs
+// This is called before any command runs that shouldBootstrap admits.
 func ensureInitialized() error {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -445,6 +462,61 @@ func ensureInitialized() error {
 		return nil
 	}
 
-	// Not initialized - run initialization
-	return initializeVigolium()
+	// Not initialized - run initialization. The default database is created
+	// only when it is the store this invocation will use: a pinned --db (or a
+	// VIGOLIUM_DB_PATH that applyDBPathEnv has already folded into globalDB)
+	// means the default file would be created, seeded and never opened.
+	//
+	// --read-only deliberately does NOT suppress it. The spec called for that,
+	// but with no --db the default file IS the store the read is about to open,
+	// and openSQLiteReadOnly refuses a path that does not exist — so skipping
+	// here would turn a cold-$HOME `vigolium --read-only finding` from "0
+	// findings, exit 0" into "database file not readable". Creating an empty
+	// store the read then reports as empty modifies nothing that existed.
+	return initializeVigolium(strings.TrimSpace(globalDB) == "")
+}
+
+// bootstrapExemptCommands are the leaf command names that must not materialize
+// ~/.vigolium as a side effect of running.
+//
+// Bootstrap writes a config, a database, and four directories of presets. That
+// is the right thing to do before a scan and the wrong thing to do when the
+// user asked what version this is, asked for help, or — worst of all — pressed
+// tab. `__complete` runs on every shell completion, so a user who had never run
+// vigolium could create a seeded database by typing `vigolium ` and hitting tab
+// twice; `completion bash` is routinely run from a shell rc file, which made it
+// happen at login.
+//
+// `init` is exempt because it does the initialization itself, with its own
+// flags and its own reporting.
+var bootstrapExemptCommands = map[string]bool{
+	"init":                          true,
+	"version":                       true,
+	"help":                          true,
+	cobra.ShellCompRequestCmd:       true, // __complete
+	cobra.ShellCompNoDescRequestCmd: true, // __completeNoDesc
+}
+
+// shouldBootstrap reports whether this command may create ~/.vigolium.
+//
+// The root command with no subcommand only prints usage, and the `completion`
+// subtree only writes a shell script to stdout — neither touches a database or
+// a profile, and both are reached by users who have not yet decided to use
+// vigolium at all.
+func shouldBootstrap(cmd *cobra.Command) bool {
+	if cmd == nil {
+		return false
+	}
+	if cmd.Root() == cmd {
+		return false
+	}
+	if bootstrapExemptCommands[cmd.Name()] {
+		return false
+	}
+	for c := cmd; c != nil; c = c.Parent() {
+		if c.Name() == "completion" {
+			return false
+		}
+	}
+	return true
 }

@@ -28,6 +28,18 @@ type Config struct {
 
 	// ExcludePatterns are URL patterns to exclude (simple substring matching)
 	ExcludePatterns []string
+
+	// Exclude refuses a URL outright, ahead of every other check including the
+	// Mode shortcut.
+	//
+	// It carries the caller's EXPLICIT denial, which is why it is consulted even in
+	// ModeAny. A scope mode says how wide to crawl; "any" must not be read as
+	// permission to ignore a host or path the caller named and refused. Returning
+	// before the exclude check on ModeAny was the defect: a scan with explicit
+	// exclusions and the default "any" discovery scope queued every excluded link.
+	//
+	// nil = nothing is excluded.
+	Exclude func(*url.URL) bool
 }
 
 // Checker validates URL scope.
@@ -61,6 +73,12 @@ func NewChecker(config Config) *Checker {
 // IsInScope returns true if the URL should be included in discovery.
 func (s *Checker) IsInScope(u *url.URL) bool {
 	if u == nil {
+		return false
+	}
+
+	// Explicit exclusions are checked FIRST, ahead of the Any-mode shortcut below:
+	// a caller that refused a host by name has refused it in every mode.
+	if s.config.Exclude != nil && s.config.Exclude(u) {
 		return false
 	}
 

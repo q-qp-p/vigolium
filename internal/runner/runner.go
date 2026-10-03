@@ -72,12 +72,17 @@ type Runner struct {
 	closeOnce sync.Once   // guards one-time resource release (Close/Discard may race)
 	finalized atomic.Bool // set once RunNativeScan has written the terminal scan status
 
-	// currentPhase is the machine event stream's tracker for the phase running
+	// currentPhase is the outcome ledger and event tracker for the phase running
 	// right now, or nil between phases. Findings arrive on worker goroutines that
 	// know nothing about phases, so the phase they belong to is read from here
 	// rather than threaded through every module callback. Atomic because the
 	// phase loop swaps it while those workers are still draining.
 	currentPhase atomic.Pointer[phaseTracker]
+
+	// scanOutcome collects the per-phase outcomes this scan produced, which the
+	// finalizer persists on the scan row and the terminal banner reads. Reset at
+	// the top of RunNativeScan; see scanOutcome.
+	scanOutcome scanOutcome
 }
 
 // Finalized reports whether RunNativeScan already wrote the scan's terminal
@@ -95,6 +100,8 @@ func (r *Runner) Finalized() bool {
 type spideringOutcome struct {
 	ran      bool     // spidering actually executed (vs skipped / not in plan)
 	records  int      // total records saved across all spidered targets
+	lost     int      // records the capture admitted but failed to persist
+	complete bool     // every capture receipt was complete (nothing lost, drains finished)
 	sawSSO   bool     // at least one target redirected off-host to a login wall
 	ssoHosts []string // the off-host login/SSO hosts (excluded from fuzzing scope)
 }
@@ -119,6 +126,29 @@ type phaseInfra struct {
 
 	// Multi-session support for IDOR/BOLA testing
 	compareSessions []compareSession
+
+	// assessmentHeaders carries the primary session's credential headers for the
+	// phases that assess (dynamic-assessment, known-issue-scan) WITHOUT putting
+	// them on httpRequester, which discovery and spidering share. It is set only
+	// under session.use_in_discovery: false, whose documented meaning is "keep the
+	// credentials out of discovery" — not "do not authenticate at all", which is
+	// what happened before: the headers were resolved, dropped on the floor, and
+	// the assessment ran anonymously against an authenticated-only app.
+	// Empty under use_in_discovery: true, where the headers are already on the
+	// shared requester and on r.options.Headers.
+	assessmentHeaders []string
+
+	// authFailureReason records that session initialization failed and the scan is
+	// continuing without it (an explicitly configured auth with --auth-best-effort,
+	// or a DB-sourced session), as the outcome code naming WHY — a login that was
+	// cancelled, one that outlived the login budget, or any other failure. The
+	// assessment phases report it so a wall of 401s is attributable instead of
+	// looking like an unauthenticated app.
+	//
+	// Non-empty IS the "auth unavailable" fact: authFailureReason() always
+	// classifies a failure into some code, so a separate bool would only be
+	// another name for this field being set.
+	authFailureReason string
 }
 
 // compareSession pairs a named session with its dedicated HTTP requester.
@@ -172,6 +202,22 @@ func (s *SharedInfra) Close() {
 	}
 }
 
+// effectiveRateLimit is the single source of truth for the scan's global
+// requests-per-second cap: whatever is on Options, clamped to a non-negative
+// value. Both the limiter that enforces the cap and every surface that reports it
+// (the Speed banner line, the config snapshot) must read it from here.
+//
+// They used to disagree. The limiter was built from Options.RateLimit while the
+// banner and the snapshot printed settings.ScanningPace.RateLimit, so a scan
+// could advertise one rate and run at another — most visibly when a scanning
+// profile set a pace the CLI flag had already overridden.
+func effectiveRateLimit(opts *types.Options) int {
+	if opts == nil || opts.RateLimit < 0 {
+		return 0
+	}
+	return opts.RateLimit
+}
+
 // buildScanRateLimiter returns a global requests-per-second token bucket for the
 // scan, or nil when no explicit --rate-limit was set (perSec <= 0) so default
 // scans keep their current throughput. Burst equals the rate so a fresh scan can
@@ -190,7 +236,7 @@ func BuildSharedInfra(opts *types.Options, settings *config.Settings, repo *data
 
 	svc := &services.Services{
 		Options:     opts,
-		RateLimiter: buildScanRateLimiter(opts.RateLimit),
+		RateLimiter: buildScanRateLimiter(effectiveRateLimit(opts)),
 	}
 
 	if opts.ShouldUseHostError() {

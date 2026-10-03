@@ -62,6 +62,7 @@ func registerAgentJSONFlags(flags *pflag.FlagSet) {
 	flags.StringSliceVar(&jsonFields, "fields", nil, "Restrict --json output to these top-level keys (comma-separated, e.g. id,severity,url). An unknown name is an error, not a silent drop")
 	flags.BoolVar(&jsonCompact, "compact", false, "With --json, emit metadata only (omit request/response bodies). --markdown already compacts response bodies by default; use --full-body to render them whole")
 	flags.BoolVar(&jsonFullBody, "full-body", false, "Render complete request/response bodies (no truncation/stubbing) with --json, and whole (uncompacted) bodies with --markdown")
+	registerOutputBudgetFlag(flags)
 }
 
 // registerAgentRecordFlags adds the nested-record controls. Only `finding` embeds
@@ -112,14 +113,19 @@ func agentViewOptionsFromFlags() agentViewOptions {
 	}
 }
 
-// validateAgentViewFlags checks the projection names against the view that will
-// render them, before any query runs.
+// validateAgentViewFlags checks the output-shaping flags before any query runs:
+// the projection names against the view that will render them, and the output
+// budget against the mode that would enforce it. Every command registering
+// registerAgentJSONFlags calls it, so a flag added there is validated once.
 func validateAgentViewFlags(opts agentViewOptions, supported []string) error {
 	if err := validateFieldSelection(opts.fields, supported); err != nil {
 		return err
 	}
 	// --record-fields always describes an HTTP record, whichever command carries it.
-	return validateFieldSelection(opts.recordFields, trafficViewFields)
+	if err := validateFieldSelection(opts.recordFields, trafficViewFields); err != nil {
+		return err
+	}
+	return validateOutputBudgetFlag(globalJSON)
 }
 
 func normalizeFieldList(in []string) []string {
@@ -140,16 +146,38 @@ func normalizeFieldList(in []string) []string {
 // under `"artifact": "json_result"` would be a lie, and a receipt that could
 // itself be redirected has nowhere left to report.
 func writeAgentJSON(v any) error {
-	dest := jsonOutputDestination()
-	if dest == "" {
-		return writeAgentJSONToStdout(v)
+	// Attached here rather than at each call site: every -j read that can be
+	// sourced from --glob-db funnels through this function, and a per-command
+	// hook is one a new command forgets — which is how a merged read with a
+	// skipped file reported a clean short answer in the first place.
+	if env, ok := v.(*agentEnvelope); ok {
+		attachGlobSources(env)
 	}
-	doc, err := encodeAgentJSON(v)
+	// After attachGlobSources, because glob_sources is part of the document the
+	// budget is measured against, and before any destination is chosen: a
+	// budgeted document is the same document whether it goes to stdout or to a
+	// file, which is the invariant encodeAgentJSON exists to hold.
+	//
+	// It hands back the bytes it measured, so a budgeted document is encoded once
+	// here rather than once to decide where to cut and again to emit.
+	doc, err := applyOutputBudget(v, maxOutputBytes)
 	if err != nil {
 		return err
 	}
-	jsonResultEmitted = true
-	return writeJSONResultToFile(dest, doc, resultIsPaged(v))
+	if doc == nil {
+		if doc, err = encodeAgentJSON(v); err != nil {
+			return err
+		}
+	}
+	if dest := jsonOutputDestination(); dest != "" {
+		// Deliberately NOT latching here: nothing has reached stdout yet. The latch
+		// belongs after publication, and writeJSONResultToFile sets it when it writes
+		// the receipt. Latching first meant a failed atomicfile.WriteBytes returned an
+		// error that the root handler then refused to frame, so `-j -o <unwritable>`
+		// exited non-zero with completely empty stdout.
+		return writeJSONResultToFile(dest, doc, resultIsPaged(v))
+	}
+	return writeAgentJSONDoc(doc)
 }
 
 // writeAgentJSONToStdout writes v to stdout. It is the only path that touches
@@ -159,7 +187,14 @@ func writeAgentJSONToStdout(v any) error {
 	if err != nil {
 		return err
 	}
-	_, err = os.Stdout.Write(doc)
+	return writeAgentJSONDoc(doc)
+}
+
+// writeAgentJSONDoc writes an already-encoded document and latches. Separate
+// from writeAgentJSONToStdout so a caller that has the exact bytes in hand —
+// applyOutputBudget measured them — does not encode the same value twice.
+func writeAgentJSONDoc(doc []byte) error {
+	_, err := os.Stdout.Write(doc)
 	jsonResultEmitted = true
 	return err
 }
@@ -191,6 +226,18 @@ func encodeAgentJSON(v any) ([]byte, error) {
 // compact document per line. Set only by a repeated read (--watch), where a
 // single document is not the shape of the answer.
 var jsonStreamMode bool
+
+// jsonStreamFramed records that this invocation's stdout is an NDJSON stream, so
+// the one-document latch below does not apply to it.
+//
+// Set when --watch enters stream mode and never cleared, including after
+// jsonStreamMode is reset on return: the frame the stream was written in is a
+// property of the whole invocation, and the error line is appended once the
+// loop has already exited. A stream that stops because the read broke must say
+// so on the stream — the alternative is a consumer tailing lines that simply
+// stop arriving, with the cause only in the exit code of a process it may not
+// be waiting on.
+var jsonStreamFramed bool
 
 // jsonResultEmitted records that a command has already written its JSON result
 // document to stdout.

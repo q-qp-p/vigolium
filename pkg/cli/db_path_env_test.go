@@ -8,6 +8,8 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 )
 
 // resetDBPathEnvGlobals restores every global applyDBPathEnv touches, so a case
@@ -242,4 +244,119 @@ func TestDBPathEnvNoticeSuppression(t *testing.T) {
 			assert.Equal(t, tc.want, n > 0, "notice printed")
 		})
 	}
+}
+
+// --stateless=false is an operator saying "I know about -S and I do not want
+// it". Reading pflag's Changed as "enabled" dropped the VIGOLIUM_DB_PATH pin, so
+// the scan wrote to the default database — the exact silent redirect the pin
+// rule exists to forbid.
+func TestDBPathEnvKeepsPinWhenStatelessExplicitlyFalse(t *testing.T) {
+	resetDBPathEnvGlobals(t)
+	path := seedDBFile(t)
+	t.Setenv(dbPathEnvVar, path)
+
+	cmd := statelessCmd("scan")
+	require.NoError(t, cmd.Flags().Set("stateless", "false"))
+
+	require.NoError(t, applyDBPathEnv(cmd))
+
+	assert.Equal(t, path, globalDB,
+		"--stateless=false must keep the pinned database, not fall back to the default")
+}
+
+// flagOn is the shared predicate behind the three sites that used Changed.
+func TestFlagOn(t *testing.T) {
+	newCmd := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "probe"}
+		var b bool
+		cmd.Flags().BoolVar(&b, "flag", false, "")
+		cmd.Flags().String("name", "", "")
+		return cmd
+	}
+
+	t.Run("untouched is off", func(t *testing.T) {
+		assert.False(t, flagOn(newCmd(), "flag"))
+	})
+	t.Run("=true is on", func(t *testing.T) {
+		cmd := newCmd()
+		require.NoError(t, cmd.Flags().Set("flag", "true"))
+		assert.True(t, flagOn(cmd, "flag"))
+	})
+	t.Run("=false is off", func(t *testing.T) {
+		cmd := newCmd()
+		require.NoError(t, cmd.Flags().Set("flag", "false"))
+		assert.False(t, flagOn(cmd, "flag"), "an explicit false must not read as enabled")
+	})
+	t.Run("missing flag is off", func(t *testing.T) {
+		assert.False(t, flagOn(newCmd(), "nope"))
+	})
+	t.Run("nil command is off", func(t *testing.T) {
+		assert.False(t, flagOn(nil, "flag"))
+	})
+	t.Run("a set non-bool is on", func(t *testing.T) {
+		cmd := newCmd()
+		require.NoError(t, cmd.Flags().Set("name", "false"))
+		assert.True(t, flagOn(cmd, "name"),
+			"for a non-bool, 'set at all' is the only available meaning — even when the value reads as false")
+	})
+}
+
+// `ingest -S=false` asked for ingestion WITHOUT scanning. It used to turn
+// scan-on-receive on.
+func TestDeprecatedScanOnReceiveFalse(t *testing.T) {
+	orig := globalScanOnReceive
+	t.Cleanup(func() { globalScanOnReceive = orig })
+
+	newIngest := func() *cobra.Command {
+		cmd := &cobra.Command{Use: "ingest"}
+		registerScanOnReceiveFlags(cmd.Flags(), "")
+		return cmd
+	}
+
+	globalScanOnReceive = false
+	cmd := newIngest()
+	require.NoError(t, cmd.Flags().Set("scan-on-receive-shorthand", "false"))
+	applyDeprecatedScanOnReceive(cmd)
+	assert.False(t, globalScanOnReceive, "-S=false must not enable scan-on-receive")
+
+	globalScanOnReceive = false
+	cmd = newIngest()
+	require.NoError(t, cmd.Flags().Set("scan-on-receive-shorthand", "true"))
+	applyDeprecatedScanOnReceive(cmd)
+	assert.True(t, globalScanOnReceive, "-S=true still folds into --scan-on-receive")
+}
+
+// --read-only rejects flags that WRITE. An explicitly-false writer flag writes
+// nothing, so rejecting it was a conflict that did not exist.
+func TestReadOnlyAcceptsWriterFlagFalse(t *testing.T) {
+	orig := globalReadOnly
+	origRequested := clicommon.ReadOnlyRequested
+	t.Cleanup(func() {
+		globalReadOnly = orig
+		clicommon.ReadOnlyRequested = origRequested
+	})
+
+	newTraffic := func() *cobra.Command {
+		root := &cobra.Command{Use: "vigolium"}
+		cmd := &cobra.Command{Use: "traffic"}
+		var save bool
+		cmd.Flags().BoolVar(&save, "save-to-vigolium-db", false, "")
+		root.AddCommand(cmd)
+		return cmd
+	}
+
+	globalReadOnly = true
+
+	clicommon.ReadOnlyRequested = false
+	cmd := newTraffic()
+	require.NoError(t, cmd.Flags().Set("save-to-vigolium-db", "false"))
+	require.NoError(t, applyReadOnlyMode(cmd), "--save-to-vigolium-db=false writes nothing")
+	assert.True(t, clicommon.ReadOnlyRequested)
+
+	clicommon.ReadOnlyRequested = false
+	cmd = newTraffic()
+	require.NoError(t, cmd.Flags().Set("save-to-vigolium-db", "true"))
+	err := applyReadOnlyMode(cmd)
+	require.Error(t, err, "--save-to-vigolium-db=true still conflicts")
+	assert.Equal(t, ExitUsageError, classifyExitCode(err))
 }

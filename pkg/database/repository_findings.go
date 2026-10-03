@@ -56,10 +56,34 @@ func (r *Repository) SaveFinding(ctx context.Context, event *output.ResultEvent,
 // finding can't drop the rest — preserving the error isolation of per-finding
 // SaveFinding while keeping the fast path a single transaction.
 func (r *Repository) SaveFindingsBatch(ctx context.Context, writes []FindingWrite) error {
+	return firstResultErr(r.SaveFindingsBatchResults(ctx, writes))
+}
+
+// SaveFindingsBatchResults is SaveFindingsBatch with the per-finding outcomes,
+// aligned 1:1 with writes — results[i] describes writes[i], including the entries
+// this method itself rejects (a nil Event or one that will not convert, each
+// carrying its own Err at its own index).
+//
+// The alignment is what makes a partial batch countable. SaveFindingsBatch
+// collapses to a single error, so FindingWriter could only ever attribute a
+// failure to the whole batch: one bad finding in a batch of sixty-four was
+// reported as sixty-four dropped findings, and a transaction that failed and then
+// succeeded on retry for all but one was reported the same way. Operators read
+// those counters to decide whether a scan's results are complete.
+func (r *Repository) SaveFindingsBatchResults(ctx context.Context, writes []FindingWrite) []FindingSaveResult {
+	results := make([]FindingSaveResult, len(writes))
+	if len(writes) == 0 {
+		return results
+	}
+
+	// findings holds only the convertible entries; index maps each back to its
+	// position in writes so the core's aligned result can be scattered home.
 	findings := make([]*Finding, 0, len(writes))
+	index := make([]int, 0, len(writes))
 	for i := range writes {
 		w := &writes[i]
 		if w.Event == nil {
+			results[i].Err = fmt.Errorf("invalid ResultEvent")
 			continue
 		}
 		f := &Finding{
@@ -69,14 +93,20 @@ func (r *Repository) SaveFindingsBatch(ctx context.Context, writes []FindingWrit
 		}
 		if err := f.FromResultEvent(w.Event); err != nil {
 			zap.L().Warn("SaveFindingsBatch: skipping unconvertible finding", zap.Error(err))
+			results[i].Err = fmt.Errorf("failed to convert finding: %w", err)
 			continue
 		}
 		findings = append(findings, f)
+		index = append(index, i)
 	}
 	if len(findings) == 0 {
-		return nil
+		return results
 	}
-	return firstResultErr(r.saveFindingsBatchCore(ctx, findings))
+
+	for j, res := range r.saveFindingsBatchCore(ctx, findings) {
+		results[index[j]] = res
+	}
+	return results
 }
 
 // saveFindingIDB inserts a single finding using the given bun.IDB, which may be

@@ -3,6 +3,7 @@
 package condition
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -54,7 +55,7 @@ func TestIntegrationWaitConditionSlowWidget(t *testing.T) {
 		WithPolling(100 * time.Millisecond)
 
 	start := time.Now()
-	result := cond.Wait(page)
+	result := cond.Wait(context.Background(), page)
 	elapsed := time.Since(start)
 
 	if result != WaitSuccess {
@@ -73,7 +74,17 @@ func TestIntegrationWaitConditionSlowWidget(t *testing.T) {
 
 // TestIntegrationWaitConditionTimeout tests timeout behavior.
 func TestIntegrationWaitConditionTimeout(t *testing.T) {
-	server := httptest.NewServer(http.FileServer(http.Dir("testdata")))
+	// Not testWaitCondition.html: its widget lands 1s after load, and the wait
+	// below only starts once Navigate returns, so a slow navigation on a loaded
+	// host let the widget arrive inside the 500ms window. A 10s widget keeps the
+	// margin far wider than any navigation.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(`<!doctype html><html><body><div id="panel">loading...</div>
+			<script>setTimeout(function () {
+				document.getElementById("panel").innerHTML = "<div id='SLOW_WIDGET'>LOADED_SLOW_WIDGET</div>";
+			}, 10000);</script></body></html>`))
+	}))
 	defer server.Close()
 
 	b := createTestBrowser(t, server.URL)
@@ -82,15 +93,15 @@ func TestIntegrationWaitConditionTimeout(t *testing.T) {
 		t.Fatalf("Failed to create page: %v", err)
 	}
 
-	if err := page.Navigate(server.URL + "/testWaitCondition.html"); err != nil {
+	if err := page.Navigate(server.URL + "/"); err != nil {
 		t.Fatalf("Failed to navigate: %v", err)
 	}
 
-	// Wait for element that won't appear (widget loads in 1s, but we timeout in 500ms)
+	// Wait for an element that won't appear in time (it loads after 10s, the wait gives up after 500ms)
 	cond := NewWaitCondition("#SLOW_WIDGET", 500*time.Millisecond).
 		WithPolling(50 * time.Millisecond)
 
-	result := cond.Wait(page)
+	result := cond.Wait(context.Background(), page)
 
 	if result != WaitTimeout {
 		t.Errorf("Wait() = %d, want %d (WaitTimeout)", result, WaitTimeout)
@@ -116,7 +127,7 @@ func TestIntegrationWaitConditionURLMismatch(t *testing.T) {
 	cond := NewWaitCondition("#SLOW_WIDGET", 1*time.Second).
 		ForURL("http://other-site.com/.*")
 
-	result := cond.Wait(page)
+	result := cond.Wait(context.Background(), page)
 
 	if result != WaitURLMismatch {
 		t.Errorf("Wait() = %d, want %d (WaitURLMismatch)", result, WaitURLMismatch)
@@ -142,7 +153,7 @@ func TestIntegrationWaitConditionImmediateSuccess(t *testing.T) {
 	cond := NewWaitCondition("#panel", 1*time.Second)
 
 	start := time.Now()
-	result := cond.Wait(page)
+	result := cond.Wait(context.Background(), page)
 	elapsed := time.Since(start)
 
 	if result != WaitSuccess {
@@ -171,12 +182,12 @@ func TestIntegrationWaitForElement(t *testing.T) {
 	}
 
 	// Should find existing element
-	if !WaitForElement(page, "#SHOULD_ALWAYS_BE_ON_THIS_PAGE", 1*time.Second) {
+	if !WaitForElement(context.Background(), page, "#SHOULD_ALWAYS_BE_ON_THIS_PAGE", 1*time.Second) {
 		t.Error("WaitForElement should find existing element")
 	}
 
 	// Should not find non-existent element
-	if WaitForElement(page, "#nonexistent", 200*time.Millisecond) {
+	if WaitForElement(context.Background(), page, "#nonexistent", 200*time.Millisecond) {
 		t.Error("WaitForElement should not find non-existent element")
 	}
 }
@@ -202,7 +213,7 @@ func TestIntegrationWaitAll(t *testing.T) {
 		NewWaitCondition("#SHOULD_ALWAYS_BE_ON_THIS_PAGE", 1*time.Second),
 	}
 
-	result := WaitAll(page, conditions...)
+	result := WaitAll(context.Background(), page, conditions...)
 	if result != WaitSuccess {
 		t.Errorf("WaitAll() = %d, want %d (WaitSuccess)", result, WaitSuccess)
 	}
@@ -230,7 +241,7 @@ func TestIntegrationWaitAny(t *testing.T) {
 		NewWaitCondition("#nonexistent2", 1*time.Second),
 	}
 
-	result := WaitAny(page, conditions...)
+	result := WaitAny(context.Background(), page, conditions...)
 	if result != WaitSuccess {
 		t.Errorf("WaitAny() = %d, want %d (WaitSuccess)", result, WaitSuccess)
 	}
@@ -255,7 +266,7 @@ func TestIntegrationWaitConditionVerifyContent(t *testing.T) {
 	cond := NewWaitCondition("#SLOW_WIDGET", 3*time.Second).
 		WithPolling(100 * time.Millisecond)
 
-	result := cond.Wait(page)
+	result := cond.Wait(context.Background(), page)
 	if result != WaitSuccess {
 		t.Fatalf("Wait failed: %d", result)
 	}

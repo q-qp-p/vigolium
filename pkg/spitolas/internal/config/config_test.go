@@ -483,8 +483,8 @@ func TestWaitConditionConfig(t *testing.T) {
 
 	// Check first wait condition
 	wait := cfg.WaitConditions[0]
-	if wait.URLPattern != "/slow/" {
-		t.Errorf("wait.URLPattern = %q, want /slow/", wait.URLPattern)
+	if wait.URLMatch != "/slow/" || wait.Matcher != "" {
+		t.Errorf("wait.URLMatch = %q (matcher %q), want /slow/ (substring)", wait.URLMatch, wait.Matcher)
 	}
 	if wait.Selector != "#content" {
 		t.Errorf("wait.Selector = %q, want #content", wait.Selector)

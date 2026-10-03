@@ -1,4 +1,4 @@
-.PHONY: build build-prof build-embedded build-all snapshot release public public-release github-release prepare-public-scripts clean test test-unit test-integration test-spitolas-browser test-e2e test-e2e-api test-e2e-agent test-e2e-rest-scan test-e2e-postgres test-canary sanity-check test-e2e-vampi test-e2e-dvwa test-e2e-juiceshop test-e2e-browser-fallback test-e2e-piolium test-benchmark test-benchmark-whitebox test-benchmark-blackbox test-benchmark-all test-benchmark-crapi test-benchmark-vuln-java test-benchmark-vuln-nginx test-benchmark-coverage test-agent-benchmark test-agent-parsing test-agent-quality test-agent-handoff test-agent-benchmark-e2e benchmark-agent-generate test-coverage coverage-gate coverage-combined test-coverage-check test-race test-ci test-xbow test-xbow-ssti test-xbow-xss test-xbow-sqli test-xbow-lfi test-xbow-cmdi test-xbow-ssrf test-xbow-xxe xbow-build lint verify-generated fmt tidy deps deps-chrome deps-chrome-update install install-gotestsum swagger help postgres-up postgres-down postgres-logs postgres-status crapi-up crapi-down crapi-logs crapi-status juiceshop-up juiceshop-down juiceshop-logs juiceshop-status vampi-up vampi-down vampi-logs vampi-status vulnerable-java-up vulnerable-java-down vulnerable-java-logs vulnerable-java-status vulnerable-nginx-up vulnerable-nginx-down vulnerable-nginx-logs vulnerable-nginx-status apps-up apps-down docker docker-build docker-build-prod docker-run docker-push docker-buildx-setup docker-publish update-jstangle ensure-jstangle sync-audit update-audit ensure-audit ensure-audit-dist restage-host-audit build-audit update-ui ssh-testbed-keygen ssh-testbed-up ssh-testbed-down ssh-testbed-status ssh-testbed-logs generate-metadata prepare-release-scripts cdn-sync bump-version npm-build npm-pack npm-publish
+.PHONY: build build-prof build-embedded build-all snapshot release public public-release github-release prepare-public-scripts clean test test-unit test-integration test-spitolas-browser test-browser-conformance test-e2e test-e2e-api test-e2e-agent test-e2e-rest-scan test-e2e-postgres test-canary sanity-check test-e2e-vampi test-e2e-dvwa test-e2e-juiceshop test-e2e-browser-fallback test-e2e-piolium test-benchmark test-benchmark-whitebox test-benchmark-blackbox test-benchmark-all test-benchmark-crapi test-benchmark-vuln-java test-benchmark-vuln-nginx test-benchmark-coverage test-agent-benchmark test-agent-parsing test-agent-quality test-agent-handoff test-agent-benchmark-e2e benchmark-agent-generate test-coverage coverage-gate coverage-combined test-coverage-check test-race test-ci test-xbow test-xbow-ssti test-xbow-xss test-xbow-sqli test-xbow-lfi test-xbow-cmdi test-xbow-ssrf test-xbow-xxe xbow-build lint verify-generated fmt tidy deps deps-chrome deps-chrome-update install install-gotestsum swagger help postgres-up postgres-down postgres-logs postgres-status crapi-up crapi-down crapi-logs crapi-status juiceshop-up juiceshop-down juiceshop-logs juiceshop-status vampi-up vampi-down vampi-logs vampi-status vulnerable-java-up vulnerable-java-down vulnerable-java-logs vulnerable-java-status vulnerable-nginx-up vulnerable-nginx-down vulnerable-nginx-logs vulnerable-nginx-status apps-up apps-down docker docker-build docker-build-prod docker-run docker-push docker-buildx-setup docker-publish update-jstangle ensure-jstangle sync-audit update-audit ensure-audit ensure-audit-dist restage-host-audit build-audit update-ui ssh-testbed-keygen ssh-testbed-up ssh-testbed-down ssh-testbed-status ssh-testbed-logs generate-metadata prepare-release-scripts cdn-sync bump-version npm-build npm-pack npm-publish
 # Phony targets defined in their own sections below (declared here so a stray
 # same-named file can never shadow them).
 .PHONY: all build-linux build-darwin build-windows deps-chrome-cft sync-platform sync-skills \
@@ -157,6 +157,12 @@ test: install-gotestsum ensure-jstangle
 	$(TESTCMD) $(TESTFLAGS) $$(go list ./... | grep -Ev '$(GOLIST_EXCLUDE)')
 
 # Run tests with race detector (see GOLIST_EXCLUDE for what's filtered)
+# Race-sensitive packages (goroutine shutdown, ctx-aware polling, shared
+# counters) whose tests are meant to run here: pkg/spitolas/internal/network
+# (capture writer receipt/drain, capture timing), pkg/spitolas/internal/condition
+# (ctx-aware wait polling), pkg/spitolas/internal/browser (launch/tab-creation
+# cancellation, dialog handling), pkg/spitolas/internal/crawler and
+# pkg/spitolas/internal/form (stats, policy gates, upload fixtures).
 test-race: install-gotestsum ensure-jstangle
 	@echo "$(PREFIX) Running tests with race detector..."
 	$(TESTCMD) $(TESTFLAGS) -race $$(go list ./... | grep -Ev '$(GOLIST_EXCLUDE)')
@@ -180,6 +186,26 @@ test-benchmark: test-integration
 test-spitolas-browser: install-gotestsum
 	@echo "$(PREFIX) Running spitolas browser integration tests (real headless browser)..."
 	$(TESTCMD) $(TESTFLAGS) -tags=integration -timeout 15m ./pkg/spitolas/internal/browser/...
+
+# Browser conformance: the integration contracts of the browser crawler —
+# launcher and security flags, dialog and submit-guard policy, form fill
+# outcomes and form scoping, POST-submission attribution, crawler gates, wait
+# conditions — against a real headless browser and local httptest fixtures (no
+# Docker, no internet). These files are //go:build integration, so the -short
+# unit run never executes them. Fails up front when no browser can be
+# launched, so a host without one is never reported green. -p 1 keeps the
+# packages from competing for the CPU, which the timing-sensitive cases need.
+# The crawler package alone runs over 20m of real crawls over the Crawljax site
+# fixtures (test/spitolas/testdata/html/site), hence the 45m binary timeout.
+CONFORMANCE_PKGS=./pkg/spitolas/internal/browser/... ./pkg/spitolas/internal/form/... ./pkg/spitolas/internal/crawler/... ./pkg/spitolas/internal/condition/...
+test-browser-conformance: install-gotestsum
+	@echo "$(PREFIX) Checking that a headless browser can be launched..."
+	@out="$$($(GOTEST) -tags=integration -count=1 -run '^TestConformancePrecheck$$' ./pkg/spitolas/internal/browser/ 2>&1)" || { \
+		echo "$$out" | tail -n 5; \
+		echo "$(PREFIX) No launchable headless browser. Install Google Chrome or Chromium, or run 'vigolium doctor --fix --only chrome' to fetch Chrome for Testing, then re-run."; \
+		exit 1; }
+	@echo "$(PREFIX) Running browser conformance tests (real headless browser)..."
+	$(TESTCMD) $(TESTFLAGS) -tags=integration -p 1 -count=1 -timeout 45m $(CONFORMANCE_PKGS)
 
 # Run E2E tests (requires Docker)
 test-e2e: install-gotestsum
@@ -1246,10 +1272,11 @@ public-release: prepare-public-scripts ensure-audit-dist ensure-jstangle-dist
 			$(GOBUILD) $(LDFLAGS) \
 			-o $${stage_dir}/$${bin_name} ./cmd/vigolium \
 			|| exit 1; \
+		cp LICENSE THIRD_PARTY_NOTICES.md $${stage_dir}/ || exit 1; \
 		if [ "$${GOOS}" = "windows" ]; then \
-			(cd $${stage_dir} && zip -q -X ../$${pkg_name}.zip $${bin_name}) || exit 1; \
+			(cd $${stage_dir} && zip -q -X ../$${pkg_name}.zip $${bin_name} LICENSE THIRD_PARTY_NOTICES.md) || exit 1; \
 		else \
-			COPYFILE_DISABLE=1 tar --no-xattrs -czf $(PUBLIC_DIST_DIR)/$${pkg_name}.tar.gz -C $${stage_dir} $${bin_name} \
+			COPYFILE_DISABLE=1 tar --no-xattrs -czf $(PUBLIC_DIST_DIR)/$${pkg_name}.tar.gz -C $${stage_dir} $${bin_name} LICENSE THIRD_PARTY_NOTICES.md \
 				|| exit 1; \
 		fi; \
 		rm -rf $${stage_dir}; \
@@ -1262,8 +1289,7 @@ public-release: prepare-public-scripts ensure-audit-dist ensure-jstangle-dist
 	@echo "$(PREFIX) Writing metadata.json..."
 	@printf '{\n  "version": "%s",\n  "commit": "%s",\n  "build_time": "%s"\n}\n' \
 		"$(VERSION)" "$(COMMIT_HASH)" "$(BUILD_TIME)" > $(PUBLIC_DIST_DIR)/metadata.json
-	@echo "$(PREFIX) Cleaning old files at r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/..."
-	@mc rm --recursive --force r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/ || true
+	# Retain older versioned archives for installed package recipes and rollbacks.
 	@echo "$(PREFIX) Uploading public artifacts to R2..."
 	mc cp $(PUBLIC_DIST_DIR)/*.tar.gz r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/
 	mc cp $(PUBLIC_DIST_DIR)/*.zip r2/vigolium-dist/$(R2_PUBLIC_PREFIX)/
@@ -1276,11 +1302,27 @@ public-release: prepare-public-scripts ensure-audit-dist ensure-jstangle-dist
 # then publish those same artifacts to a GitHub release via
 # build/scripts/github-release.sh. The release tag/title is the current version
 # ($(VERSION)) — the script creates + pushes that git tag if it does not exist —
-# and the body is that version's section pulled from CHANGELOG.md. Re-running for
-# an unchanged version edits the existing release in place — refreshing the notes
-# and re-uploading (clobbering) every artifact — instead of failing.
-github-release: public-release
+# and the body is that version's section pulled from CHANGELOG.md. Existing
+# releases are never replaced: downstream package managers pin archive hashes.
+github-release:
+	@command -v gh >/dev/null 2>&1 || { echo "GitHub CLI (gh) is required." >&2; exit 1; }
+	@if gh release view "$(VERSION)" >/dev/null 2>&1; then \
+		echo "Release $(VERSION) already exists. Bump VERSION before publishing new binaries." >&2; exit 1; \
+	fi
+	@$(MAKE) public-release
 	@VERSION="$(VERSION)" PUBLIC_DIST_DIR="$(PUBLIC_DIST_DIR)" bash build/scripts/github-release.sh
+
+# Generate recipes from verified public archives. No builds or publishing.
+.PHONY: packages packages-test packages-linux
+packages:
+	python3 build/packaging/generate.py --dist "$(PUBLIC_DIST_DIR)"
+
+packages-test:
+	python3 -m unittest discover -s build/packaging -p 'test_*.py'
+
+# Requires `make packages` and nFPM on PATH. Builds both Linux architectures.
+packages-linux:
+	python3 build/packaging/build_native.py
 
 # Sync scripts to R2 CDN without rebuilding
 cdn-sync: prepare-release-scripts generate-metadata
@@ -1530,6 +1572,7 @@ help:
 	@echo "    make test-race        Run all tests with race detector"
 	@echo "    make test-unit        Run unit tests (fast, no external deps)"
 	@echo "    make test-integration Run integration tests (XSS gym benchmark)"
+	@echo "    make test-browser-conformance  Browser crawler integration contracts (needs a local Chrome/Chromium)"
 	@echo "    make test-benchmark   Run benchmark tests (alias for test-integration)"
 	@echo "    make test-e2e         Run E2E tests (requires Docker)"
 	@echo "    make test-e2e-api     Run API E2E tests only (server endpoints)"
@@ -1635,7 +1678,10 @@ help:
 	@echo "    make snapshot         Build local snapshot release (no publish)"
 	@echo "    make release          Build and upload nightly artifacts to R2 (cdn.vigolium.com/vigolium-nightly-release/)"
 	@echo "    make public-release   Build cross-platform tarballs and upload to the public/stable R2 prefix (cdn.vigolium.com/vigolium-release/)"
-	@echo "    make github-release   Run public-release, then publish the artifacts to a GitHub release (notes from CHANGELOG.md; edits in place if the version is unchanged)"
+	@echo "    make github-release   Publish a new version to R2 and GitHub (existing GitHub releases are never replaced)"
+	@echo "    make packages         Verify public archives and generate AUR, DEB/RPM, Scoop, WinGet, Nix, and Snap recipes"
+	@echo "    make packages-linux   Build DEB/RPM packages from generated recipes (requires nFPM)"
+	@echo "    make packages-test    Run package generation and release protection tests"
 	@echo "    make cdn-sync         Sync nightly scripts (install.sh, bootstrap.sh) to R2 CDN"
 	@echo "    make bump-version     Bump pkg/cli/version.go (PART=patch|minor|major|pre|release, DRY_RUN=1)"
 	@echo "    make npm-build        Stage @vigolium/vigolium npm packages into build/dist-npm/"

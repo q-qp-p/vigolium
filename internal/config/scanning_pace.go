@@ -162,6 +162,86 @@ func PhaseSectionNames() []string {
 	return names
 }
 
+// phasePaceSupport states which pace fields each phase actually ENFORCES.
+//
+// It exists because a pace section accepts all three dials for every phase while
+// most phases read only one of them. `--rate-limit spidering=5` parsed, was
+// written into the config, appeared in the phase header and in the scan.started
+// pace table, and changed nothing: the spidering phase has no limiter to put it
+// in. A number presented as effective and silently ignored is worse than no knob
+// at all, so display, flag validation and the pace table all read this one table.
+//
+// Honest as of improvement-2 WP11. Flipping an entry to true is part of the
+// change that makes it true, never a separate bookkeeping step.
+var phasePaceSupport = map[string]struct{ Concurrency, RateLimit, MaxPerHost bool }{
+	// Deparos engine threads, and (WP11) a per-engine token bucket. Targets run
+	// sequentially, so the per-engine bucket is the phase-wide rate.
+	"discovery": {Concurrency: true, RateLimit: true},
+	// The crawler is a single browser with no limiter fields at all.
+	"spidering": {},
+	// probePaceInfra builds a phase-local requester for all three.
+	"probe": {Concurrency: true, RateLimit: true, MaxPerHost: true},
+	// Workers only: the limiter and host semaphore are scan-wide.
+	"dynamic-assessment": {Concurrency: true},
+	// Nuclei owns its own HTTP stack and takes both.
+	"known-issue-scan": {Concurrency: true, RateLimit: true},
+	// Archive/API fan-out, bounded by worker count.
+	"external-harvest": {Concurrency: true},
+}
+
+// Pace field names, as they appear in warnings and in the support table.
+const (
+	PaceFieldConcurrency = "concurrency"
+	PaceFieldRateLimit   = "rate_limit"
+	PaceFieldMaxPerHost  = "max_per_host"
+)
+
+// DiscoveryRateLimit resolves the requests-per-second ceiling the discovery
+// engine will enforce. 0 means unpaced.
+//
+// Only an EXPLICIT setting counts: `scanning_pace.discovery.rate_limit`, or a
+// typed `--rate-limit` on the command line. It deliberately does NOT fall through
+// to the resolved global rate the way every other pace field does, because that
+// rate carries a 100 rps default — discovery has never been paced, and adopting
+// that default would quietly change the speed of every scan that merely loaded a
+// config file (triage C13).
+//
+// The section value wins over the global flag: it is the more specific statement,
+// and it is the form `--rate-limit discovery=N` writes. It lives here rather than
+// in the runner so the number the banner and the scan.started pace table print is
+// the number buildDeparosConfig hands the engine.
+//
+// Nil-safe on both arguments.
+func (c *ScanningPaceConfig) DiscoveryRateLimit(opts *types.Options) int {
+	if c != nil && c.Discovery.RateLimit > 0 {
+		return c.Discovery.RateLimit
+	}
+	if opts != nil && opts.RateLimitExplicitlySet && opts.RateLimit > 0 {
+		return opts.RateLimit
+	}
+	return 0
+}
+
+// PhasePaceSupports reports whether phase actually enforces the named pace field.
+// An unknown phase or field reports false — the fail-closed direction, since the
+// consequence is a warning or an omitted table entry rather than a changed scan.
+func PhasePaceSupports(phase, field string) bool {
+	support, ok := phasePaceSupport[phase]
+	if !ok {
+		return false
+	}
+	switch field {
+	case PaceFieldConcurrency:
+		return support.Concurrency
+	case PaceFieldRateLimit:
+		return support.RateLimit
+	case PaceFieldMaxPerHost:
+		return support.MaxPerHost
+	default:
+		return false
+	}
+}
+
 // ResolvePhase merges common values with per-phase overrides for the named phase.
 // Non-zero per-phase values win over common values.
 func (c *ScanningPaceConfig) ResolvePhase(phase string) ResolvedPhasePace {
@@ -227,6 +307,27 @@ func (c *ScanningPaceConfig) ResolvePhase(phase string) ResolvedPhasePace {
 // boolPtr returns a pointer to a bool value. Used for optional YAML fields.
 func boolPtr(b bool) *bool { return &b }
 
+// validateNonNegDuration parses a duration setting and rejects negative values.
+//
+// Parsing alone was not enough: "-5m" is a perfectly valid time.Duration, so a
+// negative budget passed validation and then flowed into context.WithTimeout as
+// an already-expired deadline. The phase it governed did nothing and reported no
+// error. An empty string means "unset" and is always accepted; what a zero means
+// is per-setting and is decided by the consumer, not here.
+func validateNonNegDuration(field, s string) error {
+	if s == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("%s: invalid duration %q: %w", field, s, err)
+	}
+	if d < 0 {
+		return fmt.Errorf("%s: duration must not be negative, got %q", field, s)
+	}
+	return nil
+}
+
 // Validate rejects negative values and invalid duration strings.
 func (c *ScanningPaceConfig) Validate() error {
 	if c.Concurrency < 0 {
@@ -238,10 +339,8 @@ func (c *ScanningPaceConfig) Validate() error {
 	if c.MaxPerHost < 0 {
 		return fmt.Errorf("scanning_pace.max_per_host must be >= 0")
 	}
-	if c.MaxDuration != "" {
-		if _, err := time.ParseDuration(c.MaxDuration); err != nil {
-			return fmt.Errorf("scanning_pace.max_duration: invalid duration %q: %w", c.MaxDuration, err)
-		}
+	if err := validateNonNegDuration("scanning_pace.max_duration", c.MaxDuration); err != nil {
+		return err
 	}
 
 	for _, name := range PhaseSectionNames() {
@@ -255,10 +354,8 @@ func (c *ScanningPaceConfig) Validate() error {
 		if pp.MaxPerHost < 0 {
 			return fmt.Errorf("scanning_pace.%s.max_per_host must be >= 0", name)
 		}
-		if pp.MaxDuration != "" {
-			if _, err := time.ParseDuration(pp.MaxDuration); err != nil {
-				return fmt.Errorf("scanning_pace.%s.max_duration: invalid duration %q: %w", name, pp.MaxDuration, err)
-			}
+		if err := validateNonNegDuration(fmt.Sprintf("scanning_pace.%s.max_duration", name), pp.MaxDuration); err != nil {
+			return err
 		}
 		if pp.ConcurrencyFactor < 0 {
 			return fmt.Errorf("scanning_pace.%s.concurrency_factor must be >= 0", name)
@@ -266,15 +363,11 @@ func (c *ScanningPaceConfig) Validate() error {
 		if pp.DurationFactor < 0 {
 			return fmt.Errorf("scanning_pace.%s.duration_factor must be >= 0", name)
 		}
-		if pp.FeedbackDrainTimeout != "" {
-			if _, err := time.ParseDuration(pp.FeedbackDrainTimeout); err != nil {
-				return fmt.Errorf("scanning_pace.%s.feedback_drain_timeout: invalid duration %q: %w", name, pp.FeedbackDrainTimeout, err)
-			}
+		if err := validateNonNegDuration(fmt.Sprintf("scanning_pace.%s.feedback_drain_timeout", name), pp.FeedbackDrainTimeout); err != nil {
+			return err
 		}
-		if pp.ActiveModuleTimeout != "" {
-			if _, err := time.ParseDuration(pp.ActiveModuleTimeout); err != nil {
-				return fmt.Errorf("scanning_pace.%s.active_module_timeout: invalid duration %q: %w", name, pp.ActiveModuleTimeout, err)
-			}
+		if err := validateNonNegDuration(fmt.Sprintf("scanning_pace.%s.active_module_timeout", name), pp.ActiveModuleTimeout); err != nil {
+			return err
 		}
 	}
 

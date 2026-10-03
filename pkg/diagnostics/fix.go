@@ -3,6 +3,7 @@ package diagnostics
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +16,32 @@ import (
 	"github.com/vigolium/vigolium/pkg/piolium"
 	"github.com/vigolium/vigolium/pkg/terminal"
 )
+
+// fixOut is where installation progress goes. It is stderr, not stdout, and
+// that is the whole point.
+//
+// This package is reached two ways. Interactively it is `vigolium doctor --fix`,
+// where the chatter is the user's feedback. Silently it is ensureCoreDeps — the
+// FIRST scan on a machine, which installs nuclei templates and Chrome for
+// Testing before the scan starts. That scan may be running under `--events
+// ndjson`, whose contract is that stdout carries the event stream and nothing
+// else, or it may be `doctor --fix --json`, which prints one JSON document.
+// Every line below was a bare fmt.Printf and every subprocess inherited
+// os.Stdout, so the very first run a new user or a CI job makes injected four
+// non-JSON lines plus a git clone's output into a machine stream — at exactly
+// the moment a consumer has no prior output to recover from.
+//
+// Routing all of it to stderr costs the interactive path nothing (a terminal
+// shows both) and makes the machine path correct by construction. Mirrors
+// cftbrowser.progressOut, which was fixed the same way for the same reason.
+var fixOut io.Writer = os.Stderr
+
+// fixf writes one progress line to fixOut. A failed write is dropped: this is
+// progress chatter, and losing a line to a closed stderr must not fail an
+// install that is otherwise working.
+func fixf(format string, args ...any) {
+	_, _ = fmt.Fprintf(fixOut, format, args...)
+}
 
 // FixResult holds the outcome of a single fix attempt.
 type FixResult struct {
@@ -270,13 +297,13 @@ func RunFixes(ctx context.Context, report *Report, settings *config.Settings, on
 			continue
 		}
 
-		fmt.Printf("  %s %s %s\n",
+		fixf("  %s %s %s\n",
 			terminal.BoldCyan(terminal.SymbolStart),
 			terminal.White("Installing"),
 			terminal.BoldCyan(item.Label+"..."),
 		)
 		if item.Source != "" {
-			fmt.Printf("    %s %s\n", terminal.Gray("$"), terminal.Gray(item.Source))
+			fixf("    %s %s\n", terminal.Gray("$"), terminal.Gray(item.Source))
 		}
 
 		fixCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
@@ -334,7 +361,7 @@ func runVendorInstaller(ctx context.Context, label, posixURL, windowsURL string)
 	} else {
 		cmd = exec.CommandContext(ctx, "bash", "-c", "curl -fsSL "+posixURL+" | bash")
 	}
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = fixOut
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s install script failed: %w", label, err)
@@ -365,7 +392,7 @@ func fixChromium(ctx context.Context, _ *config.Settings) error {
 	if err != nil {
 		return fmt.Errorf("chrome for Testing download failed: %w", err)
 	}
-	fmt.Printf("    Chrome for Testing installed: %s\n", binPath)
+	fixf("    Chrome for Testing installed: %s\n", binPath)
 	return nil
 }
 
@@ -377,7 +404,7 @@ func fixNucleiTemplates(ctx context.Context, settings *config.Settings) error {
 	// to stderr.
 	cmd := exec.CommandContext(ctx, "git", "clone", "--quiet", "--depth", "1",
 		"https://github.com/projectdiscovery/nuclei-templates.git", dir)
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = fixOut
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("git clone failed: %w", err)
@@ -435,7 +462,7 @@ func ensureJSPM(ctx context.Context) (jsPM, error) {
 	if pm, ok := resolveJSPM(); ok {
 		return pm, nil
 	}
-	fmt.Printf("    %s no bun or npm found — bootstrapping bun\n",
+	fixf("    %s no bun or npm found — bootstrapping bun\n",
 		terminal.Gray(terminal.SymbolDot))
 	if err := fixBun(ctx, nil); err != nil {
 		return jsPM{}, fmt.Errorf("bootstrap bun: %w", err)
@@ -459,7 +486,7 @@ func (pm jsPM) installGlobal(ctx context.Context, pkg string) error {
 	default:
 		return fmt.Errorf("unknown package manager %q", pm.name)
 	}
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = fixOut
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s global install %s failed: %w", pm.name, pkg, err)
@@ -535,7 +562,7 @@ func fixPiolium(ctx context.Context, settings *config.Settings) error {
 		}
 	}
 	cmd := exec.CommandContext(ctx, piPath, "install", pioliumPiPackage)
-	cmd.Stdout = os.Stdout
+	cmd.Stdout = fixOut
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("pi install %s failed: %w", pioliumPiPackage, err)

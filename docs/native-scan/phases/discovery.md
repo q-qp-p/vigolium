@@ -129,6 +129,29 @@ When a file is found at `/a/b/c/file.txt`, the engine extracts `/a/`, `/a/b/`, `
 | Long files with observed extensions | 11 | Lowest-priority long-wordlist extension combinations |
 | FUZZ | 12 | Template-based fuzzing (`FUZZ` marker replacement) |
 
+## Scope enforcement
+
+Content discovery runs its own HTTP client, so the executor's scope check — which
+runs on records that have already been fetched — could only ever discard an
+out-of-scope response *after* contacting the host. An explicit exclusion is a
+request not to contact it, so it is enforced at the engine's egress instead:
+
+- `scope.host.exclude` and `scope.path.exclude` are compiled into a predicate the
+  engine consults **before every request leaves**. A refused request is never
+  sent, never retried, and never counted toward the consecutive-network-error
+  budget that can abort a crawl.
+- The same predicate excludes the URL from the spider queue, so an excluded link
+  is not even scheduled — in every scope mode, including the default `any`.
+- Only the **exclude** lists are enforced here. `scope.host.include` and the CLI
+  origin mode are not: narrowing discovery to an include list is not what an
+  include list means. How wide the crawl goes is still `discovery.scope_mode`'s
+  job (`any` / `subdomain` / `exact`).
+
+The phase's `requests_sent` figure on `phase.progress` and `phase.finished` counts
+the engine's own physical attempts, retries included. Before, the phase reported
+the shared requester's delta — which a crawl barely touches — so a discovery run
+that sent tens of thousands of requests reported roughly zero.
+
 ## Deduplication
 
 Multiple layers prevent redundant work:
@@ -138,6 +161,24 @@ Multiple layers prevent redundant work:
 - **URL-level**: DiskSet tracks processed URLs
 - **Body-level**: Hash prevents re-analyzing identical responses with JSTangle
 - **Directory/file trackers**: Prevent re-processing the same discovery
+
+### Stored-record cleanup
+
+After the phase, three passes prune the stored records: the status-retention
+policy (4xx tiers), reflected-URL collapse by normalized body hash, and a
+shape-based soft-dedup backstop. Two properties bound what they can remove:
+
+- **Evidence is never deleted.** A pass skips any record referenced by a finding
+  (`finding_records`) or by an analysis artifact, and leaves the link intact. The
+  feedback line reports the spared count as `kept N referenced by findings`, so a
+  deletion count lower than the candidate count is expected, not a failure.
+- **Grouping is per origin.** Records are grouped by `(hostname, scheme, port, …)`,
+  so `http://h/x`, `https://h/x`, and `https://h:8443/x` each keep their own
+  representative rather than collapsing into one.
+
+Cleanup is **project-scoped, not scan-scoped**: it runs over every discovery
+record in the project, including records stored by earlier scans. The evidence
+guarantee above is what keeps a later scan from pruning an earlier scan's proof.
 
 ## Discovery Modules
 
@@ -158,8 +199,18 @@ Deparos runs as an input source (`DeparosDiscoverySource`) in the scanning pipel
 
 ```
 DeparosDiscoverySource.Next()
-  → Engine.Start() → discoveries stream out
-  → Convert to httpmsg.HttpRequestResponse
-  → Save to DB (optional)
-  → Return as WorkItem → Executor → Scanner Modules
+  → per target: Engine.Start(), then wait for the queues to drain
+                or the target's budget to expire
+  → read that target's temporary sitemap
+  → dedup in memory, convert to httpmsg.HttpRequestResponse
+  → persist the batch (optional)
+  → emit as WorkItems → Executor → Scanner Modules
+  → next target
 ```
+
+Discoveries are collected **per target and emitted as a batch**, not streamed as
+each one lands: the engine has to finish a target before its sitemap can be read
+and deduplicated. Each target gets its own wall-clock budget
+(`--discover-max-time`, else `scanning_pace.discovery.max_duration`, else 1h);
+exhausting it ends that target and moves to the next, and whatever that target
+already found is still imported.

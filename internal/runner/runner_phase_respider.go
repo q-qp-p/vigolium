@@ -139,18 +139,19 @@ func (r *Runner) runTargetedReSpiderPhase(ctx context.Context, infra *phaseInfra
 	baseCfg.MaxStates = rcfg.PerSeedStates()
 	baseCfg.Source = "respider"
 
-	var totalRecords, crawled, ssoHit int
+	var totals reSpiderGroupResult
 	if spiderSessionReuseDisabled() {
 		// Escape hatch: the proven fresh-browser-per-seed path (seeds of one host
 		// are interspersed by score, so it needs the shared ssoSkip map).
 		ssoSkip := map[string]struct{}{}
-		crawled, totalRecords, ssoHit = r.crawlReSpiderPerSeed(stepCtx, chosen, baseCfg, rcfg.PerSeedDuration(), ssoSkip)
+		totals = r.crawlReSpiderPerSeed(stepCtx, chosen, baseCfg, rcfg.PerSeedDuration(), ssoSkip)
 	} else {
 		// Default: reuse one browser context per host across its seeds so cookies,
 		// local storage, and capture dedup persist instead of paying a fresh
 		// browser launch (and losing any authenticated session) for every seed.
-		crawled, totalRecords, ssoHit = r.crawlReSpiderBySession(stepCtx, chosen, baseCfg, rcfg.PerSeedDuration())
+		totals = r.crawlReSpiderBySession(stepCtx, chosen, baseCfg, rcfg.PerSeedDuration())
 	}
+	totalRecords, crawled, ssoHit := totals.records, totals.crawled, totals.ssoHit
 
 	if totalRecords > 0 {
 		if err := r.repository.IncrementProcessedCount(stepCtx, infra.scanUUID, int64(totalRecords)); err != nil {
@@ -158,9 +159,16 @@ func (r *Runner) runTargetedReSpiderPhase(ctx context.Context, infra *phaseInfra
 		}
 	}
 
-	detail := fmt.Sprintf("completed — re-crawled %s routes, %s new records in %s",
+	// What the browser capture actually managed to persist, onto the phase
+	// outcome — see recordCapture. This phase closes its RecordWriter
+	// fire-and-forget too, so without this a re-crawl that lost everything it
+	// captured still recorded state: "completed".
+	recordCapture(r.currentPhase.Load(), totals.capture)
+
+	detail := fmt.Sprintf("completed — re-crawled %s routes, %s new records%s in %s",
 		terminal.Orange(fmt.Sprintf("%d", crawled)),
 		terminal.Orange(fmt.Sprintf("%d", totalRecords)),
+		terminal.Yellow(captureIncompleteNote(totals.capture)),
 		time.Since(phaseStart).Round(time.Millisecond))
 	if ssoHit > 0 {
 		detail += terminal.Gray(fmt.Sprintf(" (%d skipped: SSO/login wall)", ssoHit))
@@ -197,10 +205,10 @@ func (r *Runner) applyReSpiderSSO(result *spitolas.SpiderResult, hostKey string,
 // crawlReSpiderPerSeed crawls each seed with its own fresh browser (the original,
 // proven behavior). ssoSkip is consulted/updated so a host's seeds stop after a
 // login wall.
-func (r *Runner) crawlReSpiderPerSeed(ctx context.Context, chosen []respiderSeed, baseCfg spitolas.SpiderConfig, perSeed time.Duration, ssoSkip map[string]struct{}) (crawled, totalRecords, ssoHit int) {
+func (r *Runner) crawlReSpiderPerSeed(ctx context.Context, chosen []respiderSeed, baseCfg spitolas.SpiderConfig, perSeed time.Duration, ssoSkip map[string]struct{}) (res reSpiderGroupResult) {
 	for _, s := range chosen {
 		if ctx.Err() != nil {
-			zap.L().Info("Re-spider: step budget reached, stopping", zap.Int("crawled", crawled))
+			zap.L().Info("Re-spider: step budget reached, stopping", zap.Int("crawled", res.crawled))
 			break
 		}
 		if _, blocked := ssoSkip[s.hostKey]; blocked {
@@ -213,14 +221,15 @@ func (r *Runner) crawlReSpiderPerSeed(ctx context.Context, chosen []respiderSeed
 		// Watchdog bounds RunSpider + rw.Close so a wedged browser can't hang the phase.
 		oc := runSpiderWatchdog(seedCtx, cfg, rw, perSeed, s.url)
 		cancel()
+		res.capture.Merge(oc.capture())
 		if oc.err != nil {
 			zap.L().Warn("Re-spider: crawl failed", zap.String("seed", s.url), zap.Error(oc.err))
 			continue
 		}
-		crawled++
-		totalRecords += oc.res.RecordsSaved
+		res.crawled++
+		res.records += oc.res.RecordsSaved
 		if r.applyReSpiderSSO(oc.res, s.hostKey, ssoSkip) {
-			ssoHit++
+			res.ssoHit++
 		}
 	}
 	return
@@ -233,6 +242,7 @@ type reSpiderGroupResult struct {
 	records  int
 	ssoHit   int
 	ssoHosts []string // login-wall hosts to feed into the scan-wide fuzz exclusion
+	capture  spitolas.CaptureReceipt
 }
 
 // crawlReSpiderHostGroup crawls all of one host's seeds in a single shared browser
@@ -271,8 +281,14 @@ func (r *Runner) crawlReSpiderHostGroup(ctx context.Context, group []respiderSee
 			// host's records, so it gets closed (and flushed) like any other.
 			abandoned = oc.wedged
 			if abandoned {
-				zap.L().Warn("Re-spider: browser wedged; abandoning host session (leaks until exit)",
+				zap.L().Warn("Re-spider: browser wedged; abandoning host session and killing its browser process",
 					zap.String("seed", s.url), zap.Error(oc.err))
+				// Nothing will close an abandoned session, so without this the
+				// Chromium process and its profile survive the rest of the scan —
+				// one per wedged host. Kill takes no lock the wedged crawl goroutine
+				// could be holding; its own goroutine because the launcher's kill
+				// waits for the process to exit.
+				go sess.Kill()
 			} else {
 				zap.L().Warn("Re-spider: session crawl failed; closing host session",
 					zap.String("seed", s.url), zap.Error(oc.err))
@@ -290,9 +306,7 @@ func (r *Runner) crawlReSpiderHostGroup(ctx context.Context, group []respiderSee
 			break // remaining seeds on this host sit behind the same wall
 		}
 	}
-	if !abandoned {
-		closeReSpiderSession(sess, rw)
-	}
+	res.capture = sessionCapture(sess, rw, abandoned)
 	return res
 }
 
@@ -302,21 +316,25 @@ func (r *Runner) crawlReSpiderHostGroup(ctx context.Context, group []respiderSee
 // independent hosts concurrently. Hosts are independent (each session owns its own
 // browser), so the only shared state — the aggregate totals and the scan-wide
 // SSO-host feed — is merged under a lock.
-func (r *Runner) crawlReSpiderBySession(ctx context.Context, chosen []respiderSeed, baseCfg spitolas.SpiderConfig, perSeed time.Duration) (crawled, totalRecords, ssoHit int) {
+func (r *Runner) crawlReSpiderBySession(ctx context.Context, chosen []respiderSeed, baseCfg spitolas.SpiderConfig, perSeed time.Duration) (total reSpiderGroupResult) {
 	groups := groupByHost(chosen, func(s respiderSeed) string { return s.hostKey })
 	par := reSpiderHostParallelism(len(groups))
+
+	merge := func(res reSpiderGroupResult) {
+		total.crawled += res.crawled
+		total.records += res.records
+		total.ssoHit += res.ssoHit
+		total.capture.Merge(res.capture)
+		r.feedReSpiderSSOHosts(res.ssoHosts)
+	}
 
 	if par <= 1 {
 		for _, group := range groups {
 			if ctx.Err() != nil {
-				zap.L().Info("Re-spider: step budget reached, stopping", zap.Int("crawled", crawled))
+				zap.L().Info("Re-spider: step budget reached, stopping", zap.Int("crawled", total.crawled))
 				break
 			}
-			res := r.crawlReSpiderHostGroup(ctx, group, baseCfg, perSeed)
-			crawled += res.crawled
-			totalRecords += res.records
-			ssoHit += res.ssoHit
-			r.feedReSpiderSSOHosts(res.ssoHosts)
+			merge(r.crawlReSpiderHostGroup(ctx, group, baseCfg, perSeed))
 		}
 		return
 	}
@@ -343,10 +361,7 @@ func (r *Runner) crawlReSpiderBySession(ctx context.Context, chosen []respiderSe
 			}
 			res := r.crawlReSpiderHostGroup(ctx, group, baseCfg, perSeed)
 			mu.Lock()
-			crawled += res.crawled
-			totalRecords += res.records
-			ssoHit += res.ssoHit
-			r.feedReSpiderSSOHosts(res.ssoHosts)
+			merge(res)
 			mu.Unlock()
 		}()
 	}

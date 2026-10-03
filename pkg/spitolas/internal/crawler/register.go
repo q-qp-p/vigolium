@@ -341,6 +341,10 @@ func (c *Crawler) submitRegisterForm(ctx context.Context, page *browser.Page) {
 	if ctx.Err() != nil {
 		return
 	}
+	// Registration is authorized by its own policy category, so it passes the
+	// page's submit guard even when ordinary submits are denied.
+	page.AllowAuthorizedSubmit()
+	c.countSubmitDispatched(submitMechRegister, 1)
 	submitted := false
 	if elem, err := page.ElementPiercing(`[data-vgo-register-submit="1"]`); err == nil && elem != nil {
 		if cerr := elem.Click(); cerr == nil {

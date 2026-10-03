@@ -2,6 +2,9 @@ package network
 
 import (
 	"context"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -24,16 +27,65 @@ var Dialer *fastdialer.Dialer
 var (
 	mu       sync.Mutex
 	refCount int
+	// activePolicy is the policyKey of the options the live Dialer was built
+	// from, recorded at creation and cleared when the last reference goes.
+	activePolicy string
 )
+
+// ErrDialerPolicyConflict is returned by Init when the shared dialer already
+// exists and was built from a DIFFERENT network policy.
+//
+// The dialer is process-global and built once, from whichever options reached
+// Init first. Every later Init silently adopted it. For a deny list that is the
+// wrong direction to fail: a second scan configured to refuse a host would reuse
+// a dialer that allows it, and nothing would say so. The tripwire fails closed
+// instead — the caller learns its policy cannot be honoured rather than running
+// under someone else's.
+//
+// No current behaviour changes: ExcludeTargets, RestrictLocalNetworkAccess,
+// SystemResolvers, DialerTimeout and DialerKeepAlive are not assigned anywhere in
+// the tree, so every Init today computes the same key. This exists so the first
+// code to wire one of them cannot land the silent-inheritance bug with it; the
+// real fix (a scan-local dialer) is a larger change.
+var ErrDialerPolicyConflict = errors.New(
+	"network dialer already initialized with a different network policy; " +
+		"concurrent scans cannot use conflicting exclude/resolver settings")
+
+// policyKey renders the options that shape the dialer's network policy into a
+// comparable string. Order-insensitive for the deny list — the same exclusions
+// listed in a different order are the same policy — and it covers exactly the
+// fields NewDialer reads, so a new field must be added here in the same change
+// that makes NewDialer read it.
+func policyKey(options *types.Options) string {
+	if options == nil {
+		return ""
+	}
+	deny := slices.Clone(options.ExcludeTargets)
+	slices.Sort(deny)
+	return strings.Join(deny, "\x00") +
+		"|restrict_local=" + strconv.FormatBool(options.RestrictLocalNetworkAccess) +
+		"|system_resolvers=" + strconv.FormatBool(options.SystemResolvers) +
+		"|timeout=" + options.DialerTimeout.String() +
+		"|keepalive=" + options.DialerKeepAlive.String()
+}
 
 // Init creates the global Dialer instance based on user configuration, or
 // reuses the existing one, and registers one reference. Every successful Init
 // must be paired with exactly one Close.
+//
+// Reuse requires the SAME network policy: an Init whose policy differs from the
+// live dialer's returns ErrDialerPolicyConflict and takes no reference, so the
+// caller must not Close. See ErrDialerPolicyConflict.
 func Init(options *types.Options) error {
 	mu.Lock()
 	defer mu.Unlock()
 
+	key := policyKey(options)
+
 	if Dialer != nil {
+		if key != activePolicy {
+			return ErrDialerPolicyConflict
+		}
 		refCount++
 		return nil
 	}
@@ -43,6 +95,7 @@ func Init(options *types.Options) error {
 		return err
 	}
 	Dialer = dialer
+	activePolicy = key
 	refCount++
 
 	StartActiveMemGuardian(context.Background())
@@ -127,5 +180,8 @@ func Close() {
 		Dialer.Close()
 		Dialer = nil
 	}
+	// Cleared with the dialer, so a later Init with a different policy builds one
+	// rather than conflicting with a policy nothing is holding any more.
+	activePolicy = ""
 	StopActiveMemGuardian()
 }

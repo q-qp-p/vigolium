@@ -110,6 +110,9 @@ func TestShouldAutoFuzzDiscovery(t *testing.T) {
 	lowYield := spideringOutcome{ran: true, records: 2}
 	ssoYield := spideringOutcome{ran: true, records: 9, sawSSO: true, ssoHosts: []string{"idp.example.com"}}
 	richYield := spideringOutcome{ran: true, records: 50}
+	// Found plenty, persisted little: the low count is a capture loss, not a
+	// low-yield target.
+	lostYield := spideringOutcome{ran: true, records: 2, lost: 40}
 
 	cases := []struct {
 		name      string
@@ -121,6 +124,7 @@ func TestShouldAutoFuzzDiscovery(t *testing.T) {
 		{"low-yield triggers", discoverOpts(nil), nil, lowYield, true},
 		{"sso wall triggers", discoverOpts(nil), nil, ssoYield, true},
 		{"rich yield does not trigger", discoverOpts(nil), nil, richYield, false},
+		{"records lost to capture do not read as low yield", discoverOpts(nil), nil, lostYield, false},
 		{"spidering did not run", discoverOpts(nil), nil, spideringOutcome{ran: false, records: 0}, false},
 		{"already fuzzing (deep) does not re-trigger", discoverOpts(func(o *types.Options) { o.Intensity = "deep" }), nil, lowYield, false},
 		{"discover disabled does not trigger", discoverOpts(func(o *types.Options) { o.DiscoverEnabled = false }), nil, lowYield, false},

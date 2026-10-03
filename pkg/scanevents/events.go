@@ -42,16 +42,23 @@ const SchemaVersion = 1
 // Event types. These are the string values of the "type" field; a consumer
 // switches on them, so they are part of the contract and only ever added to.
 const (
-	TypeScanStarted   = "scan.started"
-	TypeScanFinished  = "scan.finished"
-	TypePhaseStarted  = "phase.started"
-	TypePhaseProgress = "phase.progress"
-	TypePhaseFinished = "phase.finished"
-	TypeWAFBlock      = "waf.block"
-	TypeWAFPacing     = "waf.pacing"
-	TypeFindingNew    = "finding.new"
-	TypeImportSummary = "import.summary"
-	TypeError         = "error"
+	TypeScanStarted = "scan.started"
+	// TypeScanInterrupting says a shutdown signal arrived and the graceful stop
+	// has begun. NONTERMINAL: the scan is still finalizing, and the terminal
+	// scan.finished still follows. It exists because graceful shutdown can take
+	// seconds, during which a consumer could not tell a slow phase from a scan
+	// that was already on its way out — and an operator who sends a second
+	// signal in that window gets a hard exit with no explanation on the stream.
+	TypeScanInterrupting = "scan.interrupting"
+	TypeScanFinished     = "scan.finished"
+	TypePhaseStarted     = "phase.started"
+	TypePhaseProgress    = "phase.progress"
+	TypePhaseFinished    = "phase.finished"
+	TypeWAFBlock         = "waf.block"
+	TypeWAFPacing        = "waf.pacing"
+	TypeFindingNew       = "finding.new"
+	TypeImportSummary    = "import.summary"
+	TypeError            = "error"
 )
 
 // Terminal scan statuses.
@@ -67,8 +74,15 @@ const (
 // after. Everything past Type is omitempty so a line carries only what its type
 // actually means.
 type Event struct {
-	V        int    `json:"v"`
-	TS       string `json:"ts"`
+	V  int    `json:"v"`
+	TS string `json:"ts"`
+	// Seq is this emitter's 1-based write counter, stamped under the same lock
+	// that serialises the write, so it is the stream's own total order. ts alone
+	// could not be: it has millisecond precision and a busy scan emits several
+	// events per millisecond, so a consumer sorting by timestamp reorders them.
+	// A gap means a line was lost in transit — which a consumer otherwise had no
+	// way to detect at all.
+	Seq      uint64 `json:"seq"`
 	ScanUUID string `json:"scan_uuid"`
 	Type     string `json:"type"`
 
@@ -89,6 +103,17 @@ type Event struct {
 	Phase      string `json:"phase,omitempty"`
 	DurationMS int64  `json:"duration_ms,omitempty"`
 	Status     string `json:"status,omitempty"`
+
+	// Why a phase or a scan did not cover everything. Reasons are defects or
+	// curtailments ("phase_deadline", "targets_failed", …); Limits are configured
+	// bounds that were reached, which is designed behaviour and is reported
+	// separately so a consumer never reads a correctly time-boxed target as a
+	// degraded one. StopReason is the scan-level roll-up on scan.finished. All
+	// three are additive: a "completed" status still means what it did, and a
+	// consumer that ignores them sees the stream it saw before.
+	Reasons    []string `json:"reasons,omitempty"`
+	Limits     []string `json:"limits,omitempty"`
+	StopReason string   `json:"stop_reason,omitempty"`
 
 	// Progress counters. Pointers so a zero is reported as a zero rather than
 	// dropped by omitempty — "0 requests sent" is a meaningful reading.
@@ -148,6 +173,13 @@ type Emitter struct {
 	enc      *json.Encoder
 	scanUUID string
 	closed   bool
+	seq      uint64
+	// err keeps the FIRST write failure. The emitter latches shut on one (a
+	// consumer that went away must not cost a syscall per event for the rest of
+	// the run) and never propagates it, so without this the failure left no
+	// trace anywhere — a scan whose entire stream went to a closed pipe looked,
+	// from the outside, exactly like a scan that emitted nothing.
+	err error
 	// terminalOnce guards the single terminal scan.finished, which several paths
 	// race to write: the normal return, the signal handler, and a panic recovery
 	// can all reach it. A stream with two terminal events is worse than one with
@@ -236,6 +268,8 @@ func (e *Emitter) Emit(ev Event) {
 	}
 	ev.V = SchemaVersion
 	ev.TS = time.Now().UTC().Format(TimestampLayout)
+	e.seq++
+	ev.Seq = e.seq
 	if ev.ScanUUID == "" {
 		ev.ScanUUID = e.scanUUID
 	}
@@ -250,7 +284,23 @@ func (e *Emitter) Emit(ev Event) {
 	// point is to be cheap enough to emit continuously.
 	if err := e.enc.Encode(&ev); err != nil {
 		e.closed = true
+		if e.err == nil {
+			e.err = err
+		}
 	}
+}
+
+// Err returns the first write failure, or nil. A non-nil result means the
+// stream is incomplete: everything from that event on was dropped. The scan
+// itself is unaffected — nobody listening is not a scanning failure — so this is
+// for the caller that wants to SAY so rather than for one that wants to fail.
+func (e *Emitter) Err() error {
+	if !e.Enabled() {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.err
 }
 
 // Close latches the emitter shut. Idempotent; safe on a nil Emitter.

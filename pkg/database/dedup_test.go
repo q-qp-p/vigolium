@@ -631,24 +631,32 @@ func TestDeduplicateSoftDeparosRecords(t *testing.T) {
 		t.Fatalf("insert finding_records: %v", err)
 	}
 
-	deleted, statusCodes, err := repo.DeduplicateSoftDeparosRecords(ctx, projectUUID)
+	cleanup, err := repo.DeduplicateSoftDeparosRecords(ctx, projectUUID)
 	if err != nil {
 		t.Fatalf("DeduplicateSoftDeparosRecords: %v", err)
 	}
 
-	// Group 1: 5 → 1 = 4 deleted
+	// Group 1: 5 → 1 = 4 selected, but g1Dup1 is cited by a finding and is kept
+	//          = 3 deleted, 1 kept
 	// Group 2: 3 → 1 = 2 deleted
 	// Group 3: 2 members, below threshold = 0 deleted
-	// Total: 6
-	if deleted != 6 {
-		t.Errorf("expected 6 deleted, got %d", deleted)
+	// Total: 5 deleted, 1 kept.
+	if cleanup.Deleted != 5 {
+		t.Errorf("expected 5 deleted, got %d", cleanup.Deleted)
 	}
-	if statusCodes == nil {
-		t.Error("expected non-nil statusCodes map")
+	if cleanup.KeptReferenced != 1 {
+		t.Errorf("expected 1 record kept for its finding link, got %d", cleanup.KeptReferenced)
+	}
+	if cleanup.ByStatus == nil {
+		t.Error("expected non-nil ByStatus map")
+	}
+	// The breakdown counts only what was deleted, so the spared 405 is absent from it.
+	if cleanup.ByStatus[405] != 3 {
+		t.Errorf("expected 3 deleted 405s in the breakdown, got %d", cleanup.ByStatus[405])
 	}
 
-	// Verify survivors
-	survivors := map[string]bool{g1Short: true, g2Short: true, g3a: true, g3b: true, nonDeparos: true}
+	// Verify survivors — g1Dup1 survives purely because a finding references it.
+	survivors := map[string]bool{g1Short: true, g1Dup1: true, g2Short: true, g3a: true, g3b: true, nonDeparos: true}
 	var remaining []*HTTPRecord
 	if err := db.NewSelect().Model(&remaining).Scan(ctx); err != nil {
 		t.Fatalf("select remaining: %v", err)
@@ -662,14 +670,23 @@ func TestDeduplicateSoftDeparosRecords(t *testing.T) {
 		}
 	}
 
-	// Verify junction row cleanup
+	// The evidence link survives intact: the finding can still reach its record.
 	var junctionCount int
 	err = db.NewRaw("SELECT COUNT(*) FROM finding_records WHERE record_uuid = ?", g1Dup1).Scan(ctx, &junctionCount)
 	if err != nil {
 		t.Fatalf("junction count query: %v", err)
 	}
-	if junctionCount != 0 {
-		t.Errorf("expected junction rows cleaned up, got %d", junctionCount)
+	if junctionCount != 1 {
+		t.Errorf("expected the finding's evidence link preserved, got %d junction rows", junctionCount)
+	}
+
+	// Idempotent: a second pass finds the same survivor set and deletes nothing.
+	again, err := repo.DeduplicateSoftDeparosRecords(ctx, projectUUID)
+	if err != nil {
+		t.Fatalf("second DeduplicateSoftDeparosRecords: %v", err)
+	}
+	if again.Deleted != 0 {
+		t.Errorf("expected second pass to delete 0, got %d", again.Deleted)
 	}
 }
 
@@ -678,12 +695,12 @@ func TestDeduplicateSoftDeparosRecords_NoRecords(t *testing.T) {
 	repo := NewRepository(db)
 	ctx := context.Background()
 
-	deleted, _, err := repo.DeduplicateSoftDeparosRecords(ctx, DefaultProjectUUID)
+	cleanup, err := repo.DeduplicateSoftDeparosRecords(ctx, DefaultProjectUUID)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if deleted != 0 {
-		t.Errorf("expected 0 deleted, got %d", deleted)
+	if cleanup.Deleted != 0 {
+		t.Errorf("expected 0 deleted, got %d", cleanup.Deleted)
 	}
 }
 
@@ -735,12 +752,12 @@ func TestDeduplicateSoftDeparosRecords_DifferentCharacteristics(t *testing.T) {
 	insertRec("/api/v1/e", 200, 20)
 	insertRec("/api/v1/f", 200, 30)
 
-	deleted, _, err := repo.DeduplicateSoftDeparosRecords(ctx, projectUUID)
+	cleanup, err := repo.DeduplicateSoftDeparosRecords(ctx, projectUUID)
 	if err != nil {
 		t.Fatalf("DeduplicateSoftDeparosRecords: %v", err)
 	}
-	if deleted != 0 {
-		t.Errorf("expected 0 deleted, got %d", deleted)
+	if cleanup.Deleted != 0 {
+		t.Errorf("expected 0 deleted, got %d", cleanup.Deleted)
 	}
 }
 
@@ -791,13 +808,13 @@ func TestDeduplicateSoftDeparosRecords_ReflectedURLLength(t *testing.T) {
 	insertRec("/jboss-net//happyaxis.jsp.orig", 435)
 	insertRec("/jboss-net//happyaxis.jsp.csproj", 437)
 
-	deleted, _, err := repo.DeduplicateSoftDeparosRecords(ctx, projectUUID)
+	cleanup, err := repo.DeduplicateSoftDeparosRecords(ctx, projectUUID)
 	if err != nil {
 		t.Fatalf("DeduplicateSoftDeparosRecords: %v", err)
 	}
 	// 4 → 1 survivor = 3 deleted, despite the differing content lengths.
-	if deleted != 3 {
-		t.Errorf("expected 3 deleted (reflected-URL family collapses regardless of length), got %d", deleted)
+	if cleanup.Deleted != 3 {
+		t.Errorf("expected 3 deleted (reflected-URL family collapses regardless of length), got %d", cleanup.Deleted)
 	}
 }
 
@@ -852,16 +869,16 @@ func TestApplyDeparosStatusPolicy(t *testing.T) {
 	// A 403 from a non-deparos source must be untouched.
 	nonDeparos := insertRec("h1.com", "/scanner-403", 403, "scanner")
 
-	deleted, statusCodes, err := repo.ApplyDeparosStatusPolicy(ctx, projectUUID, DeparosStatusPolicy{KeepOnePerHost: []int{401}})
+	cleanup, err := repo.ApplyDeparosStatusPolicy(ctx, projectUUID, DeparosStatusPolicy{KeepOnePerHost: []int{401}})
 	if err != nil {
 		t.Fatalf("ApplyDeparosStatusPolicy: %v", err)
 	}
 	// Dropped: 400, 403, 410 (3) + two extra 401s on h1 (2) = 5.
-	if deleted != 5 {
-		t.Errorf("expected 5 deleted, got %d", deleted)
+	if cleanup.Deleted != 5 {
+		t.Errorf("expected 5 deleted, got %d", cleanup.Deleted)
 	}
-	if statusCodes[401] != 2 {
-		t.Errorf("expected 2 collapsed 401 records in breakdown, got %d", statusCodes[401])
+	if cleanup.ByStatus[401] != 2 {
+		t.Errorf("expected 2 collapsed 401 records in breakdown, got %d", cleanup.ByStatus[401])
 	}
 
 	survivors := map[string]bool{a1: true, b1: true, ok200: true, redir: true, serr: true, nonDeparos: true}
@@ -903,12 +920,12 @@ func TestApplyDeparosStatusPolicy_NoKeepDropsAll4xx(t *testing.T) {
 	insert("/c", 200)
 
 	// Empty policy ⇒ every 4xx (including 401) is dropped.
-	deleted, _, err := repo.ApplyDeparosStatusPolicy(ctx, projectUUID, DeparosStatusPolicy{})
+	cleanup, err := repo.ApplyDeparosStatusPolicy(ctx, projectUUID, DeparosStatusPolicy{})
 	if err != nil {
 		t.Fatalf("ApplyDeparosStatusPolicy: %v", err)
 	}
-	if deleted != 2 {
-		t.Errorf("expected 2 deleted (401+403), got %d", deleted)
+	if cleanup.Deleted != 2 {
+		t.Errorf("expected 2 deleted (401+403), got %d", cleanup.Deleted)
 	}
 }
 
@@ -952,7 +969,7 @@ func TestApplyDeparosStatusPolicy_Tiers(t *testing.T) {
 	// Untouched: 200.
 	ok := insert("h.com", "/", 200)
 
-	deleted, _, err := repo.ApplyDeparosStatusPolicy(ctx, projectUUID, DeparosStatusPolicy{
+	cleanup, err := repo.ApplyDeparosStatusPolicy(ctx, projectUUID, DeparosStatusPolicy{
 		KeepOnePerHost: []int{401, 403, 429},
 		KeepPerPath:    []int{405, 415, 422},
 		PerPathCap:     100,
@@ -961,8 +978,8 @@ func TestApplyDeparosStatusPolicy_Tiers(t *testing.T) {
 		t.Fatalf("ApplyDeparosStatusPolicy: %v", err)
 	}
 	// Dropped: two extra 403s (2) + one dup 405 path (1) + one 404 (1) = 4.
-	if deleted != 4 {
-		t.Errorf("expected 4 deleted, got %d", deleted)
+	if cleanup.Deleted != 4 {
+		t.Errorf("expected 4 deleted, got %d", cleanup.Deleted)
 	}
 
 	survivors := map[string]bool{f1: true, m1: true, m2: true, ok: true}
@@ -1002,15 +1019,15 @@ func TestApplyDeparosStatusPolicy_PerPathCap(t *testing.T) {
 		}
 	}
 
-	deleted, _, err := repo.ApplyDeparosStatusPolicy(ctx, projectUUID, DeparosStatusPolicy{
+	cleanup, err := repo.ApplyDeparosStatusPolicy(ctx, projectUUID, DeparosStatusPolicy{
 		KeepPerPath: []int{422},
 		PerPathCap:  3,
 	})
 	if err != nil {
 		t.Fatalf("ApplyDeparosStatusPolicy: %v", err)
 	}
-	if deleted != 7 {
-		t.Errorf("expected 7 deleted (10 distinct paths capped to 3), got %d", deleted)
+	if cleanup.Deleted != 7 {
+		t.Errorf("expected 7 deleted (10 distinct paths capped to 3), got %d", cleanup.Deleted)
 	}
 }
 
@@ -1064,12 +1081,12 @@ func TestDeduplicateDeparosByNormHash(t *testing.T) {
 	// Matching norm hash but non-deparos source — untouched.
 	nonDeparos := insertRec("h1.com", "/n", 200, "NORM-AAA", "scanner")
 
-	deleted, _, err := repo.DeduplicateDeparosByNormHash(ctx, projectUUID)
+	cleanup, err := repo.DeduplicateDeparosByNormHash(ctx, projectUUID)
 	if err != nil {
 		t.Fatalf("DeduplicateDeparosByNormHash: %v", err)
 	}
-	if deleted != 2 {
-		t.Errorf("expected 2 deleted, got %d", deleted)
+	if cleanup.Deleted != 2 {
+		t.Errorf("expected 2 deleted, got %d", cleanup.Deleted)
 	}
 
 	survivors := map[string]bool{keep: true, other: true, diffStatus: true, emptyNorm1: true, emptyNorm2: true, nonDeparos: true}
@@ -1113,4 +1130,237 @@ func insertRecordNoResponse(t *testing.T, db *DB, ctx context.Context, projectUU
 		t.Fatalf("insert no-response record: %v", err)
 	}
 	return id
+}
+
+// --- WP5: discovery cleanup never deletes finding evidence ---------------------
+
+// dedupEvidenceFixture builds the shared setup for the evidence-protection tests:
+// a repository, a record inserter, and helpers to attach a finding or an analysis
+// artifact to a record.
+type dedupEvidenceFixture struct {
+	db          *DB
+	repo        *Repository
+	ctx         context.Context
+	projectUUID string
+	now         time.Time
+	t           *testing.T
+}
+
+func newDedupEvidenceFixture(t *testing.T) *dedupEvidenceFixture {
+	t.Helper()
+	db := newTestDB(t)
+	return &dedupEvidenceFixture{
+		db:          db,
+		repo:        NewRepository(db),
+		ctx:         context.Background(),
+		projectUUID: DefaultProjectUUID,
+		now:         time.Now(),
+		t:           t,
+	}
+}
+
+// insert writes one deparos record. scheme/port make the origin explicit so the
+// origin-partition tests can place byte-identical responses on different origins.
+func (f *dedupEvidenceFixture) insert(scheme, hostname string, port int, path string, status int, opts ...func(*HTTPRecord)) string {
+	f.t.Helper()
+	id := uuid.NewString()
+	rec := &HTTPRecord{
+		UUID: id, ProjectUUID: f.projectUUID,
+		Scheme: scheme, Hostname: hostname, Port: port,
+		Method: "GET", Path: path,
+		URL:         fmt.Sprintf("%s://%s:%d%s", scheme, hostname, port, path),
+		HTTPVersion: "HTTP/1.1",
+		RequestHash: id, ResponseHash: id,
+		StatusCode: status, HasResponse: true,
+		Source: "deparos", SentAt: f.now, CreatedAt: f.now,
+	}
+	for _, o := range opts {
+		o(rec)
+	}
+	if _, err := f.db.NewInsert().Model(rec).Exec(f.ctx); err != nil {
+		f.t.Fatalf("insert record %s: %v", path, err)
+	}
+	return id
+}
+
+// citeByFinding links recUUID to a new finding, making it protected evidence.
+func (f *dedupEvidenceFixture) citeByFinding(recUUID string) {
+	f.t.Helper()
+	res, err := f.db.ExecContext(f.ctx,
+		`INSERT INTO findings (project_uuid, scan_uuid, module_id, module_name,
+			finding_hash, severity, confidence, http_record_uuids)
+		VALUES (?, 'scan1', 'mod1', 'mod1', ?, 'info', 'tentative', '[]')`,
+		f.projectUUID, uuid.NewString())
+	if err != nil {
+		f.t.Fatalf("insert finding: %v", err)
+	}
+	fid, _ := res.LastInsertId()
+	if _, err := f.db.ExecContext(f.ctx,
+		`INSERT INTO finding_records (finding_id, record_uuid) VALUES (?, ?)`, fid, recUUID); err != nil {
+		f.t.Fatalf("insert finding_records: %v", err)
+	}
+}
+
+// citeByArtifact attaches an analysis artifact (the JSTangle/derived-evidence
+// path), the second reference kind cleanup must respect.
+func (f *dedupEvidenceFixture) citeByArtifact(recUUID string) {
+	f.t.Helper()
+	if _, err := f.db.NewInsert().Model(&AnalysisArtifact{
+		ProjectUUID: f.projectUUID, HTTPRecordUUID: recUUID,
+		Kind: "sourcemap", SHA256: uuid.NewString(), ByteLength: 3,
+		Content: []byte("js"), CreatedAt: f.now,
+	}).Exec(f.ctx); err != nil {
+		f.t.Fatalf("insert analysis_artifact: %v", err)
+	}
+}
+
+func (f *dedupEvidenceFixture) alive(recUUID string) bool {
+	f.t.Helper()
+	n, err := f.db.NewSelect().Model((*HTTPRecord)(nil)).Where("uuid = ?", recUUID).Count(f.ctx)
+	if err != nil {
+		f.t.Fatalf("count record: %v", err)
+	}
+	return n == 1
+}
+
+// TestApplyDeparosStatusPolicy_KeepsReferencedRecords is the WP5 regression for
+// the project-wide evidence loss: the 4xx drop tier ran after every discovery
+// phase and deleted an earlier scan's records along with the finding_records rows
+// that pointed at them, so a finding from scan 1 silently lost its evidence when
+// scan 2 ran in the same project.
+func TestApplyDeparosStatusPolicy_KeepsReferencedRecords(t *testing.T) {
+	f := newDedupEvidenceFixture(t)
+
+	cited := f.insert("https", "h.com", 443, "/cited", 404)
+	artifact := f.insert("https", "h.com", 443, "/artifact", 404)
+	noise := f.insert("https", "h.com", 443, "/noise", 404)
+	f.citeByFinding(cited)
+	f.citeByArtifact(artifact)
+
+	// Empty policy ⇒ every 4xx is noise and selected for deletion.
+	cleanup, err := f.repo.ApplyDeparosStatusPolicy(f.ctx, f.projectUUID, DeparosStatusPolicy{})
+	if err != nil {
+		t.Fatalf("ApplyDeparosStatusPolicy: %v", err)
+	}
+	if cleanup.Deleted != 1 {
+		t.Errorf("expected 1 deleted (only the unreferenced 404), got %d", cleanup.Deleted)
+	}
+	if cleanup.KeptReferenced != 2 {
+		t.Errorf("expected 2 kept (finding + artifact), got %d", cleanup.KeptReferenced)
+	}
+	if cleanup.ByStatus[404] != 1 {
+		t.Errorf("breakdown must count only deletions; got %d for 404", cleanup.ByStatus[404])
+	}
+	if !f.alive(cited) {
+		t.Error("record cited by a finding was deleted")
+	}
+	if !f.alive(artifact) {
+		t.Error("record carrying an analysis artifact was deleted")
+	}
+	if f.alive(noise) {
+		t.Error("unreferenced noise record survived")
+	}
+
+	// The evidence link is intact, not merely the record.
+	var links int
+	if err := f.db.NewRaw("SELECT COUNT(*) FROM finding_records WHERE record_uuid = ?", cited).Scan(f.ctx, &links); err != nil {
+		t.Fatalf("junction count: %v", err)
+	}
+	if links != 1 {
+		t.Errorf("expected the evidence link preserved, got %d", links)
+	}
+
+	// Idempotent: the protected records are re-selected every pass and must keep
+	// being spared rather than accumulating deletions.
+	again, err := f.repo.ApplyDeparosStatusPolicy(f.ctx, f.projectUUID, DeparosStatusPolicy{})
+	if err != nil {
+		t.Fatalf("second ApplyDeparosStatusPolicy: %v", err)
+	}
+	if again.Deleted != 0 || again.KeptReferenced != 2 {
+		t.Errorf("second pass: deleted %d / kept %d, want 0 / 2", again.Deleted, again.KeptReferenced)
+	}
+}
+
+// TestDeduplicateDeparosByNormHash_KeepsReferencedRecords covers the norm-hash
+// pass: the referenced record is not the group survivor, so without the guard it
+// would be collapsed away.
+func TestDeduplicateDeparosByNormHash_KeepsReferencedRecords(t *testing.T) {
+	f := newDedupEvidenceFixture(t)
+	norm := func(r *HTTPRecord) { r.ResponseNormHash = "NORM-AAA"; r.ResponseContentType = "text/html" }
+
+	survivor := f.insert("https", "h.com", 443, "/a", 200, norm)
+	cited := f.insert("https", "h.com", 443, "/bbbb", 200, norm)
+	noise := f.insert("https", "h.com", 443, "/cccc", 200, norm)
+	f.citeByFinding(cited)
+
+	cleanup, err := f.repo.DeduplicateDeparosByNormHash(f.ctx, f.projectUUID)
+	if err != nil {
+		t.Fatalf("DeduplicateDeparosByNormHash: %v", err)
+	}
+	if cleanup.Deleted != 1 || cleanup.KeptReferenced != 1 {
+		t.Errorf("deleted %d / kept %d, want 1 / 1", cleanup.Deleted, cleanup.KeptReferenced)
+	}
+	if !f.alive(survivor) || !f.alive(cited) {
+		t.Error("expected both the shortest-path survivor and the cited record to remain")
+	}
+	if f.alive(noise) {
+		t.Error("unreferenced duplicate survived")
+	}
+}
+
+// TestDeduplicateRecordsBySource_KeepsReferencedRecords covers the source-scoped
+// pass, which the agent knowledge-base traffic cleanup also runs (A.6 #7).
+func TestDeduplicateRecordsBySource_KeepsReferencedRecords(t *testing.T) {
+	f := newDedupEvidenceFixture(t)
+	same := func(r *HTTPRecord) { r.ResponseHash = "SAME"; r.ResponseContentLength = 10 }
+
+	survivor := f.insert("https", "h.com", 443, "/a", 200, same)
+	cited := f.insert("https", "h.com", 443, "/bbbb", 200, same)
+	noise := f.insert("https", "h.com", 443, "/cccc", 200, same)
+	f.citeByFinding(cited)
+
+	deleted, err := f.repo.DeduplicateRecordsBySource(f.ctx, f.projectUUID, "deparos")
+	if err != nil {
+		t.Fatalf("DeduplicateRecordsBySource: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("expected 1 deleted, got %d", deleted)
+	}
+	if !f.alive(survivor) || !f.alive(cited) {
+		t.Error("expected the survivor and the cited record to remain")
+	}
+	if f.alive(noise) {
+		t.Error("unreferenced duplicate survived")
+	}
+}
+
+// TestDedupPartitionsByOrigin proves the passes key on (hostname, scheme, port),
+// not hostname alone: byte-identical responses served by three different origins
+// on one hostname are three services' evidence, and collapsing them to a single
+// survivor threw two of them away.
+func TestDedupPartitionsByOrigin(t *testing.T) {
+	f := newDedupEvidenceFixture(t)
+
+	plain := f.insert("http", "h.com", 80, "/x", 401)
+	tls := f.insert("https", "h.com", 443, "/x", 401)
+	altPort := f.insert("https", "h.com", 8443, "/x", 401)
+	// A second 401 on one origin is a genuine duplicate and must still collapse.
+	dupOnTLS := f.insert("https", "h.com", 443, "/x-longer", 401)
+
+	cleanup, err := f.repo.ApplyDeparosStatusPolicy(f.ctx, f.projectUUID,
+		DeparosStatusPolicy{KeepOnePerHost: []int{401}})
+	if err != nil {
+		t.Fatalf("ApplyDeparosStatusPolicy: %v", err)
+	}
+	if cleanup.Deleted != 1 {
+		t.Errorf("expected 1 deleted (the same-origin duplicate), got %d", cleanup.Deleted)
+	}
+	for name, id := range map[string]string{"http:80": plain, "https:443": tls, "https:8443": altPort} {
+		if !f.alive(id) {
+			t.Errorf("origin %s lost its representative 401", name)
+		}
+	}
+	if f.alive(dupOnTLS) {
+		t.Error("same-origin duplicate 401 survived")
+	}
 }

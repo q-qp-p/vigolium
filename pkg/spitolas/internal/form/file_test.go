@@ -3,7 +3,11 @@ package form
 import (
 	"image/png"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/vigolium/vigolium/internal/scratch"
 )
 
 func TestGetDefaultFilePath(t *testing.T) {
@@ -279,5 +283,73 @@ func TestZIPMagicBytes(t *testing.T) {
 	// For minimal empty ZIP, the signature is End of Central Directory (0x50 0x4B 0x05 0x06)
 	if data[0] != 0x50 || data[1] != 0x4B {
 		t.Errorf("ZIP magic bytes = 0x%02X 0x%02X, want 0x50 0x4B", data[0], data[1])
+	}
+}
+
+// TestUploadFixturesAreRunOwned: fixtures land in a run-owned directory under
+// the process scratch root — never at a fixed name in the shared temp
+// directory — keep the ff_upload.<ext> basename the target sees, and are
+// removed when the last crawl releases them.
+func TestUploadFixturesAreRunOwned(t *testing.T) {
+	ReleaseGeneratedFiles() // start from a clean cache
+	RetainGeneratedFiles()
+	path, err := GetFilePathForType(FileTypeCSV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(path, scratch.Root()+string(filepath.Separator)) {
+		t.Errorf("fixture %q is not under the scratch root %q", path, scratch.Root())
+	}
+	if filepath.Base(path) != "ff_upload.csv" {
+		t.Errorf("fixture basename = %q, want ff_upload.csv", filepath.Base(path))
+	}
+	if filepath.Dir(path) == os.TempDir() {
+		t.Error("fixture written directly into the shared temp directory")
+	}
+
+	// A second crawl holding the fixtures keeps them alive past the first's release.
+	RetainGeneratedFiles()
+	ReleaseGeneratedFiles()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("fixture removed while another crawl still holds it: %v", err)
+	}
+	ReleaseGeneratedFiles()
+	if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
+		t.Errorf("fixture directory survived the last release: %v", err)
+	}
+
+	// A new run gets a fresh, distinct directory — which is also what keeps two
+	// processes sharing one temp root apart.
+	RetainGeneratedFiles()
+	defer ReleaseGeneratedFiles()
+	again, err := GetFilePathForType(FileTypeCSV)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.Dir(again) == filepath.Dir(path) {
+		t.Errorf("two runs shared a fixture directory: %q", filepath.Dir(again))
+	}
+}
+
+// TestUploadFixturesSeparateTempRoots: under different temp roots (two
+// processes with different TMPDIRs) the fixtures never collide.
+func TestUploadFixturesSeparateTempRoots(t *testing.T) {
+	var paths []string
+	for _, root := range []string{t.TempDir(), t.TempDir()} {
+		t.Setenv("TMPDIR", root)
+		ReleaseGeneratedFiles()
+		RetainGeneratedFiles()
+		p, err := GetFilePathForType(FileTypeTXT)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(p, root) {
+			t.Errorf("fixture %q not under its temp root %q", p, root)
+		}
+		paths = append(paths, p)
+		ReleaseGeneratedFiles()
+	}
+	if paths[0] == paths[1] {
+		t.Errorf("fixtures collided across temp roots: %q", paths[0])
 	}
 }

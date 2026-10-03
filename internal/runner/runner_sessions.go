@@ -2,7 +2,9 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/vigolium/vigolium/pkg/authentication"
 	"github.com/vigolium/vigolium/pkg/database"
@@ -12,10 +14,22 @@ import (
 
 // initSessions loads, validates, hydrates sessions and creates compare requesters.
 // Sources (in priority order): --auth-file/--auth flags → DB authentication_hostnames fallback.
-func (r *Runner) initSessions(infra *phaseInfra) error {
+//
+// ctx bounds the login flows: hydration runs on it (under the manager's own total
+// login budget), so a Ctrl-C during setup stops the logins instead of letting
+// them run to their per-request timeouts.
+func (r *Runner) initSessions(ctx context.Context, infra *phaseInfra) error {
 	opts := r.options
 	sessionCfg := r.settings.ScanningStrategy.Session
 	hasCLISessions := len(opts.AuthFiles) > 0 || len(opts.AuthInline) > 0
+
+	// Captured BEFORE the primary-session append below. Compare requesters must
+	// carry the operator's own headers plus their OWN session's — never the
+	// primary session's credentials. Building them from the post-append slice made
+	// every compare requester send the primary's Authorization as well as its own,
+	// so an authorization-differential module compared the primary against itself
+	// and could not report a difference.
+	baseHeaders := slices.Clone(opts.Headers)
 
 	var sessions []*authentication.Session
 	var sessionHostnameMap map[string]string // session name → hostname (from DB)
@@ -38,33 +52,43 @@ func (r *Runner) initSessions(infra *phaseInfra) error {
 		}
 	} else {
 		// Fallback: load from DB authentication_hostnames for this project's target hostnames
-		sessions, sessionHostnameMap, fromDB = r.loadSessionsFromDB()
+		sessions, sessionHostnameMap, fromDB = r.loadSessionsFromDB(ctx)
 		if len(sessions) == 0 {
 			return nil
 		}
 	}
 
-	mgr, err := authentication.NewManager(sessions, authentication.WithSessionDir(sessionCfg.SessionDir))
+	mgr, err := authentication.NewManager(sessions,
+		authentication.WithSessionDir(sessionCfg.SessionDir),
+		// A login goes to the host the scan is about to attack, so it follows the
+		// same proxy and TLS policy as every other request to that host.
+		authentication.WithLoginTransport(http.LoginTransport(opts)),
+	)
 	if err != nil {
 		return err
 	}
 
-	// Execute login flows (re-hydrate DB sessions to refresh potentially stale tokens)
-	if err := mgr.HydrateSessions(); err != nil {
+	// Execute login flows (re-hydrate DB sessions to refresh potentially stale
+	// tokens). Bounded by ctx and by the manager's total login budget, so a
+	// target that accepts the connection and never answers delays the scan by the
+	// budget rather than by one per-request timeout per session.
+	if err := mgr.HydrateSessionsContext(ctx); err != nil {
 		return fmt.Errorf("session hydration failed: %w", err)
 	}
 
 	// Persist CLI sessions to DB for reuse in future scans
 	if hasCLISessions {
-		r.persistSessionsToDB(mgr.AllSessions())
+		r.persistSessionsToDB(ctx, mgr.AllSessions())
 	}
 
-	// Merge primary session headers into the main requester's options.
-	// When use_in_discovery is false, primary headers are only applied to the
-	// dynamic-assessment phase requester (handled downstream), not the main one used
-	// for discovery and spidering.
 	primaryHeaders := mgr.PrimaryHeaders()
-	if len(primaryHeaders) > 0 && sessionCfg.UseInDiscovery {
+	switch {
+	case len(primaryHeaders) == 0:
+		// Nothing to apply (static-header sessions with no primary headers, or a
+		// login that produced none).
+	case sessionCfg.UseInDiscovery:
+		// Credentials on the shared requester: every phase, discovery and
+		// spidering included, sends them.
 		opts.Headers = append(opts.Headers, primaryHeaders...)
 		// Rebuild the main requester with updated headers
 		httpRequester, err := http.NewRequester(opts, infra.svc)
@@ -72,6 +96,13 @@ func (r *Runner) initSessions(infra *phaseInfra) error {
 			return fmt.Errorf("failed to rebuild requester with session headers: %w", err)
 		}
 		infra.httpRequester = httpRequester
+	default:
+		// use_in_discovery: false — keep the credentials OFF the shared requester
+		// (discovery and spidering stay anonymous) but hand them to the assessment
+		// phases, which derive an authenticated view of that same requester. They
+		// used to be resolved here and then discarded, so the whole scan ran
+		// unauthenticated.
+		infra.assessmentHeaders = primaryHeaders
 	}
 
 	// Create separate requesters for compare sessions (IDOR/BOLA testing)
@@ -87,9 +118,11 @@ func (r *Runner) initSessions(infra *phaseInfra) error {
 	}
 
 	for _, cs := range cmpSessions {
-		// Clone options, merge global headers with session-specific auth headers
+		// Clone options, merge the operator's own headers with THIS session's auth
+		// headers — from baseHeaders, so the primary session's credentials (which
+		// may have been appended to opts.Headers above) are not included.
 		compareOpts := *opts
-		compareOpts.Headers = append(append([]string{}, opts.Headers...), cs.HeaderSlice()...)
+		compareOpts.Headers = append(slices.Clone(baseHeaders), cs.HeaderSlice()...)
 		compareRequester, err := http.NewRequester(&compareOpts, infra.svc)
 		if err != nil {
 			return fmt.Errorf("failed to create requester for session %q: %w", cs.Name, err)
@@ -117,15 +150,76 @@ func (r *Runner) initSessions(infra *phaseInfra) error {
 	return nil
 }
 
+// authFailureReason classifies a session-initialization failure into one of the
+// phase-outcome reason codes, so a scan that ran unauthenticated says WHY.
+//
+// A deadline that fired while parent is still live is the login budget's; one
+// that fired with parent already expired belongs to the scan budget, which is
+// the honest attribution — the logins were not slow, the scan ran out of time.
+func authFailureReason(parent context.Context, err error) string {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return database.ReasonCancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		if parent != nil && parent.Err() == nil {
+			return database.ReasonLoginBudget
+		}
+		return database.ReasonScanBudget
+	default:
+		return database.ReasonAuthUnavailable
+	}
+}
+
+// assessmentRequester returns the requester the assessing phases (dynamic
+// assessment, known-issue scan's edge hooks) should send through: the shared one
+// when the primary session's credentials are already on it (or there are none),
+// else an authenticated view of it carrying infra.assessmentHeaders.
+//
+// The view shares the transport, host limiter, request counter, response
+// observer and carried browser sessions, and has its own cookie jar and
+// response-cache partition — so authenticated responses never coalesce with the
+// anonymous parent's, which for an authorization-differential module would be
+// the measurement itself.
+func (r *Runner) assessmentRequester(infra *phaseInfra) (*http.Requester, error) {
+	if infra == nil {
+		return nil, fmt.Errorf("no phase infrastructure")
+	}
+	if len(infra.assessmentHeaders) == 0 {
+		return infra.httpRequester, nil
+	}
+	view, err := infra.httpRequester.WithAdditionalHeaders(infra.assessmentHeaders)
+	if err != nil {
+		return nil, fmt.Errorf("failed to apply session headers to the assessment requester: %w", err)
+	}
+	zap.L().Info("Assessment requester carries the primary session (session.use_in_discovery is false, so discovery and spidering stay anonymous)",
+		zap.Int("headers", len(infra.assessmentHeaders)))
+	return view, nil
+}
+
+// assessmentHeaderSlice returns the headers a phase that cannot share the
+// scan requester (known-issue scan runs nuclei's own HTTP stack) must send: the
+// operator's own, plus the primary session's when they are not already there.
+// assessmentHeaders is empty under use_in_discovery: true, where
+// r.options.Headers already carries them — so this is correct in both modes and
+// never duplicates.
+func (r *Runner) assessmentHeaderSlice(infra *phaseInfra) []string {
+	headers := slices.Clone(r.options.Headers)
+	if infra != nil {
+		headers = append(headers, infra.assessmentHeaders...)
+	}
+	return headers
+}
+
 // loadSessionsFromDB loads sessions from the authentication_hostnames table for target hostnames.
 // Returns the loaded sessions, a map of session name → hostname for per-host filtering,
 // and true if sessions were loaded from DB.
-func (r *Runner) loadSessionsFromDB() ([]*authentication.Session, map[string]string, bool) {
+//
+// ctx is the setup context, not r.ctx: a cancelled scan must not keep querying.
+func (r *Runner) loadSessionsFromDB(ctx context.Context) ([]*authentication.Session, map[string]string, bool) {
 	if r.repository == nil || r.options.ProjectUUID == "" {
 		return nil, nil, false
 	}
 
-	ctx := r.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -187,12 +281,11 @@ func (r *Runner) loadSessionsFromDB() ([]*authentication.Session, map[string]str
 }
 
 // persistSessionsToDB saves hydrated CLI sessions to authentication_hostnames for future reuse.
-func (r *Runner) persistSessionsToDB(sessions []*authentication.Session) {
+func (r *Runner) persistSessionsToDB(ctx context.Context, sessions []*authentication.Session) {
 	if r.repository == nil || r.options.ProjectUUID == "" || len(sessions) == 0 {
 		return
 	}
 
-	ctx := r.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}

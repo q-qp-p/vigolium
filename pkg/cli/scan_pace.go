@@ -73,12 +73,28 @@ func applyPhasePaceOverrides(settings *config.Settings, opts *types.Options) {
 	for _, knob := range []struct {
 		k     *paceKnob
 		field func(*config.PhasePace) *int
+		// paceField names this dial in config.PhasePaceSupports terms, so the
+		// "does this phase enforce it" question has one answer for the warning
+		// here, the pace table, and the phase headers.
+		paceField string
 	}{
-		{rateLimitKnob, func(p *config.PhasePace) *int { return &p.RateLimit }},
-		{concurrencyKnob, func(p *config.PhasePace) *int { return &p.Concurrency }},
-		{maxPerHostKnob, func(p *config.PhasePace) *int { return &p.MaxPerHost }},
+		{rateLimitKnob, func(p *config.PhasePace) *int { return &p.RateLimit }, config.PaceFieldRateLimit},
+		{concurrencyKnob, func(p *config.PhasePace) *int { return &p.Concurrency }, config.PaceFieldConcurrency},
+		{maxPerHostKnob, func(p *config.PhasePace) *int { return &p.MaxPerHost }, config.PaceFieldMaxPerHost},
 	} {
 		for _, phase := range sortedKeys(knob.k.perPhase) {
+			// An unsupported dial is still written into the section — the value is
+			// what the operator typed, and a later release that teaches the phase to
+			// read it should not need the flag re-typed — but it is announced, and
+			// resolvedPaceTable omits it so no consumer reads it as effective.
+			//
+			// A warning rather than an error for the same reason as the
+			// not-running case below: failing the scan would make the flag hostile
+			// to reuse, and the defect was silence, not permissiveness.
+			if running[phase] && !config.PhasePaceSupports(phase, knob.paceField) {
+				fmt.Fprintf(os.Stderr, "%s --%s override for phase %q is not enforced — that phase does not apply %s\n",
+					terminal.WarnPrefix(), knob.k.flagName, phase, knob.paceField)
+			}
 			if !running[phase] {
 				// A warning rather than an error: --only/--skip and the strategy
 				// all change which phases run, and failing a scan because a pace
@@ -113,6 +129,11 @@ func sortedKeys(m map[string]int) []string {
 // keyed by canonical phase id. Entries identical to the global pace are dropped:
 // the table exists to show where a phase DIFFERS, and one that restates the
 // global values for five phases buries the one line that matters.
+//
+// A field the phase does not ENFORCE is left at zero rather than reported, so the
+// table says only what is true. It used to carry the resolved value for all three
+// dials on every phase — a driver reading `scan.started` was told spidering ran at
+// 100 rps and 40 per host, neither of which the crawler has any way to apply.
 func resolvedPaceTable(settings *config.Settings, opts *types.Options) (scanevents.Pace, map[string]scanevents.Pace) {
 	globalPace := scanevents.Pace{
 		RateLimit:   opts.RateLimit,
@@ -125,10 +146,31 @@ func resolvedPaceTable(settings *config.Settings, opts *types.Options) (scaneven
 	table := map[string]scanevents.Pace{}
 	for _, phase := range paceEnabledPhases(opts) {
 		resolved := settings.ScanningPace.ResolvePhase(phase)
-		entry := scanevents.Pace{
-			RateLimit:   resolved.RateLimit,
-			Concurrency: resolved.Concurrency,
-			MaxPerHost:  resolved.MaxPerHost,
+		entry := scanevents.Pace{}
+		if config.PhasePaceSupports(phase, config.PaceFieldRateLimit) {
+			entry.RateLimit = resolved.RateLimit
+			// Discovery enforces only an EXPLICIT rate; it does not inherit the
+			// global 100 rps default (triage C13). Reporting the resolved value
+			// would advertise a ceiling the crawl does not apply, which is the same
+			// class of lie the support table exists to remove.
+			if phase == "discovery" {
+				entry.RateLimit = settings.ScanningPace.DiscoveryRateLimit(opts)
+			}
+		}
+		if config.PhasePaceSupports(phase, config.PaceFieldConcurrency) {
+			entry.Concurrency = resolved.Concurrency
+		}
+		if config.PhasePaceSupports(phase, config.PaceFieldMaxPerHost) {
+			entry.MaxPerHost = resolved.MaxPerHost
+		}
+		// A phase that enforces NO pace field is omitted rather than reported as
+		// three zeros. Spidering is the case: it runs one browser and has no
+		// limiter, no rate and no host semaphore, and "concurrency 0" would be a
+		// worse answer than no answer. For every phase that remains, concurrency
+		// is enforced, and a zero rate_limit or max_per_host means exactly what a
+		// zero means everywhere else in this vocabulary — unlimited.
+		if entry == (scanevents.Pace{}) {
+			continue
 		}
 		if entry != globalPace {
 			table[phase] = entry

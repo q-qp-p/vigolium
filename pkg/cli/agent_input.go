@@ -173,13 +173,9 @@ func printIntentDryRun(intent *agent.ScanIntent) error {
 
 // loadCLISettings loads settings, falling back to defaults on error so the
 // CLI can keep working with reasonable behavior even if the YAML is unreadable.
+// The fallback is announced rather than logged — see settingsOrDefaults.
 func loadCLISettings() *config.Settings {
-	settings, err := config.LoadSettings(globalConfig)
-	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		return config.DefaultSettings()
-	}
-	return settings
+	return settingsOrDefaults()
 }
 
 // parsePromptIntent is the shared scaffold for both runAutopilotFromPrompt and

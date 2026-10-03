@@ -329,10 +329,9 @@ func runServerCmd(cmd *cobra.Command, args []string) error {
 
 	// Load settings early so config values are available for API key resolution
 	// and for the server.enable_burp_bridge fallback resolved just below.
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// Burp bridge address: -B/--burp-bridge-url (which already defaults to

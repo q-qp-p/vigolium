@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/action"
+	"github.com/vigolium/vigolium/pkg/spitolas/internal/browser"
+	"github.com/vigolium/vigolium/pkg/spitolas/internal/state"
 	"go.uber.org/zap"
 )
 
@@ -103,12 +105,13 @@ func (c *Crawler) reExtractKnownStates(ctx context.Context) int {
 			continue
 		}
 
-		c.extractor.SetCurrentState(s.ID)
+		targetID := c.followUpTargetState(ctx, page, s)
+		c.extractor.SetCurrentState(targetID)
 		actions, err := c.extractor.Extract(ctx, page)
 		if err != nil || len(actions) == 0 {
 			continue
 		}
-		c.candidates.AddActions(actions, s.ID)
+		c.candidates.AddActions(actions, targetID)
 		added += len(actions)
 		zap.L().Debug("Follow-up re-extraction found new actions",
 			zap.String("url", s.URL), zap.Int("count", len(actions)))
@@ -117,6 +120,29 @@ func (c *Crawler) reExtractKnownStates(ctx context.Context) int {
 	zap.L().Debug("Follow-up re-extraction complete",
 		zap.Int("locations_visited", visited), zap.Int("actions_added", added))
 	return added
+}
+
+// followUpTargetState returns the ID of the state a revisit of s.URL actually
+// rendered, which is where its re-extracted actions must be queued.
+//
+// Loading a state's URL does not always reproduce that state: a state reached
+// by an in-page action (an AJAX swap, a "#" link) records the URL it was
+// reached on, and loading that URL renders the page it started from. Queued
+// under s, the base page's actions would be replayed against s's DOM, where
+// the same XPaths name different elements — wrong clicks and edges labelled
+// with the wrong element. A DOM matching no known state is the case the pass
+// exists for (the location has new content), so it stays attributed to s.
+func (c *Crawler) followUpTargetState(ctx context.Context, page *browser.Page, s *state.State) string {
+	rendered, err := c.captureState(ctx, page, s.Depth)
+	if err != nil || rendered.ID == s.ID {
+		return s.ID
+	}
+	if known, ok := c.graph.GetState(rendered.ID); ok {
+		zap.L().Debug("Follow-up revisit rendered a different known state",
+			zap.String("url", s.URL), zap.String("revisited", s.Name), zap.String("rendered", known.Name))
+		return known.ID
+	}
+	return s.ID
 }
 
 // recordFailedAction remembers an action the crawl gave up on so the retry sweep

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -88,9 +89,25 @@ type targetResult struct {
 	console     string
 	err         error
 	interrupted bool // batch was canceled (Ctrl-C) before this target finished
+	gated       bool // child exited 4: it scanned fine and tripped --fail-on
 	duration    time.Duration
 	stats       childStats
 	statsOK     bool
+}
+
+// childTrippedGate reports whether a child exited with the --fail-on severity
+// gate's code rather than having failed.
+//
+// Exit 4 is a completed result — the child scanned, wrote its output and found
+// something at or above the threshold — so counting it as a failure threw away
+// its stats and mislabelled it in the summary, while counting it as a plain
+// success threw away the operator's gate. It is its own outcome.
+func childTrippedGate(err error) bool {
+	if err == nil {
+		return false
+	}
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == ExitFailOnGate
 }
 
 // childStats are the per-target counts the parent recovers from a child's
@@ -311,7 +328,7 @@ func runStatelessTargetsParallel(cmd *cobra.Command, settings *config.Settings, 
 				fmt.Fprintf(os.Stderr, "%s all %d targets already complete — nothing to resume\n",
 					terminal.Purple(terminal.SymbolInfo), allCount)
 			}
-			printParallelSummary(nil, 0, 0, manifestPath, priorCarry)
+			printParallelSummary(nil, 0, 0, 0, manifestPath, priorCarry)
 			return nil
 		}
 		if !scanOpts.Silent {
@@ -409,7 +426,7 @@ func runStatelessTargetsParallel(cmd *cobra.Command, settings *config.Settings, 
 	// A parent SIGINT/SIGTERM cancels ctx, which each child's Cancel hook turns
 	// into a forwarded SIGINT (not SIGKILL) so children shut down cleanly and
 	// remove their temp databases.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), scanShutdownSignals...)
 	defer stop()
 
 	// Each child is a plain single-target stateless scan writing its own per-host
@@ -430,8 +447,12 @@ func runStatelessTargetsParallel(cmd *cobra.Command, settings *config.Settings, 
 	// atomic save are serialized against concurrent completions. idx is the index
 	// within this run's (possibly narrowed) slice; startOffset maps it back to the
 	// absolute line. We only rewrite the file when the cursor actually moved.
+	//
+	// A gated child counts as done: it scanned its target, wrote its output and
+	// merged. Leaving it out would make --resume re-scan every target that found
+	// a high-severity finding, which is the opposite of what the gate asked for.
 	onComplete := func(idx int, res targetResult) {
-		if res.err != nil || res.interrupted {
+		if res.interrupted || (res.err != nil && !res.gated) {
 			return
 		}
 		if manifest.markDone(startOffset+idx, res.target, res.stats) {
@@ -441,12 +462,12 @@ func runStatelessTargetsParallel(cmd *cobra.Command, settings *config.Settings, 
 		}
 	}
 
-	results, failed, interrupted := fanOutTargetScans(ctx, exe, targets, parallel, planFor, onComplete)
+	results, failed, interrupted, gated := fanOutTargetScans(ctx, exe, targets, parallel, planFor, onComplete)
 
 	// priorCarry folds the previously-completed prefix into the roll-up and exit
 	// status so they reason about the whole batch, not just this run's remainder.
-	printParallelSummary(results, failed, interrupted, manifestPath, priorCarry)
-	return parallelBatchError(failed, interrupted, allCount)
+	printParallelSummary(results, failed, interrupted, gated, manifestPath, priorCarry)
+	return parallelBatchError(failed, interrupted, gated, allCount)
 }
 
 // childPlan describes one child scan the parent will spawn: the full argv (with
@@ -472,13 +493,16 @@ type childPlan struct {
 // the result lock is held, so it may safely mutate shared state (the stateless
 // path uses it to checkpoint each completed target to the resume manifest). It
 // receives the target's index and its fully-populated result.
-func fanOutTargetScans(ctx context.Context, exe string, targets []string, parallel int, planFor func(i int, target string) childPlan, onComplete func(idx int, res targetResult)) ([]targetResult, int, int) {
+// It returns the per-target results plus the failed, interrupted and gated
+// tallies. A gated child is in none of the first two: see childTrippedGate.
+func fanOutTargetScans(ctx context.Context, exe string, targets []string, parallel int, planFor func(i int, target string) childPlan, onComplete func(idx int, res targetResult)) (res []targetResult, failedN, interruptedN, gatedN int) {
 	var (
-		mu          sync.Mutex // guards results, completed, failed, interrupted, and stderr prints
+		mu          sync.Mutex // guards results, completed, failed, interrupted, gated, and stderr prints
 		results     = make([]targetResult, len(targets))
 		completed   int
 		failed      int
 		interrupted int
+		gated       int
 		wg          sync.WaitGroup
 	)
 	sem := make(chan struct{}, parallel)
@@ -530,21 +554,28 @@ func fanOutTargetScans(ctx context.Context, exe string, targets []string, parall
 			// "fail" — it was cut short. Treat it as interrupted so it joins the
 			// general not-scanned tally rather than the genuine-failure list.
 			wasInterrupted := runErr != nil && ctx.Err() != nil
+			// Exit 4 is a completed scan that tripped the operator's gate. It
+			// wrote its output before choosing that code, so its stats are read
+			// exactly as for a success.
+			wasGated := !wasInterrupted && childTrippedGate(runErr)
 
 			// Recover per-target counts from the JSONL the child just wrote.
-			// Only on success — a failed child may have written nothing.
+			// Only when it ran to completion — a failed child may have written
+			// nothing.
 			var stats childStats
 			statsOK := false
-			if runErr == nil && plan.statsBase != "" {
+			if (runErr == nil || wasGated) && plan.statsBase != "" {
 				stats, statsOK = readChildStats(plan.statsBase, plan.statsFormats)
 			}
 
 			mu.Lock()
-			results[i] = targetResult{target: target, output: plan.statsBase, console: plan.console, err: runErr, interrupted: wasInterrupted, duration: dur, stats: stats, statsOK: statsOK}
+			results[i] = targetResult{target: target, output: plan.statsBase, console: plan.console, err: runErr, interrupted: wasInterrupted, gated: wasGated, duration: dur, stats: stats, statsOK: statsOK}
 			completed++
 			switch {
 			case wasInterrupted:
 				interrupted++
+			case wasGated:
+				gated++
 			case runErr != nil:
 				failed++
 			}
@@ -559,6 +590,15 @@ func fanOutTargetScans(ctx context.Context, exe string, targets []string, parall
 						terminal.BoldHiBlue(fmt.Sprintf("[%d/%d]", i+1, total)),
 						terminal.Gray(padStatus("stopped")),
 						terminal.Gray(target))
+				case wasGated:
+					fmt.Fprintf(os.Stderr, "%s %s %s %s  (%s) · %s%d/%d done, %d failed  (gate tripped)\n",
+						terminal.BoldYellow(terminal.SymbolSuccess),
+						terminal.BoldHiBlue(fmt.Sprintf("[%d/%d]", i+1, total)),
+						terminal.Yellow(padStatus("done")),
+						target,
+						terminal.Magenta(dur.Round(time.Second).String()),
+						statsSegment(stats, statsOK),
+						doneCount, total, failCount)
 				case runErr != nil:
 					fmt.Fprintf(os.Stderr, "%s %s %s %s  (%s) — see %s\n",
 						terminal.BoldRed(terminal.SymbolError),
@@ -583,9 +623,9 @@ func fanOutTargetScans(ctx context.Context, exe string, targets []string, parall
 			}
 			mu.Unlock()
 
-			// Only genuine failures are logged at ERROR — an operator Ctrl-C is
-			// not an error worth a stack of red log lines.
-			if runErr != nil && !wasInterrupted {
+			// Only genuine failures are logged at ERROR — an operator Ctrl-C and
+			// a tripped gate are not errors worth a stack of red log lines.
+			if runErr != nil && !wasInterrupted && !wasGated {
 				zap.L().Error("Parallel target scan failed",
 					zap.String("target", target),
 					zap.String("console", plan.console),
@@ -595,7 +635,7 @@ func fanOutTargetScans(ctx context.Context, exe string, targets []string, parall
 	}
 
 	wg.Wait()
-	return results, failed, interrupted
+	return results, failed, interrupted, gated
 }
 
 // runIsolatedTargetsParallel scans every target in targets concurrently, up to
@@ -704,7 +744,7 @@ func runIsolatedTargetsParallel(cmd *cobra.Command, settings *config.Settings, s
 	// A parent SIGINT/SIGTERM cancels ctx, which each child's Cancel hook turns
 	// into a forwarded SIGINT (not SIGKILL) so children shut down cleanly and
 	// finish (or abandon) their merge before exiting.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), scanShutdownSignals...)
 	defer stop()
 
 	// Each child inherits --db-isolate/--db from the parent and writes a
@@ -724,14 +764,15 @@ func runIsolatedTargetsParallel(cmd *cobra.Command, settings *config.Settings, s
 	// The db-isolate path merges into one shared DB and has no per-host output
 	// files, so host-level resume does not apply here (v1): no manifest callback,
 	// and the summary prints the generic re-run hint rather than a --resume tip.
-	results, failed, interrupted := fanOutTargetScans(ctx, exe, targets, parallel, planFor, nil)
+	results, failed, interrupted, gated := fanOutTargetScans(ctx, exe, targets, parallel, planFor, nil)
 
-	printParallelSummary(results, failed, interrupted, "", carryoverStats{})
+	printParallelSummary(results, failed, interrupted, gated, "", carryoverStats{})
 
 	// Export the unified output only when at least one child merged something —
 	// if every child failed or was interrupted there is nothing new in the
-	// destination to export.
-	batchErr := parallelBatchError(failed, interrupted, len(targets))
+	// destination to export. A gated child DID merge, so it counts toward having
+	// something to export.
+	batchErr := parallelBatchError(failed, interrupted, gated, len(targets))
 	if failed+interrupted < len(targets) {
 		// The batch itself can be a success here — children scanned and merged
 		// fine — so without this a run whose only artifact is missing exits 0.
@@ -756,13 +797,16 @@ func exportUnifiedFromDB(destCfg config.DatabaseConfig, opts *types.Options) err
 	if err := db.CreateSchema(context.Background()); err != nil {
 		return fmt.Errorf("prepare destination schema: %w", err)
 	}
-	maybeGenerateReports(db, opts)
-	finishFSExport(db, opts)
 	// This is the ONLY place the fan-out's unified output is written — every
 	// child scanned into its own scratch and merged, and none of them wrote the
 	// operator's -o. Losing it silently would leave a batch that reports every
-	// target as scanned and hands back no results at all.
-	return finishScanJSONLExport(db, opts)
+	// target as scanned and hands back no results at all. Each format is still
+	// attempted independently, so one unwritable destination costs only itself.
+	return errors.Join(
+		maybeGenerateReports(db, opts),
+		finishFSExport(db, opts),
+		finishScanJSONLExport(db, opts),
+	)
 }
 
 // parallelBatchError decides the batch's exit status. A partial success is
@@ -771,7 +815,15 @@ func exportUnifiedFromDB(destCfg config.DatabaseConfig, opts *types.Options) err
 // (everything either failed or was interrupted). A partial interrupt — some
 // targets completed before the stop — exits clean, just like a partial failure.
 // --soft-fail (handled at the root) still forces exit 0 regardless.
-func parallelBatchError(failed, interrupted, total int) error {
+//
+// The gate is last, and lowest-priority, because it is not a failure: a child
+// that tripped --fail-on scanned, wrote its output and merged. Reporting it
+// mattered though — a `-P --fail-on high` batch used to exit 0 when some
+// children tripped (the gate was per-child, and the parent only looked at
+// failures), so a CI job that asked to be stopped by a high-severity finding
+// was not. It now exits 4, the same code a single-target run gives, which is
+// what makes the flag mean one thing on both paths.
+func parallelBatchError(failed, interrupted, gated, total int) error {
 	if total == 0 {
 		return nil
 	}
@@ -780,6 +832,9 @@ func parallelBatchError(failed, interrupted, total int) error {
 	}
 	if failed == total {
 		return fmt.Errorf("all %d target scans failed", total)
+	}
+	if gated > 0 {
+		return gateError{fmt.Errorf("--fail-on: %d of %d targets tripped the severity gate", gated, total)}
 	}
 	return nil
 }
@@ -827,11 +882,14 @@ func runChildScan(ctx context.Context, exe string, args []string, consolePath st
 // empty manifestPath (the db-isolate path) keeps the generic re-run line. carry
 // folds a resumed run's previously-completed prefix into the totals so the
 // counts reflect the whole batch, not just this run's remainder.
-func printParallelSummary(results []targetResult, failed, interrupted int, manifestPath string, carry carryoverStats) {
+func printParallelSummary(results []targetResult, failed, interrupted, gated int, manifestPath string, carry carryoverStats) {
 	if scanOpts.Silent {
 		return
 	}
 	total := carry.count + len(results)
+	// A gated target succeeded: it scanned and wrote its output. It is listed
+	// separately below so the operator can see which targets tripped the gate
+	// without reading them as failures.
 	succeeded := total - failed - interrupted
 
 	var longest time.Duration
@@ -893,7 +951,7 @@ func printParallelSummary(results []targetResult, failed, interrupted int, manif
 	// Enumerate genuine failures only — each with its console for triage.
 	if failed > 0 {
 		for _, r := range results {
-			if r.err == nil || r.interrupted {
+			if r.err == nil || r.interrupted || r.gated {
 				continue
 			}
 			fmt.Fprintf(os.Stderr, "  %s %s — %v (%s)\n",
@@ -901,6 +959,21 @@ func printParallelSummary(results []targetResult, failed, interrupted int, manif
 				r.target,
 				r.err,
 				terminal.Gray(r.console))
+		}
+	}
+
+	// Gated targets get their own list: they are results, not failures, and the
+	// operator asked to be told which ones crossed the threshold.
+	if gated > 0 {
+		fmt.Fprintf(os.Stderr, "  %s %s target(s) tripped %s:\n",
+			terminal.BoldYellow(terminal.SymbolTarget),
+			terminal.BoldYellow(fmt.Sprintf("%d", gated)),
+			terminal.BoldCyan("--fail-on "+scanFailOn))
+		for _, r := range results {
+			if !r.gated {
+				continue
+			}
+			fmt.Fprintf(os.Stderr, "    %s %s\n", terminal.BoldYellow(terminal.SymbolSuccess), r.target)
 		}
 	}
 

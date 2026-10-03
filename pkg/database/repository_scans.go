@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -172,9 +173,30 @@ func applySeverityCounts(q *bun.UpdateQuery, sc scanSeverityCounts) *bun.UpdateQ
 		Set("total_findings = ?", sc.Total)
 }
 
-// CompleteScan marks a scan as completed (or failed if errMsg is non-empty)
-// and populates severity counts from the findings table.
+// CompleteScan marks a scan as completed (or failed if errMsg is non-empty) and
+// populates severity counts from the findings table.
+//
+// Leaves the completeness columns untouched, so a caller with no phase-outcome
+// data (the server's own finalization paths, an agent rescan) records "unknown"
+// rather than asserting a coverage verdict it cannot know. The runner, which
+// does see every phase, calls CompleteScanWithOutcome instead.
 func (r *Repository) CompleteScan(ctx context.Context, scanUUID string, errMsg string) error {
+	return r.CompleteScanWithOutcome(ctx, scanUUID, errMsg, ScanCompletion{})
+}
+
+// CompleteScanWithOutcome is CompleteScan plus the scan's coverage verdict: how
+// complete the run was, the single reason it stopped short, and the per-phase
+// outcomes behind that verdict.
+//
+// The status vocabulary is deliberately unchanged — "completed" still means the
+// scan reached its end, and existing consumers keep working. Completeness is a
+// SECOND axis alongside it, because the two are independent facts: a run can
+// reach its end having covered half its input, and conflating that into a new
+// status value would break every caller that switches on the four it knows.
+//
+// A zero ScanCompletion writes nothing to the three columns, which is how a
+// caller says "I don't know" without overwriting a verdict with a guess.
+func (r *Repository) CompleteScanWithOutcome(ctx context.Context, scanUUID string, errMsg string, c ScanCompletion) error {
 	status := "completed"
 	if errMsg != "" {
 		status = "failed"
@@ -207,9 +229,37 @@ func (r *Repository) CompleteScan(ctx context.Context, scanUUID string, errMsg s
 		Set("updated_at = CURRENT_TIMESTAMP").
 		Where("uuid = ?", scanUUID)
 	q = applySeverityCounts(q, sc)
+	q = applyScanCompletionColumns(q, c)
 
 	_, err := q.Exec(ctx)
 	return err
+}
+
+// applyScanCompletionColumns adds the completeness columns to an UPDATE, and
+// adds nothing at all for a zero completion.
+//
+// Written as JSON text rather than through the model's jsonb tag because this is
+// a column-level UPDATE, not a model save — bun only applies the type mapping
+// when it owns the struct field. The outcomes are serialised here so the column
+// holds the same shape the REST scan object and `--format jsonl` carry.
+func applyScanCompletionColumns(q *bun.UpdateQuery, c ScanCompletion) *bun.UpdateQuery {
+	if c.Completeness == "" && c.StopReason == "" && len(c.Phases) == 0 {
+		return q
+	}
+	q = q.Set("completeness = ?", c.Completeness).
+		Set("stop_reason = ?", c.StopReason)
+	if len(c.Phases) == 0 {
+		return q.Set("phase_outcomes = ?", nil)
+	}
+	encoded, err := json.Marshal(c.Phases)
+	if err != nil {
+		// A PhaseOutcome is plain strings and ints, so this cannot fail in
+		// practice; if it somehow does, the verdict is still worth more than the
+		// detail behind it, so record the verdict and drop the detail.
+		zap.L().Warn("failed to encode scan phase outcomes", zap.Error(err))
+		return q.Set("phase_outcomes = ?", nil)
+	}
+	return q.Set("phase_outcomes = ?", string(encoded))
 }
 
 // RefreshScanStats updates running scan stats during long-running scans

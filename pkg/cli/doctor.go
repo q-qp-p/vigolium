@@ -10,9 +10,9 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/diagnostics"
 	"github.com/vigolium/vigolium/pkg/terminal"
-	"go.uber.org/zap"
 )
 
 var (
@@ -55,13 +55,21 @@ func runDoctorCmd(cmd *cobra.Command, args []string) error {
 			strings.Join(doctorOnly, ", "))
 	}
 
-	settings, err := config.LoadSettings(globalConfig)
-	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
+	// doctor is the one command that must not fail on a broken config: reporting
+	// that the config is broken is its job. The error is carried into the report
+	// as a failed check rather than warned into a logger and then contradicted by
+	// a green readout.
+	settings, cfgErr := clicommon.LoadSettings(globalConfig)
+	if cfgErr != nil {
 		settings = config.DefaultSettings()
 	}
 
-	deps := diagnostics.Deps{Settings: settings, ProbeBrowserLaunch: true}
+	deps := diagnostics.Deps{
+		Settings:           settings,
+		ConfigErr:          cfgErr,
+		ConfigPath:         effectiveConfigPath(),
+		ProbeBrowserLaunch: true,
+	}
 
 	// Try to open DB (optional — report error if it fails). The error is
 	// passed through to diagnostics so a postgres connect failure surfaces as
@@ -273,6 +281,11 @@ func printDoctorReport(r *diagnostics.Report) {
 
 	// ── Core ──
 	printDoctorSection("Core", "")
+	if r.Config != nil {
+		printCheck("Config", r.Config.Status, r.Config.Message)
+		printDetails(detailsVisible(r.Config.Status), r.Config.Details)
+		printTip(r.Config.Tip)
+	}
 	if r.Database != nil {
 		printCheck("Database", r.Database.Status, r.Database.Message)
 		printDetails(detailsVisible(r.Database.Status), r.Database.Details)

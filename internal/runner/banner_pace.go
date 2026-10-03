@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/input/source"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/types"
 )
@@ -25,6 +26,25 @@ func SpideringBudget(settings *config.Settings, options *types.Options) time.Dur
 		return 0
 	}
 	return settings.Spidering.MaxDurationParsed()
+}
+
+// DiscoveryBudget returns the wall-clock budget one discovery target gets.
+//
+// Same contract as SpideringBudget, for the phase whose fallback lived inside
+// the input source: option (--discover-max-time, else the scanning_pace value)
+// first, then scanning_pace.discovery.max_duration, then the source's own
+// default. Without this the banner printed the unset option — 0, rendered as no
+// budget at all — while every target ran for the source's default hour.
+func DiscoveryBudget(settings *config.Settings, options *types.Options) time.Duration {
+	if options != nil && options.DiscoverMaxDuration > 0 {
+		return options.DiscoverMaxDuration
+	}
+	if settings != nil {
+		if d := settings.ScanningPace.ResolvePhase("discovery").MaxDuration; d > 0 {
+			return d
+		}
+	}
+	return source.DefaultDiscoveryMaxDuration
 }
 
 // phaseBudget reports the time budget a phase will run with, and the

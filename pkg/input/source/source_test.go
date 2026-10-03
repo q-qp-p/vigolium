@@ -249,7 +249,7 @@ func TestConcurrentMultiSource_ForwardsAllItems(t *testing.T) {
 	// exactly once (order across sources is not guaranteed).
 	a := newFakeSource("a1", "a2")
 	b := newFakeSource("b1", "b2", "b3")
-	cs := NewConcurrentMultiSource(a, b)
+	cs := NewConcurrentMultiSource(context.Background(), a, b)
 
 	got := drain(t, cs)
 	sort.Strings(got)
@@ -263,7 +263,7 @@ func TestConcurrentMultiSource_ForwardsAllItems(t *testing.T) {
 func TestConcurrentMultiSource_PropagatesError(t *testing.T) {
 	a := newFakeSource()
 	a.failNext = errors.New("kaboom")
-	cs := NewConcurrentMultiSource(a)
+	cs := NewConcurrentMultiSource(context.Background(), a)
 	defer func() { _ = cs.Close() }()
 
 	// The error item should surface from Next.
@@ -283,8 +283,12 @@ func TestConcurrentMultiSource_PropagatesError(t *testing.T) {
 }
 
 func TestConcurrentMultiSource_ContextCancelStopsStreaming(t *testing.T) {
-	a := newFakeSource("a1", "a2")
-	cs := NewConcurrentMultiSource(a)
+	// A source that never yields: with nothing ready on the items channel, Next's
+	// select must take the cancelled context. Using a source WITH items made this
+	// a coin flip — both select arms were ready — so the test passed or failed at
+	// random rather than proving anything about cancellation.
+	a := newBlockingSource()
+	cs := NewConcurrentMultiSource(context.Background(), a)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -448,6 +452,32 @@ func TestNewFileSourceDetectsBurpScope(t *testing.T) {
 	item, err := fs.Next(context.Background())
 	require.NoError(t, err)
 	require.NotNil(t, item)
+}
+
+// TestNewFileSourceDetectsHAR guards the same slot for an HTTP Archive. A HAR
+// passed without -I har used to be read line by line as a URL list, which
+// turned a 30-entry capture into 91 "targets" made of JSON punctuation — and,
+// because every one of them failed, into an ingest that stored nothing.
+func TestNewFileSourceDetectsHAR(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "capture.har")
+	content := `{"log":{"version":"1.2","creator":{"name":"fixture","version":"1"},"entries":[
+	  {"request":{"method":"GET","url":"https://example.com/a","httpVersion":"HTTP/1.1",
+	    "headers":[{"name":"Host","value":"example.com"}],"queryString":[],"cookies":[]},
+	   "response":{"status":200,"statusText":"OK","httpVersion":"HTTP/1.1",
+	    "headers":[],"cookies":[],"content":{"size":2,"mimeType":"text/plain","text":"ok"}}}
+	]}}`
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	fs, err := NewFileSource(FileSourceConfig{FilePath: path, Format: "urls"})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = fs.Close() })
+	assert.Equal(t, "har", fs.Format().Name())
+
+	item, err := fs.Next(context.Background())
+	require.NoError(t, err)
+	require.NotNil(t, item)
+	assert.True(t, item.Request.HasResponse(),
+		"the captured response must survive the parse, or the executor will re-fetch it")
 }
 
 // TestNewFileSourceExplicitFormatWinsOverSniff verifies the sniff only ever

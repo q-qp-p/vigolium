@@ -6,8 +6,7 @@ set -euo pipefail
 # Invoked by `make github-release` AFTER `make public-release` has produced the
 # cross-platform tarballs in build/dist-public/. This script does the GitHub
 # half: it creates (and pushes) the git tag if missing, pulls the release notes
-# from CHANGELOG.md, and creates — or, for an unchanged version, edits in place —
-# the GitHub release, uploading every artifact.
+# from CHANGELOG.md, and creates the GitHub release, uploading every artifact.
 #
 # Usage (normally via `make github-release`):
 #   github-release.sh
@@ -18,9 +17,8 @@ set -euo pipefail
 #   CHANGELOG        = changelog path (default: CHANGELOG.md)
 #   TAG_TARGET       = commit-ish the new tag points at (default: HEAD)
 #
-# Re-running for a version whose release already exists edits that release —
-# refreshing the notes and re-uploading (clobbering) every artifact — instead of
-# failing on the duplicate tag.
+# Published versions are immutable: package recipes pin their asset hashes.
+# Bump VERSION to ship changed binaries; never replace an existing release.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
@@ -42,6 +40,9 @@ if [ -z "$VERSION" ]; then
   VERSION="$(grep -E '^[[:space:]]*Version[[:space:]]*=' "$VERSION_FILE" | head -1 | cut -d '"' -f 2)"
 fi
 [ -n "$VERSION" ] || die "could not determine VERSION"
+if gh release view "$VERSION" >/dev/null 2>&1; then
+  die "release $VERSION already exists; bump VERSION instead of replacing package-pinned assets"
+fi
 
 # --- Release notes from CHANGELOG.md -----------------------------------------
 # Grab the block from the `## [<version>]` header up to (not including) the next
@@ -97,16 +98,10 @@ else
   git push origin "refs/tags/$VERSION"
 fi
 
-# --- GitHub release (create or edit in place) --------------------------------
-if gh release view "$VERSION" >/dev/null 2>&1; then
-  info "release $VERSION exists — updating notes and re-uploading artifacts..."
-  # --draft=false promotes a leftover draft to a published, tag-associated
-  # release (a no-op when it is already published).
-  gh release edit   "$VERSION" --title "$VERSION" --notes-file "$notes_file" --draft=false
-  gh release upload "$VERSION" "${artifacts[@]}" --clobber
-else
-  info "creating GitHub release $VERSION..."
-  gh release create "$VERSION" "${artifacts[@]}" --title "$VERSION" --notes-file "$notes_file"
-fi
+# --- GitHub release ---------------------------------------------------------
+# If another publisher created the release meanwhile, create fails instead of
+# replacing its assets.
+info "creating GitHub release $VERSION..."
+gh release create "$VERSION" "${artifacts[@]}" --title "$VERSION" --notes-file "$notes_file"
 
 info "GitHub release $VERSION published (${#artifacts[@]} artifacts)."

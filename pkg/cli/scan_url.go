@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/vigolium/vigolium/internal/scratch"
@@ -17,7 +16,6 @@ import (
 	fileutil "github.com/projectdiscovery/utils/file"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"github.com/vigolium/vigolium/internal/config"
 	"github.com/vigolium/vigolium/internal/runner"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/core"
@@ -129,6 +127,10 @@ func validateGlobalFormats() error {
 // printed as Markdown (--print-finding), traffic is printed (--print-traffic /
 // --print-traffic-tree) — all of which render from the DB — or a file output
 // format is requested; none of which the direct path implements.
+//
+// --events is on the list for the same reason: the event stream is emitted by
+// the scan phases, which only run under the Runner. On the direct path the flag
+// parsed and then described nothing.
 func needsRunnerScan() bool {
 	return hasPhaseFlags() ||
 		globalStateless ||
@@ -136,19 +138,79 @@ func needsRunnerScan() bool {
 		len(globalSkipPhases) > 0 ||
 		scanPrintFinding ||
 		hasPrintTrafficFlags() ||
+		strings.TrimSpace(scanOpts.Events) != "" ||
 		hasFileOutputFormat()
 }
 
 // dispatchSingleScan routes one parsed request to either the Runner-backed scan
 // (when output/persistence/phase flags are in play) or the fast direct path.
-func dispatchSingleScan(rr *httpmsg.HttpRequestResponse, target, method string) error {
+//
+// ctx reaches only the direct path, which is not an oversight: the Runner path
+// installs its own shutdown handler (scanSignalCoordinator), which closes the
+// runner and reports the interrupt on the event stream, so a cancellation
+// context there would be a second, slower answer to the same signal. The
+// caller's loop still checks ctx between inputs, so an interrupt stops the
+// batch on both paths.
+func dispatchSingleScan(ctx context.Context, rr *httpmsg.HttpRequestResponse, target, method string) error {
 	if needsRunnerScan() {
 		return runRunnerScan(rr, target)
 	}
-	return runScanWithRR(rr, target, method)
+	return runScanWithRR(ctx, rr, target, method)
 }
 
-func runScanURLCmd(_ *cobra.Command, args []string) error {
+// lightweightScanContext is the ONE cancellation context for a scan-url /
+// scan-request invocation.
+//
+// It used to be installed per request, inside the direct scan: a multi-target
+// run registered one signal channel and leaked one goroutine per target, and
+// only the request in flight ever saw the interrupt — the loop went straight on
+// to the next one. Installed here, a single Ctrl-C stops the batch and the
+// remaining targets are reported as not scanned.
+func lightweightScanContext() (context.Context, context.CancelFunc) {
+	return signal.NotifyContext(context.Background(), scanShutdownSignals...)
+}
+
+// runDirectScanBatch scans every input on the direct path.
+//
+// Under -j with more than one input the results become the `items` of one
+// envelope, because two top-level objects on stdout are not a document the
+// --json contract describes. Every other mode keeps per-input dispatch (the
+// human renderer and --ci-output-format are line protocols where that is
+// correct), and all of them stop early on an interrupt.
+func runDirectScanBatch(ctx context.Context, cmd *cobra.Command, inputs []scanInput) error {
+	results, notScanned, err := scanInputs(ctx, inputs,
+		func(ctx context.Context, in scanInput) (*scanResult, error) {
+			return executeDirectScan(ctx, in.rr, in.target, in.method)
+		})
+	if writeErr := writeDirectScanBatch(commandPathWithoutRoot(cmd), results, notScanned); writeErr != nil {
+		return writeErr
+	}
+	return err
+}
+
+// dispatchScanInputs runs every input through the mode-appropriate path,
+// stopping at the first sign of an interrupt.
+//
+// The cancellation rule is scanInputs', not a second copy of it: these inputs
+// publish their own output as they go, so only the error is carried back — but
+// "stop at a cancelled context, keep the last error" has to mean the same thing
+// on both paths or a Ctrl-C behaves differently depending on which one ran.
+func dispatchScanInputs(ctx context.Context, inputs []scanInput) error {
+	_, _, err := scanInputs(ctx, inputs,
+		func(ctx context.Context, in scanInput) (*scanResult, error) {
+			return nil, dispatchSingleScan(ctx, in.rr, in.target, in.method)
+		})
+	return err
+}
+
+// directBatchJSON reports whether several direct-path results must be folded
+// into one envelope. The Runner path writes its own output and --ci-output-format
+// is a line protocol, so neither qualifies.
+func directBatchJSON(inputs []scanInput) bool {
+	return len(inputs) > 1 && globalJSON && !globalCIOutput && !needsRunnerScan()
+}
+
+func runScanURLCmd(cmd *cobra.Command, args []string) error {
 	defer syncLogger()
 
 	if err := resetFailOnGate(); err != nil {
@@ -162,60 +224,80 @@ func runScanURLCmd(_ *cobra.Command, args []string) error {
 	if err := validateGlobalFormats(); err != nil {
 		return err
 	}
+	if err := validateEventsFlag(scanOpts.Events); err != nil {
+		return asUsageError(err)
+	}
+	// Validated here, not only in runRunnerScan: without -S/-o this command takes
+	// the direct in-memory path, which never reaches the Runner — so a check
+	// there alone let `scan-url --keep-db-on-error` exit 0 having done nothing
+	// with the flag, which is the shape of control this plan exists to remove.
+	if err := validateKeepDBOnError(globalStateless); err != nil {
+		return err
+	}
 
-	// Targets come from the positional URL argument and/or repeatable -t/--target
-	// flags. The positional arg is kept for the original single-URL ergonomics;
-	// -t lets the command match `vigolium scan`'s muscle memory and pass several
-	// URLs at once.
+	inputs, err := scanURLInputs(args)
+	if err != nil {
+		return err
+	}
+
+	ctx, stop := lightweightScanContext()
+	defer stop()
+
+	if directBatchJSON(inputs) {
+		return withFailOnGate(runDirectScanBatch(ctx, cmd, inputs))
+	}
+	return withFailOnGate(dispatchScanInputs(ctx, inputs))
+}
+
+// scanURLInputs resolves the command's inputs: the positional URL argument
+// and/or repeatable -t/--target flags, else the parsed stdin stream.
+//
+// The positional arg is kept for the original single-URL ergonomics; -t lets the
+// command match `vigolium scan`'s muscle memory and pass several URLs at once.
+// Resolved up front, as a list, so the batch paths above can report what they
+// did not get to.
+func scanURLInputs(args []string) ([]scanInput, error) {
 	targets := append([]string{}, args...)
 	targets = append(targets, globalTargets...)
 
 	if len(targets) > 0 {
-		var lastErr error
+		inputs := make([]scanInput, 0, len(targets))
 		for _, target := range targets {
 			rr, err := buildRequestFromFlags(target, scanURLMethod, scanURLBody, scanURLHeaders)
 			if err != nil {
-				return fmt.Errorf("failed to build request: %w", err)
+				return nil, fmt.Errorf("failed to build request: %w", err)
 			}
-			if err := dispatchSingleScan(rr, target, scanURLMethod); err != nil {
-				lastErr = err
-			}
+			inputs = append(inputs, scanInput{rr: rr, target: target, method: scanURLMethod})
 		}
-		return withFailOnGate(lastErr)
+		return inputs, nil
 	}
 
 	// No args — try reading from stdin
 	if !fileutil.HasStdin() {
-		return fmt.Errorf("no URL argument provided and no stdin input detected")
+		return nil, fmt.Errorf("no URL argument provided and no stdin input detected")
 	}
 
 	raw, err := readStdin()
 	if err != nil {
-		return fmt.Errorf("failed to read stdin: %w", err)
+		return nil, fmt.Errorf("failed to read stdin: %w", err)
 	}
 
 	content := strings.TrimSpace(string(raw))
 	if content == "" {
-		return fmt.Errorf("empty stdin input")
+		return nil, fmt.Errorf("empty stdin input")
 	}
 
 	detected := detect.DetectStdinFormat(content)
 	items, err := detect.ParseStdinContent(content, detected)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	// Scan each parsed request
-	var lastErr error
+	inputs := make([]scanInput, 0, len(items))
 	for _, rr := range items {
-		target := rr.Target()
-		method := rr.Request().Method()
-		if err := dispatchSingleScan(rr, target, method); err != nil {
-			lastErr = err
-		}
+		inputs = append(inputs, scanInput{rr: rr, target: rr.Target(), method: rr.Request().Method()})
 	}
-
-	return withFailOnGate(lastErr)
+	return inputs, nil
 }
 
 // --- Shared helpers used by both scan-url and scan-request ---
@@ -230,6 +312,15 @@ type scanResult struct {
 	Candidates     []*output.ResultEvent `json:"candidates,omitempty"`
 	Observations   []*output.ResultEvent `json:"observations,omitempty"`
 	Errors         []string              `json:"errors,omitempty"`
+	// Persisted states whether these findings also reached a database. The direct
+	// path can run with no store at all, and a caller that reads the findings out
+	// of this document and then expects `vigolium finding` to list them needs to
+	// know which of those two runs it got.
+	Persisted bool `json:"persisted"`
+	// Interrupted states that the scan was cancelled (Ctrl-C, SIGTERM) before the
+	// executor finished. The findings below are whatever had landed by then, which
+	// is a different claim from "these are the findings".
+	Interrupted bool `json:"interrupted,omitempty"`
 }
 
 // buildRequestFromFlags constructs an HttpRequestResponse from CLI flags.
@@ -477,15 +568,88 @@ func formatStreamingFindingLine(result *output.ResultEvent) string {
 	return b.String()
 }
 
-// runScanWithRR executes a scan with the given HttpRequestResponse and outputs results.
-func runScanWithRR(rr *httpmsg.HttpRequestResponse, target, method string) error {
+// acquireDirectScanDB opens the store the direct path persists into, and decides
+// whether failing to open it is fatal.
+//
+// It is fatal when the caller NAMED a store — `--db`, `VIGOLIUM_DB_PATH` (folded
+// into globalDB by the root command), or `--config`. Scanning for minutes and
+// then discarding every finding because the database the caller pinned could not
+// be opened is exactly the silent data loss a pin exists to prevent, and the
+// failure is reported before any request goes out rather than after.
+//
+// It is not fatal when no store was named: the direct path's whole point is that
+// it can answer from memory, and a run with no -o and no --db did not ask for
+// persistence. That case warns on stderr (unless --silent) and returns a nil
+// repository, which the result's `persisted: false` then reports.
+//
+// open is a parameter rather than a direct getDB call so the three branches are
+// testable without a database or a network.
+func acquireDirectScanDB(open func() (*database.DB, error)) (*database.Repository, string, error) {
+	db, dbErr := open()
+	if dbErr != nil {
+		if strings.TrimSpace(globalDB) != "" || strings.TrimSpace(globalConfig) != "" {
+			return nil, "", fmt.Errorf("database unavailable: %w", dbErr)
+		}
+		if !globalSilent {
+			fmt.Fprintf(os.Stderr, "%s database unavailable — results will not be persisted: %v\n",
+				terminal.WarnPrefix(), dbErr)
+		}
+		return nil, "", nil
+	}
+	// getDB already ran EnsureSchemaCurrent on this handle, but that check covers
+	// migrated columns only — a table or index added without a column migration
+	// passes it. Bounded like the other two setup sites; a failure only warns
+	// here because this path can still do useful work against a store it could
+	// not migrate. nil settings because this function never loads them (the
+	// handle came from getDB, which did) — that takes the minSetupTimeout floor,
+	// the right order of magnitude for a check measured in microseconds.
+	ctx, cancelSetup := setupContext(nil)
+	defer cancelSetup()
+	if schemaErr := db.EnsureSchemaReady(ctx); schemaErr != nil {
+		zap.L().Warn("Failed to create schema", zap.Error(schemaErr))
+	}
+	// Resolve the active project so the executor stamps its records and findings
+	// with it. Without this they fall through to the default project and become
+	// invisible to every project-scoped read. A failure here is fatal rather than
+	// a warning: continuing would file the whole scan into the default project —
+	// the exact silent misfiling this resolution exists to prevent — and
+	// `scan`/`ingest` both return it too.
+	projectUUID, perr := resolveProjectUUID()
+	if perr != nil {
+		return nil, "", perr
+	}
+	return database.NewRepository(db), projectUUID, nil
+}
+
+// runScanWithRR executes one request on the direct path and writes its result.
+//
+// Split from executeDirectScan so the result is published on every exit: a
+// cancelled or failed execution still has findings worth reporting, and under
+// -j the document is what carries them. The error is returned after the write,
+// so the exit code reports the failure without costing the output.
+func runScanWithRR(ctx context.Context, rr *httpmsg.HttpRequestResponse, target, method string) error {
+	result, execErr := executeDirectScan(ctx, rr, target, method)
+	if result == nil {
+		return execErr
+	}
+	if outErr := outputScanResult(result); outErr != nil {
+		return outErr
+	}
+	return execErr
+}
+
+// executeDirectScan runs the lightweight in-memory scan: no Runner, no phases,
+// one request through the executor. It returns the result it assembled together
+// with the execution's own error, so the caller can publish the former and still
+// report the latter.
+func executeDirectScan(ctx context.Context, rr *httpmsg.HttpRequestResponse, target, method string) (*scanResult, error) {
 	startTime := time.Now()
 	resolvedModules := resolveModules()
 
 	// Set up HTTP stack
 	httpRequester, svc, cleanup, err := setupScanHTTPStack()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer cleanup()
 
@@ -501,35 +665,13 @@ func runScanWithRR(rr *httpmsg.HttpRequestResponse, target, method string) error
 	// Get modules
 	active, passive := getFilteredModules(resolvedModules, scanURLNoPassive)
 
-	// Optional database
-	var repo *database.Repository
-	var scanProjectUUID string
-	db, dbErr := getDB()
-	if dbErr == nil {
-		// getDB already ran EnsureSchemaCurrent on this handle, but that check
-		// covers migrated columns only — a table or index added without a column
-		// migration passes it. Bounded like the other two setup sites; a failure
-		// only warns here because this path can still do useful work against a
-		// store it could not migrate. nil settings because this function never
-		// loads them (the handle came from getDB, which did) — that takes the
-		// minSetupTimeout floor, the right order of magnitude for a check
-		// measured in microseconds.
-		ctx, cancelSetup := setupContext(nil)
-		defer cancelSetup()
-		if schemaErr := db.EnsureSchemaReady(ctx); schemaErr != nil {
-			zap.L().Warn("Failed to create schema", zap.Error(schemaErr))
-		}
-		repo = database.NewRepository(db)
-		// Resolve the active project so the executor stamps its records and
-		// findings with it. Without this they fall through to the default
-		// project and become invisible to every project-scoped read. A failure
-		// here is fatal rather than a warning: continuing would file the whole
-		// scan into the default project — the exact silent misfiling this
-		// resolution exists to prevent — and `scan`/`ingest` both return it too.
-		var perr error
-		if scanProjectUUID, perr = resolveProjectUUID(); perr != nil {
-			return perr
-		}
+	// Storage. Acquired BEFORE any request goes out, so a pinned store that
+	// cannot be opened fails the command instead of costing a whole scan.
+	repo, scanProjectUUID, dbErr := acquireDirectScanDB(getDB)
+	if dbErr != nil {
+		return nil, dbErr
+	}
+	if repo != nil {
 		defer closeDatabaseOnExit()
 	}
 
@@ -632,18 +774,11 @@ func runScanWithRR(rr *httpmsg.HttpRequestResponse, target, method string) error
 	scanExecutor = core.NewExecutor(executorCfg, src, active, passive)
 	executor := scanExecutor
 
-	// Signal handling
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		cancel()
-	}()
-
-	// Execute
+	// The invocation's cancellation context arrives from the RunE, which installs
+	// one signal handler for the whole command. This used to call signal.Notify
+	// per request with a goroutine that outlived it, so a multi-target run left
+	// one leaked goroutine and one registered channel per target, and only the
+	// in-flight scan saw the interrupt.
 	_, execErr := executor.Execute(ctx)
 	if execErr != nil {
 		scanErrors = append(scanErrors, execErr.Error())
@@ -660,6 +795,8 @@ func runScanWithRR(rr *httpmsg.HttpRequestResponse, target, method string) error
 		Candidates:     candidates,
 		Observations:   observations,
 		Errors:         scanErrors,
+		Persisted:      repo != nil,
+		Interrupted:    ctx.Err() != nil,
 	}
 	if result.Findings == nil {
 		result.Findings = make([]*output.ResultEvent, 0)
@@ -670,7 +807,7 @@ func runScanWithRR(rr *httpmsg.HttpRequestResponse, target, method string) error
 	// an exit code after output is written.
 	failOnGateFromEvents(result.Findings, globalSilent)
 
-	return outputScanResult(result)
+	return result, execErr
 }
 
 // --- Phase mode: delegates to the Runner for full-pipeline phases ---
@@ -716,9 +853,20 @@ func buildPhaseOptions(target string) (*types.Options, error) {
 	opts.Stateless = globalStateless
 	opts.SkipPhases = globalSkipPhases
 	opts.OmitResponse = scanOpts.OmitResponse
-	if projectUUID, perr := resolveProjectUUID(); perr == nil {
-		opts.ProjectUUID = projectUUID
+	// --events, so the lightweight commands emit the same machine event stream as
+	// `vigolium scan`. Without this the flag parsed, validated and then described
+	// nothing, because the Runner was handed an empty Events path.
+	opts.Events = scanOpts.Events
+	// A failed project resolution is fatal, not a fallback. The error was
+	// discarded, so a scan whose project could not be resolved ran under the
+	// zero-value ProjectUUID and filed every record and finding into the default
+	// project — invisible to every project-scoped read, and silently merged with
+	// another project's data. `scan` and `ingest` both return it.
+	projectUUID, perr := resolveProjectUUID()
+	if perr != nil {
+		return nil, perr
 	}
+	opts.ProjectUUID = projectUUID
 
 	// Phase flags
 	opts.DiscoverEnabled = scanPhaseDiscover
@@ -780,9 +928,19 @@ func runRunnerScan(rr *httpmsg.HttpRequestResponse, target string) (err error) {
 	if err := validateEventsFlag(opts.Events); err != nil {
 		return asUsageError(err)
 	}
+	if err := validateStdoutProtocol(opts); err != nil {
+		return err
+	}
+	if err := validateKeepDBOnError(opts.Stateless); err != nil {
+		return err
+	}
 	if opts.Stateless && globalDB != "" {
 		return fmt.Errorf("--stateless and --db are mutually exclusive")
 	}
+
+	// One signal handler for the whole invocation — see executeNativeScan.
+	signals := startScanSignals(scanStart)
+	defer signals.stop()
 	// See the same guard in scan.go: --json/--ci-output stream results to stdout,
 	// so they are not discarded and the warning would be false.
 	if opts.Stateless && opts.Output == "" && !opts.Silent && !globalJSON && !globalCIOutput {
@@ -794,15 +952,11 @@ func runRunnerScan(rr *httpmsg.HttpRequestResponse, target string) (err error) {
 			terminal.BoldCyan("--format"), terminal.BoldYellow("jsonl|html"))
 	}
 
-	// Load settings from config file
-	settings, err := config.LoadSettings(opts.ConfigPath)
+	// Fatal, for the reason spelled out in runScanCmd: an explicit --config that
+	// cannot be read means the scan would run under settings nobody chose.
+	settings, err := clicommon.LoadSettings(opts.ConfigPath)
 	if err != nil {
-		if !opts.Silent {
-			fmt.Fprintf(os.Stderr, "%s Config file not found, using defaults\n",
-				terminal.Gray(terminal.SymbolPending))
-		}
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return err
 	}
 
 	// Apply CLI overrides
@@ -820,11 +974,9 @@ func runRunnerScan(rr *httpmsg.HttpRequestResponse, target string) (err error) {
 		}
 		statelessDBPath = tmpFile.Name()
 		_ = tmpFile.Close()
-		defer func() {
-			_ = os.Remove(statelessDBPath)
-			_ = os.Remove(statelessDBPath + "-wal")
-			_ = os.Remove(statelessDBPath + "-shm")
-		}()
+		// Registered first so it runs last, after the DB handle is closed. See
+		// the same defer in executeNativeScan.
+		defer func() { err = releaseStatelessDB(statelessDBPath, err) }()
 		settings.Database.Driver = "sqlite"
 		settings.Database.SQLite.Path = statelessDBPath
 	} else if globalDB != "" {
@@ -880,11 +1032,15 @@ func runRunnerScan(rr *httpmsg.HttpRequestResponse, target string) (err error) {
 	// terminal scan.finished is the last line written — a consumer treats it as
 	// end-of-stream.
 	opts.ScanUUID = pinnedOrNewUUID(opts.ScanUUID)
-	finishEvents, evErr := beginScanEventStream(db, opts, settings, opts.ScanningStrategy, scanStart)
+	prepareTerminalEvent, emitTerminalEvent, evErr := beginScanEventStream(db, opts, settings, opts.ScanningStrategy, scanStart)
 	if evErr != nil {
 		return evErr
 	}
-	defer func() { finishEvents(err) }()
+	// Registered first so LIFO writes the line last; prepare, registered second,
+	// gathers the totals before it while the database is still open. There is no
+	// --db-isolate merge on this path, so both sit together here.
+	defer func() { emitTerminalEvent(err) }()
+	defer func() { prepareTerminalEvent(err) }()
 
 	// Stateless + -o: suppress StandardWriter's live file output and materialize
 	// every requested format from the temp DB post-scan (mirrors executeNativeScan).
@@ -897,13 +1053,7 @@ func runRunnerScan(rr *httpmsg.HttpRequestResponse, target string) (err error) {
 	// the explicit scanRunner.Close() below flushes records, but before db.Close().
 	defer func() { recordExportFailure(&err, finishStatelessExport(db, opts, statelessOutputPath, false)) }()
 	defer func() {
-		// Skip the deferred jsonl envelope when stateless already materialized
-		// every format to the file, or when a persisted scan hard-failed (don't
-		// write a success-looking file of stale data).
-		if opts.Stateless && statelessOutputPath != "" {
-			return
-		}
-		if err != nil && !opts.Stateless {
+		if skipDeferredJSONLExport(err, opts.Stateless, statelessOutputPath) {
 			return
 		}
 		recordExportFailure(&err, finishScanJSONLExport(db, opts))
@@ -925,30 +1075,23 @@ func runRunnerScan(rr *httpmsg.HttpRequestResponse, target string) (err error) {
 	}
 	scanRunner.SetSettings(settings)
 	scanRunner.SetRepository(repo)
-	setupScanSignalHandler(scanRunner)
 
 	// Close before the export defers read the DB so any buffered records land
 	// first. A failed scan must abort visibly (non-zero, no success banner).
-	scanErr := scanRunner.RunNativeScan()
-	scanRunner.Close()
+	scanErr := runNativeScanPass(scanRunner)
 	if scanErr != nil {
 		err = scanErr
 		return err
 	}
 
-	// maybeGenerateReports self-guards on opts.Output=="" (blanked above for the
-	// stateless path, where finishStatelessExport handles reports instead).
-	maybeGenerateReports(db, opts)
-	finishFSExport(db, opts)
-	if !opts.Silent {
-		hosts := summaryScopeHosts(context.Background(), repo, settings, opts.Targets, opts.ProjectUUID, opts.ScanUUID)
-		printScanCompletionSummary(repo, opts.ProjectUUID, hosts, time.Since(scanStart))
-	}
-	maybePrintScanFindings(context.Background(), db, opts.ProjectUUID, opts.ScanUUID)
-	maybePrintScanTraffic(context.Background(), db, opts.ProjectUUID)
-	evaluateFailOnGate(repo, opts.ProjectUUID, opts.ScanUUID, opts.Silent)
-
-	return nil
+	// The same tail the full scan command runs, minus the upload — see
+	// reportNativeScanSuccess for why that step stays behind.
+	//
+	// recordExportFailure, not a bare return: the summary and the gate still run
+	// on an unwritable report (the findings exist and are worth showing), but the
+	// run no longer exits 0 claiming to have written a file that is not there.
+	recordExportFailure(&err, reportScanCompletion(db, settings, repo, opts, scanStart))
+	return err
 }
 
 // outputScanResult writes the scan result as JSON or human-readable table.

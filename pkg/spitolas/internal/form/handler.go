@@ -1,6 +1,8 @@
 package form
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strconv"
@@ -26,6 +28,18 @@ const (
 	// randomChars contains the character set for random strings - letters only (a-zA-Z), no numbers.
 	randomChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 )
+
+// formKeyJS is appended to every detection script: formKeyOf names the form
+// that owns a control (DetectedInput.FormKey). Built from the form's index among
+// document.forms plus its id and action attributes — read with getAttribute
+// because a control named "id" or "action" shadows the form's properties.
+const formKeyJS = `
+		function formKeyOf(f) {
+			if (!(f instanceof HTMLFormElement)) return '';
+			const idx = Array.prototype.indexOf.call(document.forms, f);
+			return 'form[' + idx + ']#' + (f.getAttribute('id') || '') + '|' + (f.getAttribute('action') || '');
+		}
+	`
 
 // Handler handles form detection and filling.
 // DetectedInput for Go extension (detection metadata).
@@ -133,7 +147,8 @@ func (h *Handler) DetectForms(page *browser.Page) ([]*Form, error) {
 					label: getLabel(input),
 					accept: input.accept || '',
 					defaultValue: input.value || input.getAttribute('value') || '',
-					datalist: (() => { try { const dl = input.list; if (dl && dl.options) return Array.from(dl.options).map(o => o.value).filter(Boolean); } catch (e) {} return []; })()
+					datalist: (() => { try { const dl = input.list; if (dl && dl.options) return Array.from(dl.options).map(o => o.value).filter(Boolean); } catch (e) {} return []; })(),
+					formKey: formKeyOf(input.form)
 				};
 				formData.inputs.push(inputData);
 			}
@@ -175,7 +190,7 @@ func (h *Handler) DetectForms(page *browser.Page) ([]*Form, error) {
 			}
 			return '/' + parts.join('/');
 		}
-	})()`
+	` + formKeyJS + `})()`
 
 	result, err := page.Eval(script)
 	if err != nil {
@@ -276,6 +291,7 @@ func (h *Handler) parseInputData(data map[string]interface{}) *DetectedInput {
 	detected.DatalistOptions = getStringSlice(data, "datalist")
 	detected.Hidden = getBool(data, "hidden")
 	detected.TriggerXPath = getString(data, "triggerXPath")
+	detected.FormKey = getString(data, "formKey")
 
 	return detected
 }
@@ -283,7 +299,21 @@ func (h *Handler) parseInputData(data map[string]interface{}) *DetectedInput {
 // DetectInputs finds all form inputs on the page (not limited to forms).
 // Returns DetectedInput slice (Go extension for detection metadata).
 func (h *Handler) DetectInputs(page *browser.Page) ([]*DetectedInput, error) {
+	inputs, _, err := h.DetectInputsForAction(page, "")
+	return inputs, err
+}
+
+// DetectInputsForAction is DetectInputs plus, in the same page evaluation, the
+// FormKey of the form that owns the element at actionXPath — the form a click
+// on it would submit (honoring the form= attribute; "" when the element is
+// outside any form, cannot be resolved, or actionXPath is empty).
+func (h *Handler) DetectInputsForAction(page *browser.Page, actionXPath string) ([]*DetectedInput, string, error) {
+	xpathLiteral, err := json.Marshal(actionXPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode action xpath: %w", err)
+	}
 	script := `(() => {
+		const actionXPath = ` + string(xpathLiteral) + `;
 		const inputs = [];
 		for (const input of document.querySelectorAll('input, textarea, select')) {
 			const hidden = isHidden(input);
@@ -308,11 +338,25 @@ func (h *Handler) DetectInputs(page *browser.Page) ([]*DetectedInput, error) {
 				defaultValue: input.value || input.getAttribute('value') || '',
 				datalist: (() => { try { const dl = input.list; if (dl && dl.options) return Array.from(dl.options).map(o => o.value).filter(Boolean); } catch (e) {} return []; })(),
 				hidden: hidden,
-				triggerXPath: hidden && input.type === 'file' ? findTriggerXPath(input) : ''
+				triggerXPath: hidden && input.type === 'file' ? findTriggerXPath(input) : '',
+				formKey: formKeyOf(input.form)
 			};
 			inputs.push(inputData);
 		}
-		return inputs;
+		return { inputs: inputs, actionFormKey: actionFormKey(actionXPath) };
+
+		function actionFormKey(xp) {
+			if (!xp) return '';
+			let el = null;
+			try {
+				el = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+			} catch (e) { return ''; }
+			if (!el || el.nodeType !== Node.ELEMENT_NODE) return '';
+			// .form is the owner for buttons/inputs/labels (form= attribute
+			// included); anything else submits the form it sits in, if any.
+			const owner = (el.form instanceof HTMLFormElement) ? el.form : el.closest('form');
+			return formKeyOf(owner);
+		}
 
 		// Check if element is visually hidden
 		function isHidden(el) {
@@ -392,30 +436,35 @@ func (h *Handler) DetectInputs(page *browser.Page) ([]*DetectedInput, error) {
 			}
 			return '/' + parts.join('/');
 		}
-	})()`
+	` + formKeyJS + `})()`
 
 	result, err := page.Eval(script)
 	if err != nil {
-		return nil, fmt.Errorf("failed to detect inputs: %w", err)
+		return nil, "", fmt.Errorf("failed to detect inputs: %w", err)
 	}
 
 	inputs := make([]*DetectedInput, 0)
+	actionForm := ""
 
-	if arr, ok := result.([]interface{}); ok {
-		for _, inputData := range arr {
-			if inputMap, ok := inputData.(map[string]interface{}); ok {
-				input := h.parseInputData(inputMap)
-				inputs = append(inputs, input)
+	if resultMap, ok := result.(map[string]interface{}); ok {
+		actionForm = getString(resultMap, "actionFormKey")
+		if arr, ok := resultMap["inputs"].([]interface{}); ok {
+			for _, inputData := range arr {
+				if inputMap, ok := inputData.(map[string]interface{}); ok {
+					input := h.parseInputData(inputMap)
+					inputs = append(inputs, input)
+				}
 			}
 		}
 	}
 
 	// Web-component apps render their form fields inside shadow roots, invisible
 	// to the document.querySelectorAll above. Surface those too so login/register
-	// forms in design-system components get filled and submitted.
+	// forms in design-system components get filled and submitted. They carry no
+	// FormKey: a shadow-root control cannot belong to a light-DOM form.
 	inputs = append(inputs, h.detectShadowInputs(page)...)
 
-	return inputs, nil
+	return inputs, actionForm, nil
 }
 
 // detectShadowInputs finds fillable inputs inside shadow roots (which the
@@ -525,7 +574,8 @@ func (h *Handler) DetectAll(page *browser.Page) ([]*Form, []*DetectedInput, erro
 				defaultValue: input.value || input.getAttribute('value') || '',
 				datalist: (() => { try { const dl = input.list; if (dl && dl.options) return Array.from(dl.options).map(o => o.value).filter(Boolean); } catch (e) {} return []; })(),
 				hidden: hidden,
-				triggerXPath: hidden && input.type === 'file' ? findTriggerXPath(input) : ''
+				triggerXPath: hidden && input.type === 'file' ? findTriggerXPath(input) : '',
+				formKey: formKeyOf(input.form)
 			};
 		}
 
@@ -596,7 +646,7 @@ func (h *Handler) DetectAll(page *browser.Page) ([]*Form, []*DetectedInput, erro
 			}
 			return '/' + parts.join('/');
 		}
-	})()`
+	` + formKeyJS + `})()`
 
 	result, err := page.Eval(script)
 	if err != nil {
@@ -633,18 +683,61 @@ func (h *Handler) DetectAll(page *browser.Page) ([]*Form, []*DetectedInput, erro
 	return forms, orphans, nil
 }
 
+// ErrUploadNotPermitted is returned for a file input when the interaction
+// policy does not permit uploads: no file is selected (or generated), and the
+// input is reported as unsupported by policy rather than silently skipped.
+var ErrUploadNotPermitted = errors.New("file upload not permitted by the interaction policy")
+
 // FillResult contains the result of filling a form input.
 type FillResult struct {
 	Input   *DetectedInput
-	Success bool
+	Outcome FillOutcome
 	Error   error
 }
 
-// FillInputsResult contains the result of filling multiple inputs.
+// Success reports whether the input counts as filled: an outcome that wrote a
+// value (verified or attempted) and no error. A skipped, rejected or unsupported
+// input is not a success even though it carries no error.
+//
+// Derived rather than stored, so it cannot disagree with Outcome and Error.
+func (fr *FillResult) Success() bool { return fr.Error == nil && fr.Outcome.Succeeded() }
+
+// FillInputsResult contains the result of filling multiple inputs, one counter
+// per FillOutcome plus Failed for fills that errored. Unsupported counts inputs
+// the policy did not permit (file inputs without upload permission) — neither a
+// success nor a failure.
 type FillInputsResult struct {
-	Results   []*FillResult
-	Succeeded int
-	Failed    int
+	Results     []*FillResult
+	Failed      int
+	Verified    int
+	Attempted   int
+	Rejected    int
+	Skipped     int
+	Unsupported int
+}
+
+// Succeeded is the number of inputs that were written: verified plus attempted.
+// It never includes a skipped control. Derived rather than stored, so it cannot
+// drift from the counters it sums.
+func (r *FillInputsResult) Succeeded() int { return r.Verified + r.Attempted }
+
+// add records one input's result under its outcome.
+func (r *FillInputsResult) add(fr *FillResult) {
+	r.Results = append(r.Results, fr)
+	switch {
+	case fr.Outcome == FillUnsupported:
+		r.Unsupported++
+	case fr.Error != nil:
+		r.Failed++
+	case fr.Outcome == FillVerified:
+		r.Verified++
+	case fr.Outcome == FillAttempted:
+		r.Attempted++
+	case fr.Outcome == FillRejected:
+		r.Rejected++
+	case fr.Outcome == FillSkipped:
+		r.Skipped++
+	}
 }
 
 // HasErrors returns true if any input failed to fill.
@@ -652,15 +745,22 @@ func (r *FillInputsResult) HasErrors() bool {
 	return r.Failed > 0
 }
 
-// Errors returns all errors that occurred during filling.
+// HasUnverified reports whether any input was written without its value being
+// confirmed: rejected by its read-back, or written with no read-back at all.
+func (r *FillInputsResult) HasUnverified() bool {
+	return r.Rejected > 0 || r.Attempted > 0
+}
+
+// Errors returns all errors that occurred during filling. A policy refusal
+// (ErrUploadNotPermitted) is not a fill error and is left out.
 func (r *FillInputsResult) Errors() []error {
-	errors := make([]error, 0, r.Failed)
+	errs := make([]error, 0, r.Failed)
 	for _, result := range r.Results {
-		if result.Error != nil {
-			errors = append(errors, result.Error)
+		if result.Error != nil && !errors.Is(result.Error, ErrUploadNotPermitted) {
+			errs = append(errs, result.Error)
 		}
 	}
-	return errors
+	return errs
 }
 
 // FillInputs fills the given inputs with configured or random values.
@@ -675,15 +775,7 @@ func (h *Handler) FillInputs(page *browser.Page, inputs []*DetectedInput) *FillI
 	}
 
 	for _, input := range inputs {
-		fillResult := &FillResult{
-			Input: input,
-		}
-
-		if !input.CanInteract() {
-			fillResult.Success = true // Skip non-interactable inputs (not an error)
-			result.Results = append(result.Results, fillResult)
-			continue
-		}
+		fillResult := &FillResult{Input: input}
 
 		// Get identification value for logging
 		idValue := ""
@@ -691,25 +783,31 @@ func (h *Handler) FillInputs(page *browser.Page, inputs []*DetectedInput) *FillI
 			idValue = input.Identification.Value
 		}
 
-		if err := h.FillInput(page, input); err != nil {
-			fillResult.Success = false
+		outcome, err := h.FillInput(page, input)
+		switch {
+		case errors.Is(err, ErrUploadNotPermitted):
+			fillResult.Outcome, fillResult.Error = FillUnsupported, err
+			zap.L().Debug("Input not filled: unsupported by policy",
+				zap.String("identification", idValue), zap.String("type", string(input.Type)))
+		case err != nil:
 			fillResult.Error = fmt.Errorf("failed to fill input %s: %w", idValue, err)
-			result.Failed++
 			zap.L().Debug("Input fill failed",
 				zap.String("identification", idValue),
 				zap.String("type", string(input.Type)),
 				zap.Error(err))
-		} else {
-			fillResult.Success = true
-			result.Succeeded++
+		default:
+			fillResult.Outcome = outcome
 		}
-
-		result.Results = append(result.Results, fillResult)
+		result.add(fillResult)
 	}
 
 	zap.L().Debug("Form inputs filled",
-		zap.Int("succeeded", result.Succeeded),
-		zap.Int("failed", result.Failed))
+		zap.Int("verified", result.Verified),
+		zap.Int("attempted", result.Attempted),
+		zap.Int("rejected", result.Rejected),
+		zap.Int("skipped", result.Skipped),
+		zap.Int("failed", result.Failed),
+		zap.Int("unsupported_by_policy", result.Unsupported))
 
 	return result
 }
@@ -799,7 +897,12 @@ func (h *Handler) HandleFormElements(page *browser.Page, formInputs []*DetectedI
 		}
 
 		// Fill the input
-		if fillErr := h.fillElement(elem, input); fillErr != nil {
+		outcome, fillErr := h.fillElement(elem, input)
+		if errors.Is(fillErr, ErrUploadNotPermitted) {
+			zap.L().Debug("Form element not filled: unsupported by policy",
+				zap.String("identification", idValue), zap.String("type", string(input.Type)))
+			continue
+		} else if fillErr != nil {
 			if h.config.Verbose {
 				zap.L().Error("Could not handle form element",
 					zap.String("identification", idValue),
@@ -810,6 +913,12 @@ func (h *Handler) HandleFormElements(page *browser.Page, formInputs []*DetectedI
 					zap.Error(fillErr))
 			}
 			continue
+		}
+		if outcome == FillRejected {
+			// Still handled — the control was acted on and its XPath is valid for
+			// backtracking — but its value did not stick.
+			zap.L().Debug("Form element value did not stick",
+				zap.String("identification", idValue), zap.String("type", string(input.Type)))
 		}
 
 		actualXPath := h.getElementXPath(page, elem)
@@ -886,20 +995,38 @@ func (h *Handler) getElementXPath(_ *browser.Page, elem *browser.Element) string
 
 // fillElement fills an element with the appropriate value based on input type.
 // Internal method used by HandleFormElements.
-func (h *Handler) fillElement(elem *browser.Element, input *DetectedInput) error {
+func (h *Handler) fillElement(elem *browser.Element, input *DetectedInput) (FillOutcome, error) {
 	value := h.getValueForInput(input)
 
 	if input.FormInput == nil {
-		return fmt.Errorf("no form input")
+		return "", fmt.Errorf("no form input")
 	}
 
-	switch input.Type {
-	case action.InputTypeText, action.InputTypeTextarea, action.InputTypePassword,
-		action.InputTypeEmail, action.InputTypeNumber, action.InputTypeInput:
-		return FillText(elem, value)
+	if input.Type != action.InputTypeFile {
+		return h.fillControl(elem, input, value)
+	}
+	if !h.uploadsPermitted() {
+		return FillUnsupported, ErrUploadNotPermitted
+	}
+	// GO EXTENSION: File upload support with smart file type selection
+	// Use configured path if provided, otherwise select based on accept attribute
+	if value == "" {
+		var err error
+		value, err = GetFilePathForAccept(input.Accept)
+		if err != nil {
+			return "", fmt.Errorf("failed to get upload file for accept=%q: %w", input.Accept, err)
+		}
+	}
+	return attempted(FillFile(elem, []string{value}))
+}
 
+// fillControl writes value into a non-file control according to the input's
+// type and reports what the write achieved. File inputs stay with the callers,
+// which differ in how a hidden one is reached.
+func (h *Handler) fillControl(elem *browser.Element, input *DetectedInput, value string) (FillOutcome, error) {
+	switch input.Type {
 	case action.InputTypeHidden:
-		return FillHidden(elem, value)
+		return attempted(FillHidden(elem, value))
 
 	case action.InputTypeCheckbox:
 		checked := value == "true" || value == "1" || value == "checked"
@@ -919,55 +1046,64 @@ func (h *Handler) fillElement(elem *browser.Element, input *DetectedInput) error
 			}
 		}
 		if value == "" {
-			return nil // No options available
+			return FillSkipped, nil // No options available
 		}
 		return FillSelect(elem, value)
 
-	case action.InputTypeFile:
-		// GO EXTENSION: File upload support with smart file type selection
-		// Use configured path if provided, otherwise select based on accept attribute
-		if value != "" {
-			return FillFile(elem, []string{value})
-		}
-		filePath, err := GetFilePathForAccept(input.Accept)
-		if err != nil {
-			return fmt.Errorf("failed to get upload file for accept=%q: %w", input.Accept, err)
-		}
-		return FillFile(elem, []string{filePath})
-
 	default:
-		return FillText(elem, value)
+		// Text-like types, and anything unrecognized tried as text. FillText
+		// writes nothing for an empty value.
+		if value == "" {
+			return FillSkipped, nil
+		}
+		return attempted(FillText(elem, value))
 	}
 }
 
-// FillInput fills a single input based on its type.
-func (h *Handler) FillInput(page *browser.Page, input *DetectedInput) error {
-	if !input.CanInteract() {
-		idValue := ""
-		if input.FormInput != nil && input.Identification != nil {
-			idValue = input.Identification.Value
-		}
-		zap.L().Debug("Input not interactable, skipping",
-			zap.String("identification", idValue),
-			zap.Bool("disabled", input.Disabled),
-			zap.Bool("readonly", input.ReadOnly))
-		return nil
-	}
-
-	elem, err := h.getElementByIdentification(page, input)
+// attempted is the outcome of a write with no read-back.
+func attempted(err error) (FillOutcome, error) {
 	if err != nil {
-		idValue := ""
-		if input.FormInput != nil && input.Identification != nil {
-			idValue = input.Identification.Value
-		}
-		return fmt.Errorf("element not found (identification: %s): %w", idValue, err)
+		return "", err
 	}
+	return FillAttempted, nil
+}
 
-	value := h.getValueForInput(input)
+// uploadsPermitted reports whether the interaction policy lets the crawl attach
+// files. Checked before a fixture is chosen or generated.
+func (h *Handler) uploadsPermitted() bool {
+	return h.config != nil && h.config.Policy.UploadFiles
+}
+
+// FillInput fills a single input based on its type and reports the outcome
+// (meaningful only when the error is nil). A disabled/readonly input is
+// FillSkipped; a file input the policy does not permit is FillUnsupported with
+// ErrUploadNotPermitted.
+func (h *Handler) FillInput(page *browser.Page, input *DetectedInput) (FillOutcome, error) {
 	idValue := ""
 	if input.FormInput != nil && input.Identification != nil {
 		idValue = input.Identification.Value
 	}
+
+	if !input.CanInteract() {
+		zap.L().Debug("Input not interactable, skipping",
+			zap.String("identification", idValue),
+			zap.Bool("disabled", input.Disabled),
+			zap.Bool("readonly", input.ReadOnly))
+		return FillSkipped, nil
+	}
+
+	// The policy is checked before the element lookup and value selection, so
+	// a refused upload neither touches the page nor chooses a fixture.
+	if input.Type == action.InputTypeFile && !h.uploadsPermitted() {
+		return FillUnsupported, ErrUploadNotPermitted
+	}
+
+	elem, err := h.getElementByIdentification(page, input)
+	if err != nil {
+		return "", fmt.Errorf("element not found (identification: %s): %w", idValue, err)
+	}
+
+	value := h.getValueForInput(input)
 	zap.L().Debug("Filling input",
 		zap.String("identification", idValue),
 		zap.String("type", string(input.Type)),
@@ -975,67 +1111,34 @@ func (h *Handler) FillInput(page *browser.Page, input *DetectedInput) error {
 		zap.Bool("hasConfiguredValues", input.HasValues()))
 
 	if input.FormInput == nil {
-		return fmt.Errorf("no form input")
+		return "", fmt.Errorf("no form input")
 	}
 
-	switch input.Type {
-	case action.InputTypeText, action.InputTypeTextarea, action.InputTypePassword,
-		action.InputTypeEmail, action.InputTypeNumber, action.InputTypeInput:
-		return FillText(elem, value)
-
-	case action.InputTypeHidden:
-		return FillHidden(elem, value)
-
-	case action.InputTypeCheckbox:
-		checked := value == "true" || value == "1" || value == "checked"
-		return FillCheckbox(elem, checked)
-
-	case action.InputTypeRadio:
-		return FillRadio(elem, value)
-
-	case action.InputTypeSelect:
-		if input.Multiple && len(input.GetValues()) > 1 {
-			return FillSelectMultiple(elem, input.GetValues())
-		}
-		if value == "" {
-			options, err := GetSelectAllOptions(elem)
-			if err == nil && len(options) > 0 {
-				value = options[h.rng.Intn(len(options))]
-			}
-		}
-		if value == "" {
-			return nil // No options available, skip
-		}
-		return FillSelect(elem, value)
-
-	case action.InputTypeFile:
-		// GO EXTENSION: File upload support with smart file type selection
-		// Determine file path: configured value or smart selection based on accept
-		filePath := value
-		if filePath == "" {
-			var err error
-			filePath, err = GetFilePathForAccept(input.Accept)
-			if err != nil {
-				return fmt.Errorf("failed to get upload file for accept=%q: %w", input.Accept, err)
-			}
-		}
-
-		// If hidden input with trigger, use dialog interception
-		if input.Hidden && input.TriggerXPath != "" {
-			triggerElem, err := page.ElementX(input.TriggerXPath)
-			if err != nil {
-				return fmt.Errorf("failed to find trigger element: %w", err)
-			}
-			return FillFileViaDialog(page, triggerElem, []string{filePath})
-		}
-
-		// Direct file input - use SetFiles
-		return FillFile(elem, []string{filePath})
-
-	default:
-		// Try as text input
-		return FillText(elem, value)
+	if input.Type != action.InputTypeFile {
+		return h.fillControl(elem, input, value)
 	}
+
+	// GO EXTENSION: File upload support with smart file type selection
+	// Determine file path: configured value or smart selection based on accept
+	filePath := value
+	if filePath == "" {
+		filePath, err = GetFilePathForAccept(input.Accept)
+		if err != nil {
+			return "", fmt.Errorf("failed to get upload file for accept=%q: %w", input.Accept, err)
+		}
+	}
+
+	// If hidden input with trigger, use dialog interception
+	if input.Hidden && input.TriggerXPath != "" {
+		triggerElem, err := page.ElementX(input.TriggerXPath)
+		if err != nil {
+			return "", fmt.Errorf("failed to find trigger element: %w", err)
+		}
+		return attempted(FillFileViaDialog(page, triggerElem, []string{filePath}))
+	}
+
+	// Direct file input - use SetFiles
+	return attempted(FillFile(elem, []string{filePath}))
 }
 
 // getValueForInput returns the appropriate value for an input.
@@ -1296,12 +1399,27 @@ func containsAny(targets []string, patterns ...string) bool {
 	return false
 }
 
-// Fixed credentials for consistent register/login flow during crawling
+// Fixed credentials for consistent register/login flow during crawling.
+// FixedEmail is the address at the default identity domain; with an operator
+// override the domain follows spidering.identity_email_domain (fixedEmail).
 const (
-	FixedEmail    = "johnted132123@gmail.com"
 	FixedUsername = "johnted132123"
+	FixedEmail    = FixedUsername + "@" + config.DefaultIdentityEmailDomain
 	FixedPassword = "Server2018!!"
 )
+
+// identityEmailDomain is the domain generated email addresses use.
+func (h *Handler) identityEmailDomain() string {
+	if h.config != nil && h.config.IdentityEmailDomain != "" {
+		return h.config.IdentityEmailDomain
+	}
+	return config.DefaultIdentityEmailDomain
+}
+
+// fixedEmail is FixedEmail at the configured identity domain.
+func (h *Handler) fixedEmail() string {
+	return FixedUsername + "@" + h.identityEmailDomain()
+}
 
 // responseAwareValue resolves a value using the per-crawl FillContext: it reuses
 // an identity value already used this crawl, prefers a concrete value the page
@@ -1338,9 +1456,10 @@ func (h *Handler) responseAwareValue(input *DetectedInput) (string, bool) {
 }
 
 // deriveIdentityValue picks the value for an identity field the first time it is
-// seen: a page-provided example when it fits the semantic, then a target-derived
-// value for email/username, falling back to the original smart value (the fixed
-// credentials / static table) so password strength and behavior are preserved.
+// seen: a page-provided example when it fits the semantic, then a generated
+// address at the identity email domain (email) or a target-derived username,
+// falling back to the original smart value (the fixed credentials / static
+// table) so password strength and behavior are preserved.
 func (h *Handler) deriveIdentityValue(sem FieldSemantic, input *DetectedInput) string {
 	switch sem {
 	case SemPassword:
@@ -1350,10 +1469,9 @@ func (h *Handler) deriveIdentityValue(sem FieldSemantic, input *DetectedInput) s
 		if ex := exampleValue(input); ex != "" && strings.Contains(ex, "@") {
 			return ex
 		}
-		if d := h.fillCtx.Domain(); d != "" {
-			return crawlLocalPart + "@" + d
-		}
-		return h.getSmartValue(input)
+		// Never the target's own domain: that is plausible real mail at the
+		// customer's domain. See config.DefaultIdentityEmailDomain.
+		return crawlLocalPart + "@" + h.identityEmailDomain()
 	case SemUsername:
 		if ex := exampleValue(input); ex != "" && !strings.ContainsAny(ex, " @") {
 			return ex
@@ -1382,7 +1500,7 @@ func (h *Handler) getSmartValue(input *DetectedInput) string {
 	// Identity patterns - FIXED for consistent login (keyword lists shared with
 	// classifyField so the two never drift).
 	if containsAny(targets, emailFieldKeywords...) {
-		return FixedEmail
+		return h.fixedEmail()
 	}
 	if containsAny(targets, passwordFieldKeywords...) {
 		return FixedPassword

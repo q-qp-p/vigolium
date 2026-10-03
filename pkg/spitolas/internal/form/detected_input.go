@@ -46,6 +46,12 @@ type DetectedInput struct {
 	// Orphan input detection (Go extension — pilot mode)
 	SubmitXPath string // XPath of nearest submit-like element for inputs outside <form> tags
 
+	// FormKey names the form that owns the control (its index among
+	// document.forms plus its id and action attributes; the form= attribute is
+	// honored), "" for a control outside any form. Stable within one detection
+	// pass, so an action's fill can be limited to the action's own form.
+	FormKey string
+
 	// Value rotation state (Go extension)
 	mu         sync.Mutex
 	valueIndex int

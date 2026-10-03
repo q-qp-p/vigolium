@@ -84,6 +84,7 @@ type ToolCheck struct {
 type Report struct {
 	Status           Status                  `json:"status"` // "ready", "degraded", "not_ready"
 	Timestamp        string                  `json:"timestamp"`
+	Config           *CheckResult            `json:"config"`
 	Database         *CheckResult            `json:"database"`
 	Initialized      *CheckResult            `json:"initialized"`
 	Queue            *CheckResult            `json:"queue,omitempty"`
@@ -105,9 +106,18 @@ type Deps struct {
 	// DBErr carries the error from opening the database when DB is nil. The
 	// CLI populates this so checkDatabase can surface real connect failures
 	// (refused, auth failed, unknown host) instead of "not configured".
-	DBErr    error
-	Queue    queue.Queue
-	Settings *config.Settings
+	DBErr error
+	// ConfigErr carries the error from loading the configuration file when
+	// Settings fell back to defaults. doctor exists to REPORT broken state, so a
+	// config it could not read must be a failed check here rather than a log line
+	// nobody sees next to a report that says everything is fine.
+	ConfigErr error
+	// ConfigPath is the file the CLI actually resolved, so a report run with
+	// --config names the file it read rather than the default location. Empty
+	// falls back to the default path.
+	ConfigPath string
+	Queue      queue.Queue
+	Settings   *config.Settings
 	// ProbeBrowserLaunch, when set, makes the chromium check actually launch the
 	// resolved browser headless (catching a binary that passes --version but
 	// crashes on real startup). It spawns a browser process (~1-2s), so only the
@@ -170,6 +180,7 @@ func Run(deps Deps) *Report {
 		Tools:     make(map[string]*ToolCheck),
 	}
 
+	r.Config = checkConfig(deps.ConfigPath, deps.ConfigErr)
 	r.Database = checkDatabase(deps.DB, deps.DBErr)
 	r.Initialized = checkInitMarker()
 	r.Queue = checkQueue(deps.Queue)
@@ -274,6 +285,32 @@ func Run(deps Deps) *Report {
 
 	r.Status = computeOverallStatus(r)
 	return r
+}
+
+// checkConfig reports whether the configuration file loaded. A nil error means
+// either a clean load or no config file at all — both are fine, and the message
+// names the resolved path so the operator can tell which.
+func checkConfig(configPath string, cfgErr error) *CheckResult {
+	path := configPath
+	if path == "" {
+		path = config.ConfigFilePath()
+	}
+	if cfgErr == nil {
+		if _, err := os.Stat(path); err != nil {
+			return &CheckResult{Status: StatusOK, Message: "no config file — using built-in defaults"}
+		}
+		return &CheckResult{Status: StatusOK, Message: config.ContractPath(path)}
+	}
+	var loadErr *config.LoadError
+	if errors.As(cfgErr, &loadErr) {
+		path = loadErr.Path
+	}
+	return &CheckResult{
+		Status:  StatusError,
+		Message: fmt.Sprintf("%s could not be loaded — running on built-in defaults", config.ContractPath(path)),
+		Details: []string{cfgErr.Error()},
+		Tip:     "fix the file or pass a different --config; every other check below reflects DEFAULT settings, not yours.",
+	}
 }
 
 func checkDatabase(db *database.DB, dbErr error) *CheckResult {
@@ -1130,6 +1167,11 @@ func checkNucleiTemplates(settings *config.Settings) *CheckResult {
 func computeOverallStatus(r *Report) Status {
 	if r.Database == nil || r.Database.Status == StatusError {
 		return "not_ready"
+	}
+	// Degraded, not not_ready: vigolium runs on defaults without a config file,
+	// so an unreadable one is a real problem that is not a hard stop.
+	if r.Config != nil && r.Config.Status != StatusOK {
+		return "degraded"
 	}
 
 	// Native scan dependencies.

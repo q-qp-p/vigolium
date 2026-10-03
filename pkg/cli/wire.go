@@ -13,9 +13,14 @@ import "github.com/vigolium/vigolium/pkg/cli/configcmd"
 func init() {
 	rootCmd.AddCommand(configcmd.NewCommand(
 		configcmd.Deps{
-			ConfigFlag:   func() string { return globalConfig },
-			Force:        func() bool { return globalForce },
-			Reinitialize: initializeVigolium,
+			ConfigFlag: func() string { return globalConfig },
+			Force:      func() bool { return globalForce },
+			// Always with the default database: `config clean` has just deleted
+			// ~/.vigolium, default store included, so regenerating without it
+			// would leave the install short of a file the user did not ask to
+			// lose. A pinned --db names a different file, which clean never
+			// touched.
+			Reinitialize: func() error { return initializeVigolium(true) },
 			JSON:         func() bool { return globalJSON },
 			WriteJSON:    writeConfigEnvelope,
 		},

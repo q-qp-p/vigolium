@@ -1,0 +1,26 @@
+pkgbase = vigolium-bin
+	pkgdesc = Web vulnerability scanner and traffic analysis CLI
+	pkgver = @VERSION@
+	pkgrel = 1
+	url = https://vigolium.com
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = glibc
+	depends = gcc-libs
+	depends = ca-certificates
+	optdepends = chromium: browser crawling
+	optdepends = git: template updates and repository operations
+	provides = vigolium
+	conflicts = vigolium
+	options = !strip
+	source = LICENSE
+	source = THIRD_PARTY_NOTICES.md
+	sha256sums = @LICENSE_SHA256@
+	sha256sums = @NOTICES_SHA256@
+	source_x86_64 = vigolium_@VERSION@_linux_amd64.tar.gz::@LINUX_AMD64_URL@
+	sha256sums_x86_64 = @LINUX_AMD64_SHA256@
+	source_aarch64 = vigolium_@VERSION@_linux_arm64.tar.gz::@LINUX_ARM64_URL@
+	sha256sums_aarch64 = @LINUX_ARM64_SHA256@
+
+pkgname = vigolium-bin

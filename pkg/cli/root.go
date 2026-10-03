@@ -30,7 +30,6 @@ var (
 	globalTargets                 []string
 	globalTargetFiles             []string
 	globalInputMode               string
-	globalInputReadTimeout        time.Duration
 	globalTimeout                 time.Duration
 	globalConcurrency             int
 	globalScanOnReceive           bool
@@ -111,6 +110,12 @@ var (
 	// Memory ceiling (GOMEMLIMIT)
 	globalMemLimit string
 
+	// globalInputReadTimeout backs --input-read-timeout. It carries the default
+	// in its initializer rather than relying on pflag, because zero is now a
+	// meaningful value ("no deadline") and the commands that never register the
+	// flag must still be bounded. See stdinReadTimeout in stdin.go.
+	globalInputReadTimeout = defaultInputReadTimeout
+
 	// scanHeapCeiling is the heap-ceiling outcome derived by applyScanMemLimit.
 	// The scan banner renders it (colored) after the logo, but only for a
 	// parallel fan-out (-P > 1) — see printScanSummary.
@@ -122,6 +127,13 @@ var (
 	// Multi-tenancy
 	globalProjectUUID string
 	globalProjectName string
+
+	// projectFromEnv records that the project selection above came from
+	// VIGOLIUM_PROJECT_UUID / VIGOLIUM_PROJECT_NAME rather than from a flag. The
+	// two are identical once folded in, and that is the point — but a filter the
+	// operator cannot see in the command they just typed is worth one line of
+	// notice when it narrows a standalone read. See noteEnvProjectFilter.
+	projectFromEnv bool
 )
 
 var rootCmd = &cobra.Command{
@@ -149,6 +161,13 @@ Run 'vigolium <command> --help' for command-specific flags and examples, or 'vig
 		// flag that looks like a safety control and does nothing is worse than
 		// one that is absent.
 		if err := applyReadOnlyMode(cmd); err != nil {
+			return err
+		}
+
+		// Now that zero means "no deadline", a negative value is the only
+		// remaining way to express something the flag cannot do — reject it
+		// rather than let ReadBounded quietly fold it into "no deadline" too.
+		if err := validateInputReadTimeout(cmd); err != nil {
 			return err
 		}
 
@@ -197,8 +216,10 @@ Run 'vigolium <command> --help' for command-specific flags and examples, or 'vig
 		if globalProjectUUID == "" && globalProjectName == "" {
 			if v := os.Getenv("VIGOLIUM_PROJECT_UUID"); v != "" {
 				globalProjectUUID = v
+				projectFromEnv = true
 			} else if v := os.Getenv("VIGOLIUM_PROJECT_NAME"); v != "" {
 				globalProjectName = v
+				projectFromEnv = true
 			}
 		}
 
@@ -223,8 +244,15 @@ Run 'vigolium <command> --help' for command-specific flags and examples, or 'vig
 		// globalDB and one check covers both ways of pinning a source.
 		applySourceMustExist(cmd)
 
-		// Initialize Vigolium on first run (skip when `init` is invoked explicitly)
-		if cmd.Name() != "init" {
+		// After the -S folding above, so the warning reflects the resolved flag
+		// state rather than the raw command line.
+		warnNoOpStateless(cmd)
+
+		// Initialize Vigolium on first run, for the commands that have a reason
+		// to need it. `version`, `help`, `completion` and the hidden completion
+		// RPCs are excluded: see shouldBootstrap for why a tab-completion must
+		// not create a database.
+		if shouldBootstrap(cmd) {
 			if err := ensureInitialized(); err != nil {
 				return err
 			}

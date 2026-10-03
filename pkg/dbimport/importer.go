@@ -36,6 +36,18 @@ type Result struct {
 	FindingsSkipped int
 	ParseErrors     int
 
+	// RecordsSkippedDuplicate counts HTTP records whose uuid was already in the
+	// destination, so they were not inserted. Reported separately from
+	// RecordsImported because "0 imported" out of a 10,000-line export means
+	// something very different from "0 imported, 10,000 already present".
+	RecordsSkippedDuplicate int
+
+	// FindingsFailed counts findings the destination refused to store. Distinct
+	// from FindingsSkipped, which is the benign dedup-append case: a failed
+	// finding is data that was in the source and is NOT in the destination, and
+	// folding the two together reported a lossy import as a clean one.
+	FindingsFailed int
+
 	SeverityCounts map[string]int
 	SkippedTypes   map[string]int
 
@@ -95,7 +107,55 @@ type Options struct {
 	// Ignored by the JSONL/audit/archive importers, whose whole payload is
 	// findings.
 	SkipFindings bool
+
+	// PreserveProjectUUID keeps each JSONL row's own project_uuid instead of
+	// re-homing it onto the projectUUID argument. A row with no project_uuid of
+	// its own still gets the argument.
+	//
+	// It exists for the read-only scratch databases: a `-S --db export.jsonl`
+	// load and a --glob-db merge exist to show a file's contents as they are, and
+	// stamping the default project over every row made `project_uuid` in the
+	// output a statement about the reader rather than about the data — which also
+	// made an explicit project filter over such a source meaningless.
+	//
+	// Persistent `vigolium import` deliberately does NOT set it: importing into a
+	// project means the rows join that project.
+	PreserveProjectUUID bool
+
+	// MaxLineBytes caps a single JSONL line. 0 means DefaultMaxLineBytes.
+	//
+	// The reader grows its buffer to whatever a line needs, which is required —
+	// an exported http_record carries its whole response body on one line. With
+	// no ceiling at all, though, a truncated or non-JSONL file (a tarball, a core
+	// dump, a file whose newlines were stripped) is read into memory in full
+	// before the first parse error can be reported, so the symptom of pointing
+	// `import` at the wrong file is the OOM killer rather than a message.
+	MaxLineBytes int
 }
+
+// DefaultMaxLineBytes is the ceiling ImportJSONL applies to one line when
+// Options.MaxLineBytes is unset. 256 MiB is far above any real exported record
+// (the largest observed response body is ~2 orders of magnitude smaller) and far
+// below the point where the allocation itself is the failure.
+const DefaultMaxLineBytes = 256 << 20
+
+// recordFlushBatch is how many parsed http_records ImportJSONL holds before
+// writing them. Buffering the whole file first meant a 16 GB export was 16 GB of
+// Go heap before the first INSERT; at 500 rows the peak no longer depends on how
+// long the file is.
+const recordFlushBatch = 500
+
+// recordFlushBytes caps the same buffer by SIZE, which is the limit that
+// actually binds. An exported http_record carries its whole request and response
+// inline, so 500 of them is 500 rows on a crawl of small JSON endpoints and
+// ~100 MB on a corpus of page responses — and the multi-row INSERT bun builds
+// from it costs several times that again while it is being assembled and copied
+// through the driver. Measured on a 183 MB single-file export: a count-only
+// limit peaked at 1.6 GB RSS in 3.5 s, a 32 MiB budget at 0.8 GB in 1.9 s.
+//
+// A single record larger than the budget is still written on its own — the
+// budget bounds batching, it never rejects data.
+const recordFlushBytes = 32 << 20
 
 // ImportPath dispatches based on filesystem inspection of path: directory →
 // audit folder, .tar.gz/.tgz/.zip → archive, a vigolium SQLite result database
@@ -236,24 +296,36 @@ func ImportArchive(ctx context.Context, repo *database.Repository, archivePath, 
 	return merged, nil
 }
 
-// tallyFindingSaves counts saved (newly-inserted) vs skipped (dedup-append or
-// errored) findings from an aligned SaveFindingsDirectBatch result, tallying the
-// severity of each non-errored finding into sev. Shared by the audit and JSONL
-// import paths.
-func tallyFindingSaves(findings []*database.Finding, results []database.FindingSaveResult, sev map[string]int) (saved, skipped int) {
+// tallyFindingSaves splits an aligned SaveFindingsDirectBatch result into saved
+// (a new finding row), deduped (collapsed into an existing finding) and failed
+// (the destination refused it), tallying the severity of each non-failed finding
+// into sev. Shared by the audit and JSONL import paths.
+//
+// failed used to be folded into the skipped count, so an import that lost
+// findings and one that merely re-imported them printed the same line. They are
+// opposite outcomes: a deduped finding is already in the destination, a failed
+// one is nowhere.
+//
+// results may be shorter than findings only if a caller passes a mismatched
+// pair; the loop is bounded by the shorter of the two so a bug there is a
+// missing tally rather than a panic in the middle of an import.
+func tallyFindingSaves(findings []*database.Finding, results []database.FindingSaveResult, sev map[string]int) (saved, deduped, failed int) {
 	for i, f := range findings {
+		if i >= len(results) {
+			break
+		}
 		if results[i].Err != nil {
-			skipped++
+			failed++
 			continue
 		}
 		if results[i].Inserted {
 			saved++
 		} else {
-			skipped++
+			deduped++
 		}
 		sev[f.Severity]++
 	}
-	return saved, skipped
+	return saved, deduped, failed
 }
 
 // ImportAudit imports an audit output folder. When opts.AgenticScanUUID is
@@ -298,8 +370,13 @@ func ImportAudit(ctx context.Context, repo *database.Repository, folderPath, pro
 	findings := audit.BuildFindingsWithSource(parsed.RawFindings, auditID, agenticScan.UUID, projectUUID, parsed.RepoName, src)
 
 	sevCounts := map[string]int{}
+	// The batch error is the first per-finding error, which `failed` already
+	// counts; it is carried in the Result rather than returned so the caller can
+	// report everything that DID land alongside what did not. Callers turn a
+	// non-zero FindingsFailed into a non-zero exit (cmd_import) or a rolled-back
+	// source (openGlobDB).
 	results, _ := repo.SaveFindingsDirectBatch(ctx, findings)
-	saved, skipped := tallyFindingSaves(findings, results, sevCounts)
+	saved, skipped, failed := tallyFindingSaves(findings, results, sevCounts)
 
 	// For new scans we set the full finding count; for attached scans we
 	// increment so prior findings on that row aren't clobbered.
@@ -322,7 +399,12 @@ func ImportAudit(ctx context.Context, repo *database.Repository, folderPath, pro
 		updateScan.StorageURL = opts.OriginalSource
 		res.StorageURL = opts.OriginalSource
 	}
-	_ = repo.UpdateAgenticScan(ctx, updateScan)
+	// Propagated, not swallowed: this row is the only link between the imported
+	// findings and the audit they came from, and a dropped update left `agent ls`
+	// reporting a scan with 0 findings next to a database holding hundreds.
+	if err := repo.UpdateAgenticScan(ctx, updateScan); err != nil {
+		return nil, fmt.Errorf("update agent run %s after import: %w", agenticScan.UUID, err)
+	}
 
 	// Mirror the update onto the in-memory copy so the response matches the
 	// new DB state without an extra SELECT round-trip.
@@ -339,6 +421,7 @@ func ImportAudit(ctx context.Context, repo *database.Repository, folderPath, pro
 	res.FindingsTotal = len(findings)
 	res.FindingsSaved = saved
 	res.FindingsSkipped = skipped
+	res.FindingsFailed = failed
 	res.SeverityCounts = sevCounts
 	return res, nil
 }
@@ -363,10 +446,41 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 	}
 
 	var (
-		records  []*database.HTTPRecord
-		findings []*database.Finding
-		lineNum  int
+		records      []*database.HTTPRecord
+		findings     []*database.Finding
+		lineNum      int
+		recordLines  int
+		pendingBytes int
 	)
+
+	// flushRecords writes the buffered records and empties the buffer. Records
+	// are written as they are parsed rather than at the end so peak memory is the
+	// batch, not the file; findings stay buffered because SaveFindingsDirectBatch
+	// dedups on finding_hash across the whole batch and its per-finding results
+	// are what the summary is built from.
+	flushRecords := func() error {
+		if len(records) == 0 {
+			return nil
+		}
+		inserted, err := repo.SaveRecordsBatchSkipExisting(ctx, records)
+		if err != nil {
+			return fmt.Errorf("failed to save HTTP records batch: %w", err)
+		}
+		res.RecordsImported += len(inserted)
+		res.RecordsSkippedDuplicate += len(records) - len(inserted)
+		records = records[:0]
+		pendingBytes = 0
+		return nil
+	}
+
+	// homeProject decides the project a row lands in: its own when the caller
+	// asked to preserve it and the row carries one, otherwise the import target.
+	homeProject := func(rowProject string) string {
+		if opts.PreserveProjectUUID && rowProject != "" {
+			return rowProject
+		}
+		return projectUUID
+	}
 
 	// processLine parses a single JSONL envelope and appends to records/findings.
 	// A bare return here behaves like the old `continue` (skip this line, keep going).
@@ -387,7 +501,7 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 				res.ParseErrors++
 				return
 			}
-			rec.ProjectUUID = projectUUID
+			rec.ProjectUUID = homeProject(rec.ProjectUUID)
 			if rec.UUID == "" {
 				rec.UUID = uuid.New().String()
 			}
@@ -398,6 +512,8 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 				rec.CreatedAt = time.Now()
 			}
 			records = append(records, &rec)
+			recordLines++
+			pendingBytes += len(rec.RawRequest) + len(rec.RawResponse)
 
 		case "finding":
 			var finding database.Finding
@@ -405,7 +521,7 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 				res.ParseErrors++
 				return
 			}
-			finding.ProjectUUID = projectUUID
+			finding.ProjectUUID = homeProject(finding.ProjectUUID)
 			if finding.FindingSource == "" {
 				finding.FindingSource = database.FindingSourceImport
 			}
@@ -425,17 +541,68 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		}
 	}
 
+	maxLine := opts.MaxLineBytes
+	if maxLine <= 0 {
+		maxLine = DefaultMaxLineBytes
+	}
+
 	// Read line-by-line with bufio.Reader rather than bufio.Scanner: an exported
 	// http_record can carry a multi-megabyte response/request body on a single
 	// line, which overflows Scanner's fixed token cap ("token too long").
-	// ReadBytes grows its buffer to the full line length, so any line size loads.
+	//
+	// ReadSlice plus an explicit accumulator rather than ReadBytes, because
+	// ReadBytes has no ceiling: pointed at a file with no newlines it allocates
+	// the whole file before returning, so the failure mode for naming the wrong
+	// input was the OOM killer. Here the accumulator is checked against maxLine
+	// on every refill, and the error says which line and what was already written.
 	reader := bufio.NewReaderSize(r, 1024*1024)
+	var (
+		acc     []byte
+		partial bool
+	)
+	tooLong := func() error {
+		return fmt.Errorf("line %d exceeds %d bytes (%d records already committed); raise Options.MaxLineBytes if this file is genuinely that wide",
+			lineNum+1, maxLine, res.RecordsImported)
+	}
 	for {
-		lineBytes, readErr := reader.ReadBytes('\n')
-		if trimmed := bytes.TrimSpace(lineBytes); len(trimmed) > 0 {
+		chunk, readErr := reader.ReadSlice('\n')
+		if errors.Is(readErr, bufio.ErrBufferFull) {
+			acc = append(acc, chunk...)
+			if len(acc) > maxLine {
+				return nil, tooLong()
+			}
+			partial = true
+			continue
+		}
+
+		line := chunk
+		if partial {
+			acc = append(acc, chunk...)
+			line = acc
+		}
+		if len(line) > maxLine {
+			return nil, tooLong()
+		}
+		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
 			lineNum++
 			processLine(trimmed)
+			if len(records) >= recordFlushBatch || pendingBytes >= recordFlushBytes {
+				if err := flushRecords(); err != nil {
+					return nil, err
+				}
+			}
 		}
+		// Reuse the accumulator for the next wide line, but do not carry an
+		// outlier's capacity for the rest of the import: MaxLineBytes allows a
+		// single 256 MiB line, and holding that array live behind thousands of
+		// small lines would dwarf the whole flush budget this function bounds.
+		if cap(acc) > recordFlushBytes {
+			acc = nil
+		} else {
+			acc = acc[:0]
+		}
+		partial = false
+
 		if readErr != nil {
 			if errors.Is(readErr, io.EOF) {
 				break
@@ -444,28 +611,19 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 		}
 	}
 
-	if len(records) == 0 && len(findings) == 0 {
+	if recordLines == 0 && len(findings) == 0 {
 		return nil, fmt.Errorf("no importable data found (parsed %d lines, %d errors)", lineNum, res.ParseErrors)
 	}
-
-	const batchSize = 500
-	for i := 0; i < len(records); i += batchSize {
-		end := i + batchSize
-		if end > len(records) {
-			end = len(records)
-		}
-		uuids, err := repo.SaveRecordsBatch(ctx, records[i:end])
-		if err != nil {
-			return nil, fmt.Errorf("failed to save HTTP records batch: %w", err)
-		}
-		res.RecordsImported += len(uuids)
+	if err := flushRecords(); err != nil {
+		return nil, err
 	}
 
 	results, _ := repo.SaveFindingsDirectBatch(ctx, findings)
-	saved, skipped := tallyFindingSaves(findings, results, res.SeverityCounts)
+	saved, skipped, failed := tallyFindingSaves(findings, results, res.SeverityCounts)
 	res.FindingsTotal = len(findings)
 	res.FindingsSaved = saved
 	res.FindingsSkipped = skipped
+	res.FindingsFailed = failed
 
 	if attachedScan != nil {
 		update := &database.AgenticScan{
@@ -473,7 +631,11 @@ func ImportJSONL(ctx context.Context, repo *database.Repository, r io.Reader, pr
 			SavedCount:   attachedScan.SavedCount + saved,
 			FindingCount: attachedScan.FindingCount + len(findings),
 		}
-		_ = repo.UpdateAgenticScan(ctx, update)
+		// See ImportAudit: the scan row is the link between these findings and the
+		// run they belong to, so a failed update is reported rather than dropped.
+		if err := repo.UpdateAgenticScan(ctx, update); err != nil {
+			return nil, fmt.Errorf("update agent run %s after import: %w", attachedScan.UUID, err)
+		}
 		attachedScan.SavedCount = update.SavedCount
 		attachedScan.FindingCount = update.FindingCount
 		res.AgenticScan = attachedScan
@@ -500,9 +662,11 @@ func mergeResult(dst, src *Result) {
 		dst.CreatedNew = dst.CreatedNew || src.CreatedNew
 	}
 	dst.RecordsImported += src.RecordsImported
+	dst.RecordsSkippedDuplicate += src.RecordsSkippedDuplicate
 	dst.FindingsTotal += src.FindingsTotal
 	dst.FindingsSaved += src.FindingsSaved
 	dst.FindingsSkipped += src.FindingsSkipped
+	dst.FindingsFailed += src.FindingsFailed
 	dst.ParseErrors += src.ParseErrors
 	for k, v := range src.SeverityCounts {
 		dst.SeverityCounts[k] += v

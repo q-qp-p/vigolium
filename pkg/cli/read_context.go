@@ -1,7 +1,11 @@
 package cli
 
 import (
+	"path/filepath"
 	"strings"
+
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
+	"github.com/vigolium/vigolium/pkg/database"
 )
 
 // Every -j read attaches a ready-to-run follow-up command:
@@ -39,26 +43,90 @@ func readContextArgs() ([]string, bool) {
 	}
 
 	var args []string
-	if db := strings.TrimSpace(resolvedReadDBPath()); db != "" {
+	if db := followUpDBFlag(); db != "" {
 		args = append(args, "--db", db)
 	}
 	// Scope is carried explicitly rather than left to the active-project file:
 	// that file is global process state a parallel caller may have changed
 	// between the two reads.
-	if statelessReadRequested() {
+	stateless := statelessReadRequested()
+	if stateless {
 		args = append(args, "--stateless")
-	} else if uuid := strings.TrimSpace(globalProjectUUID); uuid != "" {
-		args = append(args, "--project-uuid", uuid)
-	} else if name := strings.TrimSpace(globalProjectName); name != "" {
-		args = append(args, "--project-name", name)
 	}
+	args = append(args, followUpScopeFlags(stateless)...)
 	if globalReadOnly {
 		args = append(args, "--read-only")
 	}
 	if cfg := strings.TrimSpace(globalConfig); cfg != "" {
-		args = append(args, "--config", cfg)
+		// Absolute, for the same reason --db is: the follow-up may be run from
+		// another directory, and a relative --config that resolves to a
+		// different file there is worse than no --config at all.
+		args = append(args, "--config", absOrRaw(cfg))
 	}
 	return args, true
+}
+
+// followUpDBFlag renders the --db value that reopens this read's store, or ""
+// when the store cannot be named on a command line.
+//
+// Two rules, both learned from follow-ups that resolved somewhere else:
+//
+//   - A stateless read's store is the SOURCE the operator named (a .jsonl
+//     export, a standalone .sqlite), not the scratch database it was loaded
+//     into. OpenedDBPath reports the scratch file, which is deleted on exit.
+//   - A non-SQLite driver has no path. OpenedDBPath returns the driver name
+//     there, and "--db postgres" means "a file called postgres in the cwd" —
+//     so the connection details stay where they are, in the config.
+func followUpDBFlag() string {
+	// The first rule is readSourcePath's — shared with the --tree root label, so
+	// the two cannot disagree about which store a read is about.
+	src := readSourcePath()
+	if !statelessReadRequested() {
+		if driver := clicommon.OpenedDBDriver(); driver != "" && driver != "sqlite" {
+			return ""
+		}
+	}
+	if src == "" {
+		return ""
+	}
+	return absOrRaw(database.ExpandPath(src))
+}
+
+// followUpScopeFlags pins the project the read was scoped to.
+//
+// The resolved UUID is preferred over the operator's own --project-name or the
+// implicit active project: a name is looked up at run time in whichever store
+// the follow-up opens, and the active-project file can be changed by `project
+// use` between the two commands. Pinning the UUID makes the follow-up name the
+// same rows this read returned.
+//
+// A stateless read is unscoped by default (the file carries whatever
+// project_uuid it was exported under), so a scope flag is emitted only when the
+// operator asked for one.
+func followUpScopeFlags(stateless bool) []string {
+	if stateless && !explicitProjectSelected() {
+		return nil
+	}
+	if uuid, ok := clicommon.ResolvedProjectUUID(); ok {
+		return []string{"--project-uuid", uuid}
+	}
+	if uuid := strings.TrimSpace(globalProjectUUID); uuid != "" {
+		return []string{"--project-uuid", uuid}
+	}
+	if name := strings.TrimSpace(globalProjectName); name != "" {
+		return []string{"--project-name", name}
+	}
+	return nil
+}
+
+// absOrRaw makes path absolute, falling back to the original when the working
+// directory cannot be read. A best-effort absolute path beats refusing to
+// describe the read.
+func absOrRaw(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
 }
 
 // followUpQuery renders a runnable follow-up command string, pinned to the read
@@ -68,15 +136,10 @@ func readContextArgs() ([]string, bool) {
 // Returns "" when the read cannot be reproduced, which the envelope renders as
 // an absent `query` field rather than a wrong one.
 func followUpQuery(tail ...string) string {
-	ctx, ok := readContextArgs()
-	if !ok {
+	parts := followUpArgv(tail...)
+	if parts == nil {
 		return ""
 	}
-	parts := make([]string, 0, len(ctx)+len(tail)+1)
-	parts = append(parts, "vigolium")
-	parts = append(parts, ctx...)
-	parts = append(parts, tail...)
-
 	// shellQuoteArg is the resume-command quoter; reusing it means a database
 	// path with a space in it is escaped by the same rule in both places.
 	quoted := make([]string, 0, len(parts))
@@ -84,4 +147,21 @@ func followUpQuery(tail ...string) string {
 		quoted = append(quoted, shellQuoteArg(p))
 	}
 	return strings.Join(quoted, " ")
+}
+
+// followUpArgv is followUpQuery's unquoted form: the same command as an argv
+// vector, ready for exec.Command without a shell in the middle.
+//
+// Returns nil when the read cannot be reproduced, so both forms are absent
+// together and a consumer cannot find one but not the other.
+func followUpArgv(tail ...string) []string {
+	ctx, ok := readContextArgs()
+	if !ok {
+		return nil
+	}
+	parts := make([]string, 0, len(ctx)+len(tail)+1)
+	parts = append(parts, "vigolium")
+	parts = append(parts, ctx...)
+	parts = append(parts, tail...)
+	return parts
 }

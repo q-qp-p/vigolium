@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"time"
 )
 
@@ -69,12 +70,51 @@ type ConditionConfig struct {
 	Preconditions []ConditionConfig
 }
 
+// Wait-condition URL matchers (WaitConditionConfig.Matcher).
+const (
+	URLMatchSubstring = "substring" // case-insensitive substring of the page URL (default)
+	URLMatchRegex     = "regex"     // Go regular expression matched against the page URL
+)
+
 // WaitConditionConfig defines a wait condition for specific URLs.
 type WaitConditionConfig struct {
-	URLPattern string        // Apply to URLs matching this pattern
-	Selector   string        // Wait for this element
-	Visible    bool          // Wait for visibility (not just existence)
-	Timeout    time.Duration // Max wait time
+	// URLMatch limits the condition to pages whose URL matches it under
+	// Matcher; empty applies it to every page.
+	URLMatch string
+	// URLPattern is the old name of URLMatch, read only when URLMatch is
+	// empty (EffectiveURLMatch is the one place the two are reconciled).
+	// Despite the name it was always a case-insensitive substring.
+	//
+	// Deprecated: use URLMatch.
+	URLPattern string
+	// Matcher is URLMatchSubstring (the default, also "") or URLMatchRegex.
+	Matcher  string
+	Selector string        // Wait for this element
+	Visible  bool          // Wait for visibility (not just existence)
+	Timeout  time.Duration // Max wait time
+}
+
+// EffectiveURLMatch is URLMatch, falling back to the deprecated URLPattern.
+func (w WaitConditionConfig) EffectiveURLMatch() string {
+	if w.URLMatch != "" {
+		return w.URLMatch
+	}
+	return w.URLPattern
+}
+
+// Validate rejects an unknown matcher and a regex that does not compile, so a
+// typo is a config error instead of a condition that silently never matches.
+func (w WaitConditionConfig) Validate() error {
+	switch w.Matcher {
+	case "", URLMatchSubstring:
+	case URLMatchRegex:
+		if _, err := regexp.Compile(w.EffectiveURLMatch()); err != nil {
+			return fmt.Errorf("invalid URL regex %q: %w", w.EffectiveURLMatch(), err)
+		}
+	default:
+		return fmt.Errorf("matcher must be %q or %q, got: %q", URLMatchSubstring, URLMatchRegex, w.Matcher)
+	}
+	return nil
 }
 
 // FormInputConfig defines how to fill a specific form input.
@@ -100,6 +140,10 @@ type Config struct {
 	BrowserEngine string // "chromium" (default), "ungoogled", or "fingerprint"
 	BrowserPath   string // explicit path to browser binary (overrides auto-detection)
 
+	// BrowserCompat is the set of browser security exceptions in force; see
+	// DefaultBrowserCompat for the defaults.
+	BrowserCompat BrowserCompat
+
 	// Auth & Network
 	BasicAuthUser string
 	BasicAuthPass string
@@ -116,7 +160,14 @@ type Config struct {
 	// makes via CDP. Populated from the same session/header set the HTTP scan
 	// phases use, so the browser explores authenticated instead of only the
 	// unauthenticated shell. Cookie headers are split out into InitialCookies.
+	// They are installed only while the crawl stays on an origin the operator
+	// scope admits (see crawler.applyPageAuth).
 	ExtraHeaders map[string]string
+
+	// RequireAuth fails the crawl, instead of continuing anonymously, when
+	// authentication was configured (InitialCookies/ExtraHeaders) but could
+	// not be applied to the start page.
+	RequireAuth bool
 
 	// Wait times
 	WaitAfterReload time.Duration
@@ -137,10 +188,24 @@ type Config struct {
 	CrawlHiddenAnchors           bool     // Crawl hidden anchor elements
 	RandomizeElements            bool     // Randomize order of extracted elements
 
+	// Policy is what the crawl is permitted to change. Install it with
+	// ApplyPolicy, which also sets the derived switches below
+	// (FormFillEnabled, SubmitGetForms, SubmitPostForms, SelfRegister,
+	// LoginCredentialAttempts) — those still gate their own mechanisms, and
+	// gates with no legacy switch read Policy directly.
+	Policy InteractionPolicy
+
 	// Form Handling
 	FormFillEnabled bool
 	FormFillMode    FormFillMode
 	FormInputs      []FormInputConfig
+
+	// IdentityEmailDomain is the domain of every generated email address
+	// (signup, login and plain email fields), never one derived from the
+	// target: a target-domain address is plausible real mail at the customer's
+	// own domain. Default DefaultIdentityEmailDomain; a page-provided example
+	// address is still preferred.
+	IdentityEmailDomain string
 
 	// SubmitGetForms makes the crawler, after filling a page's forms, synthesize
 	// and fetch the submit URL of each GET form (its resolved action plus the
@@ -168,6 +233,12 @@ type Config struct {
 	// SubmitFormMaxVariants (shared with the GET-form budget).
 	SubmitPostForms bool
 
+	// FormHandlerGrace is how long a triggered POST form waits for the page's own
+	// handler to send a request attributable to it before the outcome is decided
+	// (0 = DefaultFormHandlerGrace). Long enough for a handler that awaits a
+	// token fetch or debounces; a handler slower than this is not attributed.
+	FormHandlerGrace time.Duration
+
 	// Conditions
 	CrawlConditions []ConditionConfig
 	WaitConditions  []WaitConditionConfig
@@ -186,6 +257,13 @@ type Config struct {
 	// Output (traffic is written to vigolium's HTTPRecord table via Writer)
 	IncludeResponseBody    bool // Include response body in HTTP traffic capture
 	IncludeResponseHeaders bool // Include response headers in HTTP traffic capture
+
+	// MaxCaptureBodyBytes caps the encoded size of a dynamic (HTML/JS/JSON/API)
+	// response body the capture pulls over CDP. 0 keeps the capture's default
+	// (network.DefaultMaxDynamicBodyBytes, above the API-spec ingest window);
+	// a negative value removes the ceiling. A skipped body is recorded as
+	// too-large with its size, never as an empty body.
+	MaxCaptureBodyBytes int64
 
 	// MaxParamValueVariants controls how many DISTINCT query-value variants of the
 	// same endpoint shape (same method, path, param-name set and response shape)
@@ -292,8 +370,9 @@ type Config struct {
 	// now-unlocked area. It is single-flighted per host, negative-control gated (a
 	// random pair must be rejected first, or the whole spray is abandoned), and
 	// never a brute-force wordlist, so it cannot lock accounts. Off by default; the
-	// runner auto-enables it at balanced AND deep intensity (see
-	// LoginCredentialFullList for the list size). No finding is emitted — the
+	// runner defaults it on at balanced AND deep intensity unless the operator's
+	// interaction policy says otherwise (see LoginCredentialFullList for the list
+	// size). Derived from Policy.LoginAttempts by ApplyPolicy. No finding is emitted — the
 	// attempts are captured as ordinary traffic.
 	LoginCredentialAttempts bool
 
@@ -323,8 +402,8 @@ type Config struct {
 	// with a generated identity, and reuse that identity to log in. On an app
 	// with open registration the entire authenticated surface is otherwise
 	// invisible to an unauthenticated crawl. Off by default — creating an
-	// account is a write, so it stays an explicit opt-in; the runner enables it
-	// at deep intensity.
+	// account is a write, so it stays an explicit opt-in at every intensity.
+	// Derived from Policy.RegisterAccount by ApplyPolicy.
 	SelfRegister bool
 
 	// FollowUpPasses is how many extra sweeps to run after the action queue
@@ -336,13 +415,6 @@ type Config struct {
 	// drains, bounded by RetryMaxActions — see retryFailedActions. Default on.
 	RetryFailedActions bool
 	RetryMaxActions    int
-
-	// GraphOutputPath, when set, is a file path the finished state graph is
-	// serialized to (states, edges, and the selector each edge was taken by).
-	// The captured traffic says what was requested; the graph says how the
-	// crawler got there, which is what makes a run reproducible and lets a
-	// later pass re-walk to a specific state instead of rediscovering it.
-	GraphOutputPath string
 
 	CrawlScope CrawlScope // Custom URL scope filter (nil = default same-domain check)
 
@@ -369,6 +441,12 @@ type Config struct {
 	// NoColor mode - disable colored output
 	NoColor bool
 }
+
+// DefaultIdentityEmailDomain is the default generated-email domain: reserved by
+// RFC 2606 and published with a null MX (RFC 7505), so mail to it is never
+// delivered, while form validators that check the TLD or resolve the domain
+// still accept it (".invalid" fails both).
+const DefaultIdentityEmailDomain = "example.com"
 
 // DefaultClickSelectors returns the default CSS selectors for clickable elements.
 func DefaultClickSelectors() []string {
@@ -431,6 +509,7 @@ func New(targetURL string) (*Config, error) {
 		Headless:      true,
 		BrowserCount:  1,
 		BrowserEngine: "chromium", // Default to standard chromium
+		BrowserCompat: DefaultBrowserCompat(),
 
 		BasicAuthUser: "",
 		BasicAuthPass: "",
@@ -462,11 +541,14 @@ func New(targetURL string) (*Config, error) {
 		FormFillMode:    FormFillNormal,
 		FormInputs:      []FormInputConfig{},
 
+		IdentityEmailDomain: DefaultIdentityEmailDomain,
+
 		// GET- and POST-form submission on by default (tied to form filling by the
 		// caller); bounded per crawl so a form-heavy page cannot flood the target.
 		SubmitGetForms:        true,
 		SubmitPostForms:       true,
 		SubmitFormMaxVariants: defaultSubmitFormMaxVariants,
+		FormHandlerGrace:      DefaultFormHandlerGrace,
 
 		// Keep a handful of distinct query-value variants per endpoint shape so
 		// category/filter/tab/search links are not all collapsed into one record.
@@ -531,8 +613,7 @@ func New(targetURL string) (*Config, error) {
 		RetryFailedActions: true,
 		RetryMaxActions:    defaultRetryMaxActions,
 
-		// Registering an account is a write, so it stays opt-in; the runner turns
-		// it on at deep intensity.
+		// Registering an account is a write, so it stays opt-in.
 		SelfRegister: false,
 
 		// Common-credential login attempts are off by default; the runner turns
@@ -541,6 +622,10 @@ func New(targetURL string) (*Config, error) {
 		// ordinary crawl keeps active login attempts explicit.
 		LoginCredentialAttempts: false,
 		LoginCredentialFullList: false,
+
+		// Matches the derived switches above (forms filled and submitted, no
+		// account actions); see DefaultInteractionPolicy.
+		Policy: DefaultInteractionPolicy(),
 	}, nil
 }
 
@@ -549,6 +634,9 @@ func New(targetURL string) (*Config, error) {
 // filter forms is the common case; the cap guards a page that wires up many
 // forms without truncating real-world apps.
 const defaultSubmitFormMaxVariants = 50
+
+// DefaultFormHandlerGrace is the default FormHandlerGrace.
+const DefaultFormHandlerGrace = 750 * time.Millisecond
 
 // defaultMaxParamValueVariants is how many distinct query-value variants of one
 // endpoint shape the capture keeps by default. Big enough to surface a typical
@@ -668,6 +756,18 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("CrawlStrategy must be normal/random/oldest_first/shallow_first/adaptive, got: %s", c.CrawlStrategy)
 	}
 
+	for i, wc := range c.WaitConditions {
+		if err := wc.Validate(); err != nil {
+			return fmt.Errorf("WaitConditions[%d]: %w", i, err)
+		}
+	}
+
+	switch c.Policy.DialogResponse {
+	case "", DialogRecordDismiss, DialogAcceptAll:
+	default:
+		return fmt.Errorf("Policy.DialogResponse must be %q or %q, got: %s", DialogRecordDismiss, DialogAcceptAll, c.Policy.DialogResponse)
+	}
+
 	// Validate browser engine
 	validEngines := map[string]bool{"": true, "chromium": true, "ungoogled": true, "fingerprint": true}
 	if !validEngines[c.BrowserEngine] {
@@ -767,13 +867,14 @@ func (c *Config) AddCrawlCondition(condType ConditionType, value string, negate 
 	return c
 }
 
-// AddWaitCondition adds a wait condition.
-func (c *Config) AddWaitCondition(urlPattern, selector string, visible bool, timeout time.Duration) *Config {
+// AddWaitCondition adds a wait condition applied to pages whose URL contains
+// urlSubstring (case-insensitive; empty = every page).
+func (c *Config) AddWaitCondition(urlSubstring, selector string, visible bool, timeout time.Duration) *Config {
 	c.WaitConditions = append(c.WaitConditions, WaitConditionConfig{
-		URLPattern: urlPattern,
-		Selector:   selector,
-		Visible:    visible,
-		Timeout:    timeout,
+		URLMatch: urlSubstring,
+		Selector: selector,
+		Visible:  visible,
+		Timeout:  timeout,
 	})
 	return c
 }
@@ -799,6 +900,7 @@ func (c *Config) EnableCDPDetection(enabled bool) *Config {
 // EnableFormFill enables or disables form filling.
 func (c *Config) EnableFormFill(enabled bool) *Config {
 	c.FormFillEnabled = enabled
+	c.Policy.EditFields = enabled
 	return c
 }
 
@@ -881,6 +983,7 @@ func (c *Config) SetBrowserEngine(engine string) *Config {
 // the full documented list (deep) versus the minimal set (balanced).
 func (c *Config) SetLoginCredentialAttempts(enabled, fullList bool) *Config {
 	c.LoginCredentialAttempts = enabled
+	c.Policy.LoginAttempts = enabled
 	c.LoginCredentialFullList = fullList
 	return c
 }

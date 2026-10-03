@@ -2,8 +2,11 @@ package cli
 
 import (
 	"database/sql"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -180,18 +183,75 @@ func TestValidateParallelScanSingleTargetDegrades(t *testing.T) {
 // the batch was interrupted before any target finished cleanly. Partial success
 // (including a partial interrupt) and an empty batch are clean exits.
 func TestParallelBatchError(t *testing.T) {
-	assert.NoError(t, parallelBatchError(0, 0, 0), "empty batch is not a failure")
-	assert.NoError(t, parallelBatchError(0, 0, 5), "all succeeded")
-	assert.NoError(t, parallelBatchError(4, 0, 5), "partial success exits clean")
-	assert.Error(t, parallelBatchError(5, 0, 5), "all failed exits non-zero")
-	assert.Error(t, parallelBatchError(1, 0, 1), "single failed target exits non-zero")
+	assert.NoError(t, parallelBatchError(0, 0, 0, 0), "empty batch is not a failure")
+	assert.NoError(t, parallelBatchError(0, 0, 0, 5), "all succeeded")
+	assert.NoError(t, parallelBatchError(4, 0, 0, 5), "partial success exits clean")
+	assert.Error(t, parallelBatchError(5, 0, 0, 5), "all failed exits non-zero")
+	assert.Error(t, parallelBatchError(1, 0, 0, 1), "single failed target exits non-zero")
 
 	// Interrupt handling: a full stop (nothing finished) is non-zero, but a
 	// partial interrupt — some targets completed before Ctrl-C — exits clean.
-	assert.Error(t, parallelBatchError(0, 5, 5), "full interrupt before any success exits non-zero")
-	assert.Error(t, parallelBatchError(2, 3, 5), "all targets failed or interrupted exits non-zero")
-	assert.NoError(t, parallelBatchError(0, 3, 5), "partial interrupt with successes exits clean")
-	assert.NoError(t, parallelBatchError(1, 2, 5), "some succeeded despite interrupt exits clean")
+	assert.Error(t, parallelBatchError(0, 5, 0, 5), "full interrupt before any success exits non-zero")
+	assert.Error(t, parallelBatchError(2, 3, 0, 5), "all targets failed or interrupted exits non-zero")
+	assert.NoError(t, parallelBatchError(0, 3, 0, 5), "partial interrupt with successes exits clean")
+	assert.NoError(t, parallelBatchError(1, 2, 0, 5), "some succeeded despite interrupt exits clean")
+}
+
+// A gated child scanned fine and tripped --fail-on. The batch must report that
+// with exit 4 — a `-P --fail-on high` run used to exit 0 unless every child
+// tripped, so the gate the operator asked for did not stop their CI job.
+func TestParallelBatchErrorGate(t *testing.T) {
+	assert.Equal(t, ExitFailOnGate, classifyExitCode(parallelBatchError(0, 0, 2, 5)),
+		"some targets tripped the gate")
+	assert.Equal(t, ExitFailOnGate, classifyExitCode(parallelBatchError(0, 0, 5, 5)),
+		"every target tripped the gate")
+
+	// A real failure outranks the gate: a batch that both broke and found
+	// something should report the break, which is the actionable half.
+	assert.Equal(t, ExitError, classifyExitCode(parallelBatchError(5, 0, 0, 5)),
+		"all failed is still a failure")
+	assert.Equal(t, ExitFailOnGate, classifyExitCode(parallelBatchError(4, 0, 1, 5)),
+		"a partial failure is clean, so the gate decides")
+
+	// An interrupt that stopped everything outranks the gate too: the batch did
+	// not finish, so its verdict is incomplete.
+	assert.Equal(t, ExitError, classifyExitCode(parallelBatchError(0, 5, 0, 5)),
+		"full interrupt reports the interrupt")
+}
+
+// childTrippedGate must read the child's exit status, not its message: the
+// severity gate and a genuine crash both surface as a non-nil error from
+// exec.Cmd.Run, and only the code tells them apart.
+func TestChildTrippedGate(t *testing.T) {
+	assert.False(t, childTrippedGate(nil), "a clean child did not trip the gate")
+	assert.False(t, childTrippedGate(errors.New("exit status 4")),
+		"message text must not be enough — a coincidence would mislabel a failure")
+
+	run := func(code string) error {
+		cmd := exec.Command(os.Args[0], "-test.run=TestChildExitHelper")
+		cmd.Env = append(os.Environ(), childExitHelperEnv+"="+code)
+		return cmd.Run()
+	}
+	assert.True(t, childTrippedGate(run("4")), "exit 4 is the severity gate")
+	assert.False(t, childTrippedGate(run("1")), "exit 1 is a failure, not the gate")
+	assert.False(t, childTrippedGate(run("0")), "exit 0 is a clean child")
+}
+
+// childExitHelperEnv names the exit code TestChildExitHelper should produce.
+const childExitHelperEnv = "VIGOLIUM_TEST_CHILD_EXIT"
+
+// TestChildExitHelper is the helper process TestChildTrippedGate re-executes.
+// It is a no-op unless the env var above asks it for an exit code.
+func TestChildExitHelper(t *testing.T) {
+	code, ok := os.LookupEnv(childExitHelperEnv)
+	if !ok {
+		t.Skip("helper process only")
+	}
+	n, err := strconv.Atoi(code)
+	if err != nil {
+		t.Fatalf("bad %s=%q", childExitHelperEnv, code)
+	}
+	os.Exit(n)
 }
 
 // withIndexSuffix disambiguates two targets that resolve to the same per-host

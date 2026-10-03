@@ -23,14 +23,15 @@ const (
 	SemPhone    FieldSemantic = "phone"
 )
 
-// crawlLocalPart is the local-part of the target-derived email address. Kept
-// deterministic (not random) so a value submitted to a registration form can be
-// replayed verbatim into a later login form.
+// crawlLocalPart is the local-part of the generated email address (at the
+// identity email domain, never the target's). Kept deterministic (not random)
+// so a value submitted to a registration form can be replayed verbatim into a
+// later login form.
 const crawlLocalPart = "vigolium-crawl"
 
 // FillContext carries per-crawl state that makes form filling response-aware:
-// the target's registrable domain (so values can be derived from the target
-// itself) and a memory of the value chosen for each identity semantic (so the
+// the target's registrable domain (so a username can be derived from the target
+// itself — email addresses never are) and a memory of the value chosen for each identity semantic (so the
 // same email/username/password is reused across pages — a signup filled on one
 // page can be logged in with on another). It is shared between the form Handler
 // and the crawler's login-credential pass, and every method is safe for the

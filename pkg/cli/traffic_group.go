@@ -44,7 +44,12 @@ var trafficGroupConflicts = []string{
 }
 
 // validateTrafficGroupFlags rejects what is knowable from the flags alone.
-func validateTrafficGroupFlags(changed func(string) bool) error {
+//
+// `on` answers "did the operator ask for this behaviour", not "did they mention
+// the flag": `--group-by host --raw=false` is a caller explicitly turning the
+// conflicting renderer OFF, and rejecting it as a conflict told them to remove
+// the very flag that resolved it.
+func validateTrafficGroupFlags(on func(string) bool) error {
 	if strings.TrimSpace(trafficGroupBy) == "" {
 		return nil
 	}
@@ -55,7 +60,7 @@ func validateTrafficGroupFlags(changed func(string) bool) error {
 		return usageErrorf("--group-limit must be >= 0 (0 = every group), got %d", trafficGroupLimit)
 	}
 	for _, name := range trafficGroupConflicts {
-		if changed(name) {
+		if on(name) {
 			return usageErrorf("--group-by cannot be combined with --%s: one counts records, the other renders them", name)
 		}
 	}

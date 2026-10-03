@@ -1,0 +1,35 @@
+name: vigolium
+version: '@VERSION@'
+summary: Web vulnerability scanner and traffic analysis CLI
+description: |
+  Vigolium provides a command-line scanner, traffic ingestion, and a REST API.
+  Browser crawling and external integrations require additional tools.
+base: core24
+grade: stable
+# Full CLI integration requires host files and external tools. Store publication
+# requires classic-confinement approval; this recipe does not imply approval.
+confinement: classic
+license: MIT
+platforms:
+  @ARCH@:
+    build-on: [@ARCH@]
+    build-for: [@ARCH@]
+apps:
+  vigolium:
+    command: vigolium
+    environment:
+      VIGOLIUM_PACKAGE_MANAGER: snap
+      VIGOLIUM_DISABLE_UPDATE_CHECK: '1'
+      VIGOLIUM_HOME: $SNAP_USER_COMMON/data
+      XDG_CACHE_HOME: $SNAP_USER_COMMON/cache
+      VIGOLIUM_AUDIT_CACHE_DIR: $SNAP_USER_COMMON/cache/audit
+parts:
+  vigolium:
+    plugin: dump
+    source: '@URL@'
+    source-checksum: sha256/@SHA256@
+    stage-packages: [ca-certificates, libstdc++6]
+  notices:
+    plugin: dump
+    source: .
+    stage: [LICENSE, THIRD_PARTY_NOTICES.md]

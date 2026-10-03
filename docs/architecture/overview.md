@@ -47,6 +47,17 @@ JavaScript extensions are selected and dispatched as part of dynamic
 assessment; `extension` remains a selector for extension-only work, not a
 trailing stage after known-issue scanning.
 
+**Browser capture is accounted, not assumed.** The browser phases (Spidering,
+targeted Re-spider) and the agent's browser tools persist what Chromium
+observed through a writer that returns a *capture receipt* once it has drained:
+records accepted, persisted, refused, failed, and whether the final drain
+completed. Phase summaries and tool results report from the receipt — never
+from the fact that capture was configured — and a phase whose receipts show
+loss says `run incomplete`, meaning the stored traffic is a lower bound on what
+the browser saw. What a browser crawl may change, and which browser security
+exceptions it runs with, is one reported policy; see
+[Browser policy](../guides/browser-policy.md).
+
 **Strategies** control which phases run and how aggressively:
 
 | Strategy | Behavior |

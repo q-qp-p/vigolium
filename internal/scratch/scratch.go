@@ -29,8 +29,18 @@
 // vigolium's own process directories, not a walk of a shared temp directory
 // with six figures in it.
 //
-// Collection is age-based on mtime, which doubles as a liveness check: scratch
-// belonging to a running scan is being written to, so it stays young.
+// Liveness is a lease, not an age. Each process directory holds a `.lease` file
+// this process flocks for its lifetime, so the sweeper can ask the kernel
+// whether an owner is still running — and get the right answer even after a
+// SIGKILL, since the lock dies with the open file description.
+//
+// mtime alone was never the liveness proxy it was described as: a directory's
+// mtime changes when an entry is created or removed in it, NOT when files
+// already inside it are written. A long scan that allocated its disksets up
+// front and then wrote gigabytes into them for eight hours had a directory
+// mtime fixed at its first minute, so DefaultMaxAge made its scratch a
+// collection candidate while it was still in use. Age remains the backstop for
+// directories with no lease (an older version's, or Windows).
 package scratch
 
 import (
@@ -40,6 +50,8 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -110,6 +122,12 @@ var (
 	dirPath string
 	holders int
 
+	// leaseFile holds this process's lease on dirPath for as long as the
+	// directory is ours. Nil when the lease could not be taken (an exotic
+	// filesystem, Windows), which costs the sweeper its liveness check and
+	// nothing else.
+	leaseFile *os.File
+
 	sweepOnce sync.Once
 )
 
@@ -155,8 +173,24 @@ func ensureLocked() (string, error) {
 	if err := os.MkdirAll(path, 0o700); err != nil {
 		return "", err
 	}
+	// Best-effort: a directory with no lease is still usable, it just falls back
+	// to the pid and age checks when another process sweeps.
+	leaseFile, _ = acquireLease(path)
 	dirPath = path
 	return dirPath, nil
+}
+
+// releaseLeaseLocked drops this process's lease. The caller must hold mu.
+//
+// Closing before the RemoveAll, not after: on the unixes removing an open file
+// is legal and the lock would survive on the now-unlinked inode, which is
+// harmless but makes the invariant "a lease exists iff a live owner has the
+// directory" false for as long as the handle lives.
+func releaseLeaseLocked() {
+	if leaseFile != nil {
+		_ = leaseFile.Close()
+		leaseFile = nil
+	}
 }
 
 // processDir returns the scratch directory, creating it if no holder has yet.
@@ -180,6 +214,9 @@ func processDir() (string, error) {
 func reprovision() (string, error) {
 	mu.Lock()
 	defer mu.Unlock()
+	// The old lease belongs to a directory we are abandoning, and holding it
+	// would keep another sweeper from collecting that directory forever.
+	releaseLeaseLocked()
 	dirPath = ""
 	return ensureLocked()
 }
@@ -232,6 +269,7 @@ func Release() bool {
 	if holders > 0 || dirPath == "" {
 		return false
 	}
+	releaseLeaseLocked()
 	err := os.RemoveAll(dirPath)
 	dirPath = ""
 	return err == nil
@@ -283,9 +321,22 @@ func SweepRoot(maxAge time.Duration) (int, error) {
 	return sweepDir(Root(), maxAge, time.Time{}, nil)
 }
 
+// processDirName matches a scratch process directory: p<pid>-<8 hex>.
+//
+// Used to decide which entries are eligible for the liveness checks. Loose
+// matching would be worse than none: the legacy prefixes sweep runs over the
+// whole of os.TempDir(), and reading an arbitrary name's digits as a pid would
+// have the sweeper spare someone else's file because an unrelated number in it
+// happened to be live.
+var processDirName = regexp.MustCompile(`^p(\d+)-[0-9a-f]{8}$`)
+
 // sweepDir removes entries in dir older than maxAge, stopping at the deadline.
 // A zero deadline means no limit. A nil prefixes means every entry is a
 // candidate, which is safe only under a directory vigolium owns outright.
+//
+// For a process directory under the scratch root, age is the LAST question
+// asked, not the only one. See the package doc for why mtime was never the
+// liveness proxy it was described as.
 func sweepDir(dir string, maxAge time.Duration, deadline time.Time, prefixes []string) (int, error) {
 	if maxAge <= 0 {
 		maxAge = DefaultMaxAge
@@ -314,6 +365,9 @@ func sweepDir(dir string, maxAge time.Duration, deadline time.Time, prefixes []s
 		if path == live {
 			continue
 		}
+		if ownerIsAlive(path, entry.Name()) {
+			continue
+		}
 		info, err := entry.Info()
 		if err != nil {
 			// Raced with another sweeper or with the owner's own cleanup.
@@ -323,11 +377,48 @@ func sweepDir(dir string, maxAge time.Duration, deadline time.Time, prefixes []s
 		if info.ModTime().After(cutoff) {
 			continue
 		}
+		// Re-checked immediately before the removal, not only every 64 entries:
+		// RemoveAll of a diskset directory with six figures of files in it is the
+		// expensive operation here, so a budget enforced only at the loop head can
+		// be overrun by one whole removal — minutes, on the backlog this exists to
+		// drain.
+		if !deadline.IsZero() && time.Now().After(deadline) {
+			break
+		}
 		if err := os.RemoveAll(path); err == nil {
 			removed++
 		}
 	}
 	return removed, nil
+}
+
+// ownerIsAlive reports whether a live process still owns the scratch directory
+// at path.
+//
+// Only process directories (p<pid>-<rand>) are asked: everything else under the
+// root, and everything the legacy sweep matches, carries no owner identity to
+// check. For those it answers false and the age check decides, which is the
+// behavior that was always there.
+func ownerIsAlive(path, name string) bool {
+	m := processDirName.FindStringSubmatch(name)
+	if m == nil {
+		return false
+	}
+	if held, known := leaseHeld(path); known {
+		// A lease answers definitively in both directions: held means a live
+		// owner, and not-held means the owner is gone even if the pid has since
+		// been recycled onto an unrelated process.
+		return held
+	}
+	// No lease to ask (an older version's directory, or Windows). The pid is the
+	// next best thing. It is wrong in one direction — a recycled pid keeps a dead
+	// run's scratch — but that direction only delays collection, while the other
+	// deletes a running scan's working set.
+	pid, err := strconv.Atoi(m[1])
+	if err != nil {
+		return false
+	}
+	return pidAlive(pid)
 }
 
 // currentDir reads the live scratch directory under the lock, so the sweep

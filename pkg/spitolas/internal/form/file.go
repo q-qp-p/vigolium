@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/vigolium/vigolium/internal/scratch"
 )
 
 // File generation constants.
@@ -37,11 +39,61 @@ const (
 	FileTypeZIP  FileType = "zip"
 )
 
-// generatedFiles caches generated file paths by type.
+// generatedFiles caches generated file paths by type. The files live in one
+// run-owned directory (fixtureDir) under the process's scratch, never at fixed
+// names in the shared temp directory, so two vigolium processes cannot
+// overwrite or read each other's fixtures. holders refcounts the crawls using
+// them (RetainGeneratedFiles / ReleaseGeneratedFiles).
 var (
 	generatedFiles = make(map[FileType]string)
 	generateMu     sync.Mutex
+	fixtureDir     string
+	holders        int
 )
+
+// RetainGeneratedFiles registers one crawl as a user of the generated upload
+// fixtures. Pair every call with ReleaseGeneratedFiles.
+func RetainGeneratedFiles() {
+	generateMu.Lock()
+	holders++
+	generateMu.Unlock()
+}
+
+// ReleaseGeneratedFiles drops one crawl's hold; when the last holder releases,
+// the fixture directory is removed and the cache cleared, so a run's fixtures do
+// not outlive it. scratch.Release is the backstop when a crawl never gets here.
+// Extra releases are ignored.
+func ReleaseGeneratedFiles() {
+	generateMu.Lock()
+	defer generateMu.Unlock()
+	if holders > 0 {
+		holders--
+	}
+	if holders > 0 {
+		return
+	}
+	if fixtureDir != "" {
+		_ = os.RemoveAll(fixtureDir)
+	}
+	fixtureDir = ""
+	clear(generatedFiles)
+}
+
+// fixtureDirLocked returns the run-owned fixture directory, creating it under
+// the process scratch on first use. The caller holds generateMu.
+func fixtureDirLocked() (string, error) {
+	if fixtureDir != "" {
+		if _, err := os.Stat(fixtureDir); err == nil {
+			return fixtureDir, nil
+		}
+	}
+	dir, err := scratch.MkdirTemp("ff_upload-*")
+	if err != nil {
+		return "", err
+	}
+	fixtureDir = dir
+	return dir, nil
+}
 
 // GetFilePathForAccept returns an appropriate file path based on accept attribute.
 // Parses accept attribute (e.g., "image/*", ".pdf,.doc", "application/pdf")
@@ -67,12 +119,14 @@ func GetFilePathForType(fileType FileType) (string, error) {
 		delete(generatedFiles, fileType)
 	}
 
-	// Generate file
-	tempDir := os.TempDir()
-	filename := fmt.Sprintf("ff_upload.%s", fileType)
-	path := filepath.Join(tempDir, filename)
+	// Generate the file in the run-owned directory. The basename stays
+	// ff_upload.<ext>: it is what the target sees as the uploaded file name.
+	dir, err := fixtureDirLocked()
+	if err != nil {
+		return "", fmt.Errorf("create upload fixture directory: %w", err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("ff_upload.%s", fileType))
 
-	var err error
 	switch fileType {
 	case FileTypePNG:
 		err = generatePNG(path)

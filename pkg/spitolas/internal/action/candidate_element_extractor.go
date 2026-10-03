@@ -48,6 +48,19 @@ type CandidateElementExtractor struct {
 	crawlFrames         bool     // Enable recursive frame extraction
 	frameIgnorePatterns []string // Patterns to ignore frames by name/id
 
+	// crawlScope is the operator's URL boundary, consulted on an anchor's href
+	// BEFORE the element is offered as a click candidate. The crawler applies the
+	// same boundary when it decides whether to visit a state, but by then the
+	// browser has already navigated — an explicitly excluded path is a path the
+	// operator asked us not to request, so the anchor is dropped here instead.
+	// nil = no operator boundary (the host-only check below still applies).
+	crawlScope config.CrawlScope
+	// baseURL is what a relative href is resolved against before crawlScope sees
+	// it. Without it only absolute hrefs could be checked, and a root-relative
+	// "/logout" — the single most common thing an operator excludes — would slip
+	// through.
+	baseURL *url.URL
+
 	formHandler FormHandler
 
 	checkedElements ExtractorManager
@@ -92,6 +105,8 @@ func NewCandidateElementExtractor(cfg *config.Config) *CandidateElementExtractor
 		frameIgnorePatterns: cfg.ExcludeFrames,
 		clickOnce:           cfg.ClickOnce,
 		clickOnceSeen:       make(map[string]bool),
+		crawlScope:          cfg.CrawlScope,
+		baseURL:             cfg.URL,
 	}
 }
 
@@ -685,8 +700,53 @@ func (e *CandidateElementExtractor) shouldSkipHref(href string) bool {
 		}
 	}
 
+	// Operator scope boundary, on the href itself.
+	if e.outOfCrawlScope(href) {
+		return true
+	}
+
 	// Elements with these hrefs often have onclick handlers that cause state changes
 	return false
+}
+
+// outOfCrawlScope reports whether href resolves to a URL the operator's scope
+// rejects.
+//
+// Only absolute and root-relative hrefs are judged. A PATH-relative href
+// ("admin/users") is left alone: resolving it needs the document's real base,
+// which a <base> tag or a History API push can have moved away from the config's
+// start URL, and a wrong resolution here would drop a legitimate link rather than
+// merely let an extra one through. Anything not judged still meets the crawler's
+// own scope check before it is visited — this pass exists to avoid the navigation,
+// not to replace that check.
+//
+// Un-parseable hrefs are allowed through for the same reason: the other skip rules
+// above and the crawler's check downstream are the authority on those.
+func (e *CandidateElementExtractor) outOfCrawlScope(href string) bool {
+	if e.crawlScope == nil {
+		return false
+	}
+	trimmed := strings.TrimSpace(href)
+	absolute := strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") ||
+		strings.HasPrefix(trimmed, "//")
+	rootRelative := strings.HasPrefix(trimmed, "/") && !strings.HasPrefix(trimmed, "//")
+	if !absolute && !rootRelative {
+		return false
+	}
+
+	ref, err := url.Parse(trimmed)
+	if err != nil {
+		return false
+	}
+	resolved := ref
+	if e.baseURL != nil {
+		resolved = e.baseURL.ResolveReference(ref)
+	}
+	// A scheme-relative href with no base has no host to judge.
+	if resolved.Host == "" {
+		return false
+	}
+	return !e.crawlScope(resolved.String())
 }
 
 // isExternalLink checks if a href points to an external site.

@@ -290,10 +290,17 @@ func runVacuum(ctx context.Context, db *database.DB) {
 
 // resetDatabase deletes the SQLite database file and recreates it with a fresh schema.
 func resetDatabase() error {
+	// config.LoadSettings directly, and ANY error refuses — not the clicommon
+	// helper, which degrades a merely-discovered broken config to defaults.
+	//
+	// This function deletes a database file. The config is what names which one,
+	// so falling back to defaults here does not mean "run with default settings",
+	// it means "delete ~/.vigolium/database-vgnm.sqlite instead of the file you
+	// configured". There is no reading of a broken config that justifies guessing
+	// at that.
 	settings, err := config.LoadSettings(globalConfig)
 	if err != nil {
-		zap.L().Warn("Failed to load settings, using defaults", zap.Error(err))
-		settings = config.DefaultSettings()
+		return fmt.Errorf("cannot determine which database to reset: %w", err)
 	}
 
 	if !settings.Database.Enabled && settings.Database.Driver == "" {

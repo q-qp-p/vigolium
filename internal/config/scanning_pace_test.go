@@ -2,8 +2,11 @@ package config
 
 import (
 	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/vigolium/vigolium/pkg/types"
 )
 
 func TestResolvePhase_ConcurrencyFactor(t *testing.T) {
@@ -292,5 +295,128 @@ func TestPhaseSectionNamesMatchSection(t *testing.T) {
 		if !slices.Contains(PhaseSectionNames(), name) {
 			t.Errorf("PhaseSectionNames omits %q", name)
 		}
+	}
+}
+
+// TestValidate_NegativeDurations is the F21 regression: "-5m" parses fine as a
+// time.Duration, so every negative budget passed validation and then reached
+// context.WithTimeout as an already-expired deadline — the phase did nothing and
+// said nothing.
+func TestValidate_NegativeDurations(t *testing.T) {
+	t.Run("common max_duration", func(t *testing.T) {
+		c := DefaultScanningPaceConfig()
+		c.MaxDuration = "-5m"
+		if err := c.Validate(); err == nil {
+			t.Fatal("expected a negative scanning_pace.max_duration to be rejected")
+		}
+	})
+
+	for _, field := range []string{"max_duration", "feedback_drain_timeout", "active_module_timeout"} {
+		t.Run("dynamic-assessment "+field, func(t *testing.T) {
+			c := DefaultScanningPaceConfig()
+			pp := c.Section("dynamic-assessment")
+			switch field {
+			case "max_duration":
+				pp.MaxDuration = "-1s"
+			case "feedback_drain_timeout":
+				pp.FeedbackDrainTimeout = "-1s"
+			case "active_module_timeout":
+				pp.ActiveModuleTimeout = "-1s"
+			}
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("expected a negative %s to be rejected", field)
+			}
+			if !strings.Contains(err.Error(), field) {
+				t.Errorf("error must name the offending field, got %q", err)
+			}
+		})
+	}
+
+	// Zero stays legal: it means "default" for the phases that take one.
+	c := DefaultScanningPaceConfig()
+	c.MaxDuration = "0s"
+	if err := c.Validate(); err != nil {
+		t.Errorf("zero duration must remain valid, got %v", err)
+	}
+}
+
+// TestPhasePaceSupportCoversEverySection is the drift guard for the support
+// table: a phase that has a pace section but no entry here reports "enforces
+// nothing", which silences every warning for it and strips it from the pace
+// table. Silently. So the table must name every section, honestly or not at all.
+func TestPhasePaceSupportCoversEverySection(t *testing.T) {
+	for _, name := range PhaseSectionNames() {
+		if _, ok := phasePaceSupport[name]; !ok {
+			t.Errorf("phase %q has a pace section but no phasePaceSupport entry", name)
+		}
+	}
+	cfg := &ScanningPaceConfig{}
+	for name := range phasePaceSupport {
+		if cfg.Section(name) == nil {
+			t.Errorf("phasePaceSupport names %q, which has no pace section", name)
+		}
+	}
+}
+
+func TestPhasePaceSupports(t *testing.T) {
+	tests := []struct {
+		phase, field string
+		want         bool
+	}{
+		{"discovery", PaceFieldConcurrency, true},
+		{"discovery", PaceFieldRateLimit, true},
+		{"discovery", PaceFieldMaxPerHost, false},
+		{"spidering", PaceFieldConcurrency, false},
+		{"spidering", PaceFieldRateLimit, false},
+		{"spidering", PaceFieldMaxPerHost, false},
+		{"probe", PaceFieldConcurrency, true},
+		{"probe", PaceFieldRateLimit, true},
+		{"probe", PaceFieldMaxPerHost, true},
+		{"dynamic-assessment", PaceFieldConcurrency, true},
+		{"dynamic-assessment", PaceFieldRateLimit, false},
+		{"known-issue-scan", PaceFieldRateLimit, true},
+		{"known-issue-scan", PaceFieldMaxPerHost, false},
+		{"external-harvest", PaceFieldConcurrency, true},
+		// Unknown phase and unknown field both fail closed.
+		{"not-a-phase", PaceFieldRateLimit, false},
+		{"probe", "not_a_field", false},
+	}
+	for _, tt := range tests {
+		if got := PhasePaceSupports(tt.phase, tt.field); got != tt.want {
+			t.Errorf("PhasePaceSupports(%q, %q) = %v, want %v", tt.phase, tt.field, got, tt.want)
+		}
+	}
+}
+
+// TestDiscoveryRateLimit pins the explicit-only contract: discovery must not pick
+// up the global 100 rps default, because adopting it would change the speed of
+// every scan that merely loaded a config file.
+func TestDiscoveryRateLimit(t *testing.T) {
+	defaults := DefaultScanningPaceConfig()
+	if got := defaults.DiscoveryRateLimit(nil); got != 0 {
+		t.Errorf("default config with no options: got %d, want 0 (unpaced)", got)
+	}
+	if got := defaults.DiscoveryRateLimit(&types.Options{RateLimit: 100}); got != 0 {
+		t.Errorf("non-explicit global rate: got %d, want 0", got)
+	}
+
+	withSection := DefaultScanningPaceConfig()
+	withSection.Discovery.RateLimit = 7
+	if got := withSection.DiscoveryRateLimit(&types.Options{RateLimit: 50, RateLimitExplicitlySet: true}); got != 7 {
+		t.Errorf("section rate must win over the global flag: got %d, want 7", got)
+	}
+
+	if got := defaults.DiscoveryRateLimit(&types.Options{RateLimit: 5, RateLimitExplicitlySet: true}); got != 5 {
+		t.Errorf("explicit global rate: got %d, want 5", got)
+	}
+	// A typed `--rate-limit 0` means unlimited, and must not be read as a cap.
+	if got := defaults.DiscoveryRateLimit(&types.Options{RateLimit: 0, RateLimitExplicitlySet: true}); got != 0 {
+		t.Errorf("explicit zero means unlimited: got %d, want 0", got)
+	}
+
+	var nilPace *ScanningPaceConfig
+	if got := nilPace.DiscoveryRateLimit(&types.Options{RateLimit: 9, RateLimitExplicitlySet: true}); got != 9 {
+		t.Errorf("nil pace config: got %d, want 9", got)
 	}
 }

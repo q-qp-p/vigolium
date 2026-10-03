@@ -50,7 +50,7 @@ type FileSource struct {
 // FileSourceConfig configures FileSource behavior.
 type FileSourceConfig struct {
 	FilePath      string
-	Format        string // "urls", "nuclei-output", "spitolas", "openapi", etc.
+	Format        string // canonical name or alias from formatRegistry ("urls", "nuclei", "openapi", …)
 	BufferSize    int    // Channel buffer size (default: 100)
 	EnableModules []string
 	FormatOptions formats.InputFormatOptions
@@ -72,6 +72,17 @@ func NewFileSource(cfg FileSourceConfig) (*FileSource, error) {
 	if _, isURLList := format.(*urls.URLListFormat); isURLList && burpscope.SniffFile(cfg.FilePath) {
 		zap.L().Info("detected burp scope file, expanding include rules to targets", zap.String("file", cfg.FilePath))
 		format = burpscope.New()
+	}
+
+	// A HAR arrives through the same slot too, and reading an archive line by
+	// line hands the scanner its JSON punctuation as targets — `ingest -i
+	// traffic.har` without -I har reported "91 records ingested" for a 30-entry
+	// capture, none of which was a request anyone made. Same rule as the two
+	// sniffs around it: content, not extension (a .har may be named anything),
+	// and only the URL-list default is ever displaced.
+	if _, isURLList := format.(*urls.URLListFormat); isURLList && har.SniffFile(cfg.FilePath) {
+		zap.L().Info("detected HAR archive, parsing captured entries", zap.String("file", cfg.FilePath))
+		format = har.New()
 	}
 
 	// A WSDL/SOAP service description arrives through the same slot as a plain
@@ -131,6 +142,36 @@ var formatRegistry = []formatEntry{
 	{"burpscope", []string{"burp-scope", "burp-config", "burp-project-config"}, func() formats.Format { return burpscope.New() }, true},
 	{"har", []string{"http-archive"}, func() formats.Format { return har.New() }, false},
 	{"deparos", []string{"deparos-output"}, func() formats.Format { return deparos.New() }, false},
+}
+
+// FormatInfo is the public view of one formatRegistry row: everything a caller
+// outside this package needs to describe an input format, and nothing that
+// would let it construct a parser of its own.
+//
+// It exists so the CLI's -I help text and `--list-input-mode` table are derived
+// from the registry rather than re-typed beside it. The hand-maintained copy
+// they used to carry had already drifted: it advertised "nuclei-output" as the
+// canonical name with "nuclei" as the alias, which is the reverse of what
+// resolveFormat accepts, and it was missing burpscope's burp-project-config
+// alias entirely.
+type FormatInfo struct {
+	Name       string   // canonical -I value
+	Aliases    []string // accepted alternatives, in registry order
+	TargetList bool     // the file is a list of target URLs (see IsTargetListFormat)
+}
+
+// Formats returns every supported input format in display order. The aliases
+// slice is copied, so a caller cannot mutate the registry through it.
+func Formats() []FormatInfo {
+	out := make([]FormatInfo, 0, len(formatRegistry))
+	for _, e := range formatRegistry {
+		out = append(out, FormatInfo{
+			Name:       e.canonical,
+			Aliases:    append([]string(nil), e.aliases...),
+			TargetList: e.targetList,
+		})
+	}
+	return out
 }
 
 // IsTargetListFormat reports whether the given -I/--input-mode name or alias

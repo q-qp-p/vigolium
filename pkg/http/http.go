@@ -441,6 +441,53 @@ func (r *Requester) abandoned() bool {
 	return r.abandonFlag != nil && r.abandonFlag.Load()
 }
 
+// targetTLSConfig is the TLS stance for traffic aimed at a scan target —
+// hardcoded for pentesting (insecure, max compat), with sni as ServerName when
+// the operator pinned one.
+//
+// This permissiveness is SCOPED TO SCANNER/TARGET TRAFFIC: scan targets
+// routinely present self-signed, expired, or wrong-host certs, and a scanner
+// that refused them would be useless. It deliberately does NOT apply to
+// vigolium's own infrastructure calls — OSINT harvesting (pkg/harvester),
+// cloud storage, AI providers, tool downloads, webhooks — which verify certs
+// using Go's secure defaults. Keep that split: don't copy InsecureSkipVerify
+// into non-target/infra HTTP clients.
+//
+// Every client that talks to a target builds its config here, so the stance is
+// stated once rather than mirrored by comment: the scan transport and the
+// auxiliary login transport (LoginTransport) are the two callers today.
+func targetTLSConfig(sni string) *tls.Config {
+	cfg := &tls.Config{
+		InsecureSkipVerify: true,
+		Renegotiation:      tls.RenegotiateOnceAsClient,
+		MinVersion:         tls.VersionTLS10,
+	}
+	if sni != "" {
+		cfg.ServerName = sni
+	}
+	return cfg
+}
+
+// applyExplicitProxy installs the resolved proxy on t as an explicit URL rather
+// than ProxyFromEnvironment, because Go's environment resolver bypasses the
+// proxy for localhost and a localhost target still has to be observable in the
+// operator's proxy log. An unparseable URL is warned about and left unset, so a
+// typo degrades to a direct connection rather than failing the client's
+// construction. client names the caller in that warning.
+func applyExplicitProxy(t *http.Transport, cliProxy, client string) {
+	proxyURL := getProxyURL(cliProxy)
+	if proxyURL == "" {
+		return
+	}
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		zap.L().Warn("Invalid proxy URL",
+			zap.String("url", proxyURL), zap.String("client", client), zap.Error(err))
+		return
+	}
+	t.Proxy = http.ProxyURL(parsed)
+}
+
 // getProxyURL returns proxy URL from CLI flag or environment variable.
 // CLI flag takes precedence over environment variables.
 // Uses explicit proxy URL (not ProxyFromEnvironment) to ensure localhost is proxied.
@@ -492,23 +539,7 @@ func NewRequester(options *types.Options, services *services.Services) (*Request
 
 	timeout := effectiveRequestTimeout(options.Timeout)
 
-	// TLS config - hardcoded for pentesting (insecure, max compat).
-	//
-	// This permissiveness is SCOPED TO SCANNER/TARGET TRAFFIC: scan targets
-	// routinely present self-signed, expired, or wrong-host certs, and a scanner
-	// that refused them would be useless. It deliberately does NOT apply to
-	// vigolium's own infrastructure calls — OSINT harvesting (pkg/harvester),
-	// cloud storage, AI providers, tool downloads, webhooks — which verify certs
-	// using Go's secure defaults. Keep that split: don't copy InsecureSkipVerify
-	// into non-target/infra HTTP clients.
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-		Renegotiation:      tls.RenegotiateOnceAsClient,
-		MinVersion:         tls.VersionTLS10,
-	}
-	if options.SNI != "" {
-		tlsConfig.ServerName = options.SNI
-	}
+	tlsConfig := targetTLSConfig(options.SNI)
 
 	// Size the idle-connection pool to the per-host concurrency cap. A scanner
 	// fans out many requests at the same host, so the transport must keep at
@@ -604,15 +635,7 @@ func NewRequester(options *types.Options, services *services.Services) (*Request
 			MaxResponseHeaderBytes: 48 * 1024,
 			ReadBufferSize:         16 * 1024,
 		}
-		// Use explicit proxy URL (CLI flag or env var) to ensure localhost is proxied.
-		// Go's ProxyFromEnvironment bypasses proxy for localhost requests.
-		if proxyURL := getProxyURL(options.ProxyURL); proxyURL != "" {
-			if parsed, err := url.Parse(proxyURL); err == nil {
-				t.Proxy = http.ProxyURL(parsed)
-			} else {
-				zap.L().Warn("Invalid proxy URL", zap.String("url", proxyURL), zap.Error(err))
-			}
-		}
+		applyExplicitProxy(t, options.ProxyURL, "scanner")
 		return t
 	}
 
@@ -751,8 +774,13 @@ func (r *Requester) applyCarriedSession(req *retryablehttp.Request) {
 	if sess.UserAgent != "" {
 		req.Header.Set("User-Agent", sess.UserAgent)
 	}
-	if sess.CookieHeader != "" {
-		req.Header.Set("Cookie", httpmsg.MergeCookieHeaders(req.Header.Get("Cookie"), sess.CookieHeader))
+	// Evaluated per request, not attached wholesale: the harvested jar carries
+	// Domain/Path/Secure/Expires, so a cookie scoped to /admin, to the exact host,
+	// or to https is only sent where a browser would send it. A session harvested
+	// without those attributes falls back to its flat header (see CookieHeaderFor),
+	// so nothing regresses for an older harvest.
+	if carriedCookies := sess.CookieHeaderFor(req.URL.URL, time.Now()); carriedCookies != "" {
+		req.Header.Set("Cookie", httpmsg.MergeCookieHeaders(req.Header.Get("Cookie"), carriedCookies))
 	}
 	// Fill a harvested token-session credential only when the request carries no
 	// Authorization of its own — so a replayed authenticated request keeps its own
@@ -821,6 +849,70 @@ func (r *Requester) CloneWithoutCredentials() (*Requester, error) {
 // credential-stripped view. The primary requester's scope stays "", so the
 // common path adds nothing to the cache key.
 const anonymousClusterScope = "anon"
+
+// primarySessionClusterScope labels the response-cache partition used by the
+// authenticated view WithAdditionalHeaders returns. Like anonymousClusterScope
+// it is a CONSTANT rather than a per-view id: every view built from the same
+// session headers has the same credential surface and must keep coalescing with
+// its siblings, while staying split from the unauthenticated parent.
+const primarySessionClusterScope = "primary-session"
+
+// WithAdditionalHeaders returns a view of r that adds headers to every request.
+// It shares r's transport (connection pool), rate limiter, request counter,
+// response observer, block notifier, edge pacer and carried sessions, and gets
+// its own cookie jar and response-cache partition so authenticated responses
+// never coalesce with the anonymous parent's.
+//
+// It exists for `session.use_in_discovery: false`, which keeps the primary
+// session's credentials off the discovery/spidering requester but is documented
+// to authenticate the assessment. Adding the headers to the shared requester
+// would leak them back into discovery; building a second requester from scratch
+// would fragment the connection pool and hide the authenticated traffic from the
+// scan-wide 5xx corroboration and edge pacing (see CloneWithoutCredentials).
+//
+// Carried browser sessions are shared through the same pointer the parent holds,
+// so a session installed on the parent AFTER this view is created (spidering
+// installs them at the end of its phase, before assessment runs) still applies
+// here.
+//
+// headers are "Name: Value" strings, as on the command line. An added header
+// replaces a parent header of the same name case-insensitively, so the session's
+// Authorization wins over a stale one inherited from the parent rather than the
+// two racing on map iteration order. An empty list returns r unchanged.
+func (r *Requester) WithAdditionalHeaders(headers []string) (*Requester, error) {
+	if r == nil {
+		return nil, errors.New("cannot derive a view of a nil requester")
+	}
+	added := parseHeaders(headers)
+	if len(added) == 0 {
+		return r, nil
+	}
+	view, err := r.cloneSharingTransport()
+	if err != nil {
+		return nil, err
+	}
+
+	addedNames := make(map[string]struct{}, len(added))
+	for name := range added {
+		addedNames[strings.ToLower(name)] = struct{}{}
+	}
+	merged := make(map[string]string, len(r.customHeaders)+len(added))
+	for name, value := range r.customHeaders {
+		// An added header outranks the parent's, so drop the parent entry the
+		// added one supersedes instead of leaving both in the map: doRequest
+		// Sets every entry and the canonical key would collide.
+		if _, overridden := addedNames[strings.ToLower(name)]; overridden {
+			continue
+		}
+		merged[name] = value
+	}
+	for name, value := range added {
+		merged[name] = value
+	}
+	view.customHeaders = merged
+	view.clusterScope = primarySessionClusterScope
+	return view, nil
+}
 
 // CloneForScan returns a per-scan requester that SHARES the expensive
 // transport (connection pool), dialer, and host rate limiter with r, but gives

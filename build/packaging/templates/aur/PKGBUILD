@@ -1,0 +1,29 @@
+# Maintainer: Vigolium maintainers <contact@vigolium.com>
+pkgname=vigolium-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Web vulnerability scanner and traffic analysis CLI'
+arch=('x86_64' 'aarch64')
+url='https://vigolium.com'
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'ca-certificates')
+optdepends=('chromium: browser crawling' 'git: template updates and repository operations')
+provides=('vigolium')
+conflicts=('vigolium')
+# Do not strip or otherwise rewrite the upstream executable and its embedded data.
+options=('!strip')
+source=('LICENSE' 'THIRD_PARTY_NOTICES.md')
+sha256sums=('@LICENSE_SHA256@' '@NOTICES_SHA256@')
+source_x86_64=('vigolium_@VERSION@_linux_amd64.tar.gz::@LINUX_AMD64_URL@')
+sha256sums_x86_64=('@LINUX_AMD64_SHA256@')
+source_aarch64=('vigolium_@VERSION@_linux_arm64.tar.gz::@LINUX_ARM64_URL@')
+sha256sums_aarch64=('@LINUX_ARM64_SHA256@')
+
+package() {
+  install -Dm755 "$srcdir/vigolium" "$pkgdir/usr/lib/vigolium/vigolium"
+  printf 'aur\n' > "$pkgdir/usr/lib/vigolium/.vigolium-package-manager"
+  install -dm755 "$pkgdir/usr/bin"
+  ln -s /usr/lib/vigolium/vigolium "$pkgdir/usr/bin/vigolium"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$srcdir/THIRD_PARTY_NOTICES.md" "$pkgdir/usr/share/doc/vigolium/THIRD_PARTY_NOTICES.md"
+}

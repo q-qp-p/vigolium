@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/jsext"
 	"github.com/vigolium/vigolium/pkg/terminal"
 	"github.com/vigolium/vigolium/pkg/yamlext"
@@ -228,7 +229,7 @@ func yamlMatchesFilter(def *yamlext.ExtensionDef, filter string) bool {
 }
 
 func printExtensionsTable(opts *extensionOptions, filter string) {
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
 		fmt.Printf("%s Failed to load settings: %v\n", terminal.ErrorSymbol(), err)
 		return
@@ -746,7 +747,7 @@ func printModuleTemplates() {
 // ──────────────────────────────────────────────────────────────
 
 func installPresets(filter string) {
-	settings, err := config.LoadSettings(globalConfig)
+	settings, err := clicommon.LoadSettings(globalConfig)
 	if err != nil {
 		fmt.Printf("%s Failed to load settings: %v\n", terminal.ErrorSymbol(), err)
 		return

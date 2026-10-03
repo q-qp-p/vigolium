@@ -496,6 +496,58 @@ func (r *Repository) SaveRecordsBatch(ctx context.Context, records []*HTTPRecord
 	return uuids, nil
 }
 
+// SaveRecordsBatchSkipExisting inserts multiple HTTP records in one transaction,
+// skipping any whose uuid is already stored, and returns the uuids it actually
+// inserted. len(records)-len(inserted) is the number skipped as duplicates.
+//
+// SaveRecordsBatch aborts the whole batch on a duplicate uuid, which is right for
+// a scanner writing records it has just generated and wrong for an import: a
+// JSONL export re-imported, or two overlapping exports imported together, share
+// record uuids by design. That used to fail the run with a UNIQUE constraint
+// error after an arbitrary number of earlier batches had already committed —
+// neither idempotent nor atomic. Here the overlap is simply not inserted.
+//
+// Only the inserted uuids fire emitRecordSaved: a row that was already there is
+// not a new record, and a mirror that saw it would duplicate on every re-import.
+func (r *Repository) SaveRecordsBatchSkipExisting(ctx context.Context, records []*HTTPRecord) ([]string, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	for _, rec := range records {
+		rec.ProjectUUID = defaultProjectUUID(rec.ProjectUUID)
+	}
+
+	var inserted []string
+	err := r.db.RunInTx(ctx, &sql.TxOptions{}, func(ctx context.Context, tx bun.Tx) error {
+		// RETURNING is the only way to learn WHICH rows survived the conflict
+		// clause — RowsAffected gives a count with no identity, and a pre-SELECT of
+		// existing uuids is a second round trip that another writer can invalidate
+		// between the two statements. Supported by the bundled modernc SQLite
+		// (3.35+) and by Postgres.
+		return tx.NewInsert().Model(&records).
+			On("CONFLICT (uuid) DO NOTHING").
+			Returning("uuid").
+			Scan(ctx, &inserted)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to batch insert %d records: %w", len(records), err)
+	}
+
+	if len(inserted) > 0 {
+		byUUID := make(map[string]*HTTPRecord, len(records))
+		for _, rec := range records {
+			byUUID[rec.UUID] = rec
+		}
+		for _, u := range inserted {
+			if rec := byUUID[u]; rec != nil {
+				r.emitRecordSaved(rec)
+			}
+		}
+	}
+	return inserted, nil
+}
+
 // GetRecordByUUID retrieves a single HTTP record by UUID
 func (r *Repository) GetRecordByUUID(ctx context.Context, uuid string) (*HTTPRecord, error) {
 	record := &HTTPRecord{}

@@ -1,11 +1,17 @@
 package form
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
+
+	"github.com/vigolium/vigolium/internal/atomicfile"
+	"github.com/vigolium/vigolium/internal/redact"
 )
 
 // TrainingMode defines how form inputs are filled during crawling.
@@ -47,6 +53,13 @@ type TrainedInput struct {
 
 	// FormAction is the action URL of the containing form
 	FormAction string `json:"form_action,omitempty"`
+
+	// Origin is the page origin (scheme://host[:port]) the input was recorded
+	// on, and FormKey the owning form (DetectedInput.FormKey). MatchInput never
+	// carries a value across origins, and fills by type alone only within the
+	// same origin and form.
+	Origin  string `json:"origin,omitempty"`
+	FormKey string `json:"form_key,omitempty"`
 
 	// Value is the value to fill
 	Value string `json:"value"`
@@ -218,23 +231,34 @@ func (t *FormTrainer) GetInputByType(inputType string) []*TrainedInput {
 	return t.inputsByType[inputType]
 }
 
-// MatchInput finds the best matching trained input for the given input.
-// Uses priority-based matching: XPath > ID > Name > Type
-func (t *FormTrainer) MatchInput(xpath, id, name, inputType string) *TrainedInput {
+// MatchInput finds the best matching trained input for the given input,
+// recorded on the same origin — a value trained on one origin is never typed
+// into another's form. Priority: XPath > ID > Name > Type. The type-only
+// fallback additionally requires the same form (a non-empty formKey) and is
+// refused for password/hidden fields and credential-named ones, so a secret is
+// never filled into a field just because the type matches.
+func (t *FormTrainer) MatchInput(xpath, id, name, inputType, origin, formKey string) *TrainedInput {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	// Priority 1: Exact XPath match
+	sameOrigin := func(in *TrainedInput) bool { return in.Origin == origin }
+
+	// Priority 1: Exact XPath match (the latest recorded on this origin)
 	if xpath != "" {
-		if input := t.inputsByXPath[xpath]; input != nil {
+		if input := t.inputsByXPath[xpath]; input != nil && sameOrigin(input) {
 			return input
+		}
+		for _, input := range slices.Backward(t.allInputsLocked()) {
+			if input.XPath == xpath && sameOrigin(input) {
+				return input
+			}
 		}
 	}
 
 	// Priority 2: Match by ID
 	if id != "" {
 		for _, input := range t.Data.GlobalInputs {
-			if input.ID == id {
+			if input.ID == id && sameOrigin(input) {
 				return input
 			}
 		}
@@ -242,26 +266,56 @@ func (t *FormTrainer) MatchInput(xpath, id, name, inputType string) *TrainedInpu
 
 	// Priority 3: Match by name (prefer same type)
 	if name != "" {
-		inputs := t.inputsByName[name]
-		for _, input := range inputs {
+		var first *TrainedInput
+		for _, input := range t.inputsByName[name] {
+			if !sameOrigin(input) {
+				continue
+			}
 			if input.Type == inputType {
 				return input
 			}
+			if first == nil {
+				first = input
+			}
 		}
-		if len(inputs) > 0 {
-			return inputs[0]
+		if first != nil {
+			return first
 		}
 	}
 
-	// Priority 4: Match by type (last resort)
-	if inputType != "" {
-		inputs := t.inputsByType[inputType]
-		if len(inputs) > 0 {
-			return inputs[0]
+	// Priority 4: Match by type (last resort) — same origin and same form only,
+	// and never for a credential-bearing field.
+	if inputType != "" && formKey != "" && !typeFallbackRefused(inputType, name, id) {
+		for _, input := range t.inputsByType[inputType] {
+			if sameOrigin(input) && input.FormKey == formKey && !typeFallbackRefused(input.Type, input.Name, input.ID) {
+				return input
+			}
 		}
 	}
 
 	return nil
+}
+
+// typeFallbackRefused reports a field whose value must never be chosen by type
+// alone: a password or hidden field (where pages keep anti-CSRF tokens), or one
+// whose name reads as credential-bearing.
+func typeFallbackRefused(inputType, name, id string) bool {
+	switch strings.ToLower(inputType) {
+	case "password", "hidden":
+		return true
+	}
+	return redact.IsSensitiveName(name) || redact.IsSensitiveName(id)
+}
+
+// allInputsLocked returns every recorded input — global and per-form — in
+// record order within each list. The caller holds t.mu.
+func (t *FormTrainer) allInputsLocked() []*TrainedInput {
+	out := make([]*TrainedInput, 0, len(t.Data.GlobalInputs))
+	out = append(out, t.Data.GlobalInputs...)
+	for _, form := range t.Data.Forms {
+		out = append(out, form.Inputs...)
+	}
+	return out
 }
 
 // GetFormByAction finds a trained form by action URL.
@@ -299,8 +353,9 @@ func (t *FormTrainer) Save() error {
 		return fmt.Errorf("output directory not set")
 	}
 
-	// Ensure directory exists
-	if err := os.MkdirAll(t.OutputDir, 0755); err != nil {
+	// Ensure directory exists. Owner-only: the file holds the values typed into
+	// forms, credentials included.
+	if err := os.MkdirAll(t.OutputDir, 0o700); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
@@ -310,9 +365,13 @@ func (t *FormTrainer) Save() error {
 		return fmt.Errorf("failed to marshal training data: %w", err)
 	}
 
-	// Write file
+	// Write the file atomically at 0600 (atomicfile.Write keeps the temp file's
+	// owner-only mode), so an interrupted save never truncates earlier data.
 	filePath := filepath.Join(t.OutputDir, "form_training.json")
-	if err := os.WriteFile(filePath, data, 0644); err != nil {
+	if err := atomicfile.Write(filePath, func(w *bufio.Writer) error {
+		_, werr := w.Write(data)
+		return werr
+	}); err != nil {
 		return fmt.Errorf("failed to write training data: %w", err)
 	}
 

@@ -3,6 +3,7 @@ package tool
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -134,6 +135,8 @@ func (b *browserProbeTool) Execute(ctx context.Context, args map[string]any, _ U
 		cfg.CaptureSink = b.captureSink
 		cfg.CaptureProjectUUID = b.captureProject
 		cfg.CaptureSource = spitolas.CaptureSourceBrowserProbe
+		// Requested to expand the input surface, which needs the responses.
+		cfg.CaptureBodies = true
 	}
 
 	res, err := b.probe(ctx, cfg)
@@ -144,15 +147,19 @@ func (b *browserProbeTool) Execute(ctx context.Context, args map[string]any, _ U
 		return Result{Content: "probe returned no result", IsError: true}, nil
 	}
 
-	return Result{
-		Content: renderProbeResult(url, res, err),
-		Details: map[string]any{
-			"dialog_fired": len(res.Dialogs) > 0,
-			"dialogs":      dialogsToDetails(res.Dialogs),
-			"final_url":    res.FinalURL,
-			"title":        res.Title,
-		},
-	}, nil
+	details := map[string]any{
+		"dialog_fired": len(res.Dialogs) > 0,
+		"dialogs":      dialogsToDetails(res.Dialogs),
+		"final_url":    res.FinalURL,
+		"title":        res.Title,
+	}
+	maps.Copy(details, readinessDetails(res))
+	content := renderProbeResult(url, res, err)
+	if cfg.CaptureSink != nil {
+		maps.Copy(details, captureDetails(res.Capture))
+		content += "\nCapture: " + captureSummary(res.Capture, spitolas.CaptureSourceBrowserProbe) + "\n"
+	}
+	return Result{Content: content, Details: details}, nil
 }
 
 func renderProbeResult(reqURL string, res *spitolas.ProbeResult, navErr error) string {
@@ -167,13 +174,20 @@ func renderProbeResult(reqURL string, res *spitolas.ProbeResult, navErr error) s
 	if navErr != nil {
 		fmt.Fprintf(&out, "Nav note:   %v\n", navErr)
 	}
+	if res.ReadinessFailed {
+		fmt.Fprintf(&out, "Readiness:  %s — %s (dialogs were sampled anyway)\n", res.Readiness, res.ReadinessDetail)
+	}
 	if len(res.Dialogs) == 0 {
 		out.WriteString("\nNo JavaScript dialogs fired during navigation.\n")
 		return out.String()
 	}
 	fmt.Fprintf(&out, "\nDialogs (%d):\n", len(res.Dialogs))
 	for i, d := range res.Dialogs {
-		fmt.Fprintf(&out, "  %d. %s: %q (frame: %s)\n", i+1, d.Type, d.Message, d.URL)
+		answered := ""
+		if d.Answered != "" {
+			answered = ", " + d.Answered
+		}
+		fmt.Fprintf(&out, "  %d. %s: %q (frame: %s%s)\n", i+1, d.Type, d.Message, d.URL, answered)
 	}
 	return out.String()
 }
@@ -182,10 +196,11 @@ func dialogsToDetails(in []spitolas.DialogEvent) []map[string]any {
 	out := make([]map[string]any, 0, len(in))
 	for _, d := range in {
 		out = append(out, map[string]any{
-			"type":    d.Type,
-			"message": d.Message,
-			"url":     d.URL,
-			"at":      d.At,
+			"type":     d.Type,
+			"message":  d.Message,
+			"url":      d.URL,
+			"at":       d.At,
+			"answered": d.Answered,
 		})
 	}
 	return out

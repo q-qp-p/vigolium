@@ -398,7 +398,9 @@ func (r *Runner) shouldAutoFuzzDiscovery() bool {
 	if !r.spidering.ran {
 		return false
 	}
-	return r.spidering.sawSSO || r.spidering.records < lowYieldSpideringRecords
+	// Records the capture lost still count as found: a crawl that reached plenty
+	// and failed to persist it is not a low-yield target.
+	return r.spidering.sawSSO || r.spidering.records+r.spidering.lost < lowYieldSpideringRecords
 }
 
 // filterOutHosts drops target URLs whose host matches any host in block
@@ -472,17 +474,43 @@ func boolPtrOr(p *bool, def bool) bool {
 	return *p
 }
 
+// discoveryRateLimit is the requests-per-second ceiling the discovery engine will
+// enforce (0 = unpaced), resolved by config so the banner, the scan.started pace
+// table and the engine all read one answer. See ScanningPaceConfig.DiscoveryRateLimit.
+func (r *Runner) discoveryRateLimit() int {
+	var pace *config.ScanningPaceConfig
+	if r.settings != nil {
+		pace = &r.settings.ScanningPace
+	}
+	return pace.DiscoveryRateLimit(r.options)
+}
+
+// phaseConcurrency is the worker count a phase will run with:
+// scanning_pace.<phase>.concurrency when set and the CLI did not type a global
+// one, otherwise the global value.
+//
+// One function for every phase because the rule is one rule, and the phases
+// that resolved it inline each printed the global value on their own "Speed:"
+// line while running on the section's.
+func (r *Runner) phaseConcurrency(phase string) int {
+	concurrency := r.options.Concurrency
+	if r.settings != nil && !r.options.ConcurrencyExplicitlySet {
+		if pace := r.settings.ScanningPace.ResolvePhase(phase); pace.Concurrency > 0 {
+			concurrency = pace.Concurrency
+		}
+	}
+	return concurrency
+}
+
+// discoveryConcurrency is the engine thread count the Discovery phase will run
+// with. Shared by buildDeparosConfig and the phase's own "Speed:" line.
+func (r *Runner) discoveryConcurrency() int { return r.phaseConcurrency("discovery") }
+
 // buildDeparosConfig maps YAML DiscoveryConfig + CLI flags into a DeparosDiscoveryConfig.
 // additionalTargets are merged (deduplicated) with CLI targets to expand the discovery scope.
 func (r *Runner) buildDeparosConfig(additionalTargets []string) source.DeparosDiscoveryConfig {
 	// Resolve discovery concurrency: scanning_pace.discovery overrides global when CLI not explicit
-	discoveryConcurrency := r.options.Concurrency
-	if r.settings != nil && !r.options.ConcurrencyExplicitlySet {
-		discPace := r.settings.ScanningPace.ResolvePhase("discovery")
-		if discPace.Concurrency > 0 {
-			discoveryConcurrency = discPace.Concurrency
-		}
-	}
+	discoveryConcurrency := r.discoveryConcurrency()
 
 	// Merge CLI targets with additional targets (deduplicated)
 	targets := dedupTargets(r.options.Targets, additionalTargets)
@@ -490,6 +518,7 @@ func (r *Runner) buildDeparosConfig(additionalTargets []string) source.DeparosDi
 	cfg := source.DeparosDiscoveryConfig{
 		Targets:       targets,
 		Concurrency:   discoveryConcurrency,
+		RateLimit:     r.discoveryRateLimit(),
 		MaxDuration:   r.options.DiscoverMaxDuration,
 		EnableModules: r.options.Modules,
 		// Browser-harvested sessions from the spidering phase, so content

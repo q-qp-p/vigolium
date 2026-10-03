@@ -173,6 +173,15 @@ const serviceWorkerPrimeScript = `(async () => {
   return ok;
 })()`
 
+// serviceWorkerPrimingAllowed reports whether the service-worker primer may
+// run. It fetches inside its own script (it discovers the asset list in-page),
+// so it cannot go through fetchURLsInPage's scope check; under a custom
+// operator scope it is off rather than trusted to stay inside a path boundary
+// it never sees. The runner's policy report says so.
+func serviceWorkerPrimingAllowed(customScope bool) bool {
+	return !customScope
+}
+
 // primeServiceWorkerAssets runs the service-worker asset priming script on the
 // page, fetching the assets a PWA service worker / framework build would load so
 // the network capture records them. It is best-effort: any failure (eval error,
@@ -180,6 +189,10 @@ const serviceWorkerPrimeScript = `(async () => {
 // the assets that did load are still captured.
 func (c *Crawler) primeServiceWorkerAssets(ctx context.Context, page *browser.Page) {
 	if page == nil || c.config == nil || !c.config.ServiceWorkerPriming {
+		return
+	}
+	if !serviceWorkerPrimingAllowed(c.config.CrawlScope != nil) {
+		zap.L().Debug("Service-worker priming skipped: a custom crawl scope is configured")
 		return
 	}
 

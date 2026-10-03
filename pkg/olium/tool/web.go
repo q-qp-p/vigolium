@@ -5,8 +5,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	urlpkg "net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,12 +43,30 @@ type webFetchTool struct {
 	// without a separate ingest step. Nil sink disables capture.
 	captureSink    spitolas.CaptureSink
 	captureProject string
+
+	// probe renders browser mode; nil means spitolas.ProbeURL. Overridable so
+	// tests don't spawn real browsers.
+	probe func(ctx context.Context, cfg spitolas.ProbeConfig) (*spitolas.ProbeResult, error)
+
+	// readOnly restricts the tool to safe methods (GET/HEAD) in http mode and
+	// refuses browser mode, which executes page script with side effects the
+	// tool cannot bound. Only this variant may claim IsReadOnly.
+	readOnly bool
 }
 
 // NewWebFetch returns the no-capture variant. Used by TUI chat, tests, and
-// other callers that don't have a database wired.
+// other callers that don't have a database wired. It still accepts mutating
+// methods and browser mode, so it is not read-only — see NewWebFetchReadOnly.
 func NewWebFetch() Tool {
 	return &webFetchTool{client: &http.Client{Timeout: 30 * time.Second}}
+}
+
+// NewWebFetchReadOnly returns the genuinely read-only variant: GET/HEAD over
+// plain HTTP, no browser mode, no capture. Anything else is refused with an
+// error result naming the restriction. Registered by RegisterReadOnlyBuiltins
+// so strictly read-only contexts cannot issue state-changing requests.
+func NewWebFetchReadOnly() Tool {
+	return &webFetchTool{client: &http.Client{Timeout: 30 * time.Second}, readOnly: true}
 }
 
 // NewWebFetchWithCapture wires a CaptureSink so every successful fetch is
@@ -69,28 +89,39 @@ func (*webFetchTool) Label() string    { return "Fetch URL" }
 func (*webFetchTool) Category() string { return CategoryBuiltin }
 
 // IsReadOnly gates whether the engine may fan this tool out concurrently with
-// other read-only calls. The capture-enabled variant persists an http_record
-// to the project DB on every successful fetch — regardless of HTTP method, and
-// browser mode writes many records per call — so it is NOT parallel-safe:
-// concurrent capturing fetches race on the shared record store. It can also
-// issue arbitrary (state-changing) methods. Only the no-capture variant
-// (TUI/query, no DB wired) is genuinely read-only.
-func (w *webFetchTool) IsReadOnly() bool { return w.captureSink == nil }
-func (*webFetchTool) Description() string {
+// other read-only calls, and the contract is "no observable side effects"
+// (tool.go). The general tool accepts state-changing methods and browser mode
+// (page script runs), and the capture variant also writes http_records, so it
+// is never read-only — whether a database happens to be wired does not change
+// what a request can do to the target. Only NewWebFetchReadOnly qualifies.
+func (w *webFetchTool) IsReadOnly() bool { return w.readOnly }
+func (w *webFetchTool) Description() string {
+	if w.readOnly {
+		return "Fetch a URL with a read-only HTTP request (GET or HEAD only; no browser mode, nothing persisted). Returns the raw response."
+	}
 	return "Fetch a URL. Default mode is plain HTTP (fast, returns raw response, one record persisted). Set mode='browser' to render via headless Chromium (handles JS SPAs, client-side routing) — every XHR/fetch the page issues during render is also captured, so a single browser fetch typically produces many http_records. Use browser mode when the initial HTTP response is empty or missing content that clearly depends on JavaScript. HTTP-mode returns Details.record_uuid; browser-mode persists multiple records — call query_records with the target hostname to enumerate them."
 }
-func (*webFetchTool) Schema() map[string]any {
+func (w *webFetchTool) Schema() map[string]any {
+	modes := []string{"http", "browser"}
+	modeDesc := "'http' = raw HTTP request (fast, one record); 'browser' = render with headless Chromium via CDP (also captures every XHR/fetch issued during render)."
+	method := map[string]any{"type": "string", "default": "GET", "description": "HTTP method (http mode only)."}
+	if w.readOnly {
+		modes = []string{"http"}
+		modeDesc = "'http' only — this variant is read-only."
+		method["enum"] = readOnlyMethods
+		method["description"] = "HTTP method: GET or HEAD only (read-only variant)."
+	}
 	return map[string]any{
 		"type": "object",
 		"properties": map[string]any{
 			"url": map[string]any{"type": "string", "description": "HTTP or HTTPS URL."},
 			"mode": map[string]any{
 				"type":        "string",
-				"enum":        []string{"http", "browser"},
-				"description": "'http' = raw HTTP request (fast, one record); 'browser' = render with headless Chromium via CDP (also captures every XHR/fetch issued during render).",
+				"enum":        modes,
+				"description": modeDesc,
 				"default":     "http",
 			},
-			"method":  map[string]any{"type": "string", "default": "GET", "description": "HTTP method (http mode only)."},
+			"method":  method,
 			"headers": map[string]any{"type": "object", "description": "Extra request headers (http mode only)."},
 			"body":    map[string]any{"type": "string", "description": "Request body (http mode only)."},
 			"max_bytes": map[string]any{
@@ -125,6 +156,11 @@ func (w *webFetchTool) Execute(ctx context.Context, args map[string]any, onUpdat
 	if mode == "" {
 		mode = "http"
 	}
+	if w.readOnly {
+		if msg := readOnlyViolation(mode, args); msg != "" {
+			return Result{Content: msg, IsError: true}, nil
+		}
+	}
 
 	switch mode {
 	case "browser":
@@ -141,6 +177,26 @@ func (w *webFetchTool) Execute(ctx context.Context, args map[string]any, onUpdat
 			IsError: true,
 		}, nil
 	}
+}
+
+// readOnlyMethods are the only methods the read-only variant sends: safe by
+// HTTP semantics, so a fan-out of them cannot change target state.
+var readOnlyMethods = []string{"GET", "HEAD"}
+
+// readOnlyViolation names why a call cannot run on the read-only variant, or
+// returns "" when it can.
+func readOnlyViolation(mode string, args map[string]any) string {
+	if mode == "browser" {
+		return "web_fetch (read-only): mode='browser' is not available here — rendering runs page script, which can change application state. Use a plain GET."
+	}
+	method, _ := args["method"].(string)
+	if method == "" {
+		return ""
+	}
+	if !slices.Contains(readOnlyMethods, strings.ToUpper(method)) {
+		return fmt.Sprintf("web_fetch (read-only): method %q is not allowed — only GET and HEAD can be sent from this context.", method)
+	}
+	return ""
 }
 
 func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[string]any) (Result, error) {
@@ -211,11 +267,38 @@ func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[str
 		"truncated":    truncated,
 	}
 
+	// The client follows redirects, so resp answers the LAST hop's request, not
+	// req. The record pairs the response with the request that produced it.
+	final := req
+	if resp.Request != nil {
+		final = resp.Request
+	}
+	if hops := redirectHops(resp); hops > 0 {
+		details["redirect_chain"] = map[string]any{
+			"hops":         hops,
+			"original_url": req.URL.String(),
+			"final_url":    final.URL.String(),
+		}
+		if requestBodyUnreadable(final) {
+			// The hop re-sent a body this side cannot re-read, so the stored
+			// request would read as bodiless when it was not.
+			details["body_omitted"] = "redirect"
+		}
+	}
+
 	// Persist for downstream tools (query_records, inspect_record,
 	// replay_request). Capture failures are non-fatal — the model still
-	// gets the body even if persistence breaks.
-	if recUUID, perr := w.persistHTTPFetch(ctx, req, resp, raw); perr == nil && recUUID != "" {
-		details["record_uuid"] = recUUID
+	// gets the body even if persistence breaks — but they are reported, so
+	// the model is never told a record exists that does not.
+	if w.captureSink != nil && w.captureProject != "" {
+		recUUID, perr := w.persistHTTPFetch(ctx, final, resp, raw)
+		details["persisted"] = perr == nil && recUUID != ""
+		switch {
+		case perr != nil:
+			details["persist_error"] = perr.Error()
+		case recUUID != "":
+			details["record_uuid"] = recUUID
+		}
 	}
 
 	return Result{
@@ -224,8 +307,25 @@ func (w *webFetchTool) executeHTTP(ctx context.Context, url string, args map[str
 	}, nil
 }
 
+// redirectHops counts the redirects the client followed to produce resp: each
+// hop's request links to the response that redirected it.
+func redirectHops(resp *http.Response) int {
+	n := 0
+	for r := resp.Request; r != nil && r.Response != nil; r = r.Response.Request {
+		n++
+	}
+	return n
+}
+
+// requestBodyUnreadable reports a request that carried a body which cannot be
+// re-read for serialization (no GetBody).
+func requestBodyUnreadable(req *http.Request) bool {
+	return req.GetBody == nil && req.Body != nil && req.Body != http.NoBody
+}
+
 // persistHTTPFetch serialises the just-completed request/response pair into
-// raw HTTP bytes and hands it to the capture sink. Returns the new record's
+// raw HTTP bytes and hands it to the capture sink. req must be the request
+// that produced resp — resp.Request after redirects, not the original. Returns the new record's
 // UUID (or empty when capture is disabled or fails). All errors are
 // surfaced to the caller as a flag, not propagated — fetch already succeeded
 // and the model has the body, so a persistence hiccup shouldn't fail the
@@ -328,6 +428,55 @@ func buildRawResponse(resp *http.Response, body []byte) []byte {
 	return b.Bytes()
 }
 
+// readinessDetails renders a probe's wait_selector outcome as tool-result
+// details; empty when no selector was waited for.
+func readinessDetails(res *spitolas.ProbeResult) map[string]any {
+	if res.Readiness == "" {
+		return nil
+	}
+	d := map[string]any{"readiness": res.Readiness}
+	if res.ReadinessDetail != "" {
+		d["readiness_detail"] = res.ReadinessDetail
+	}
+	return d
+}
+
+// captureDetails renders a capture receipt as tool-result details.
+func captureDetails(rc spitolas.CaptureReceipt) map[string]any {
+	d := map[string]any{
+		"records_persisted": rc.Persisted,
+		"records_failed":    rc.Lost(),
+		"capture_complete":  rc.Enabled && rc.Clean(),
+		"bodies_retained":   rc.BodiesRetained,
+	}
+	if rc.Err != "" {
+		d["capture_error"] = rc.Err
+	}
+	return d
+}
+
+// captureSummary is the one-line capture account appended to a tool's text.
+func captureSummary(rc spitolas.CaptureReceipt, source string) string {
+	if !rc.Enabled {
+		msg := "not running, nothing persisted"
+		if rc.Err != "" {
+			msg += " (" + rc.Err + ")"
+		}
+		return msg
+	}
+	msg := fmt.Sprintf("%d record(s) persisted under source='%s'", rc.Persisted, source)
+	if lost := rc.Lost(); lost > 0 {
+		msg += fmt.Sprintf(", %d lost", lost)
+	}
+	if !rc.Clean() {
+		msg += " — capture incomplete"
+	}
+	if rc.Persisted > 0 {
+		msg += "; use query_records to enumerate"
+	}
+	return msg
+}
+
 // splitHostPort returns hostname + numeric port, defaulting to 80/443 per
 // scheme when the URL omits it.
 func splitHostPort(u *urlpkg.URL) (string, int) {
@@ -374,10 +523,17 @@ func (w *webFetchTool) executeBrowser(ctx context.Context, url string, args map[
 	if w.captureSink != nil && w.captureProject != "" {
 		cfg.CaptureSink = w.captureSink
 		cfg.CaptureProjectUUID = w.captureProject
-		cfg.CaptureSource = "web-fetch-browser"
+		cfg.CaptureSource = spitolas.CaptureSourceWebFetchBrowser
+		// The records are promised to query_records/replay_request, which need
+		// the response, not just the request line.
+		cfg.CaptureBodies = true
 	}
 
-	res, err := spitolas.ProbeURL(ctx, cfg)
+	probe := w.probe
+	if probe == nil {
+		probe = spitolas.ProbeURL
+	}
+	res, err := probe(ctx, cfg)
 	if err != nil {
 		// Render the partial result if spitolas got us a final URL despite
 		// the error — useful when navigation fails late (e.g. JS errors).
@@ -396,7 +552,13 @@ func (w *webFetchTool) executeBrowser(ctx context.Context, url string, args map[
 	}
 
 	var out strings.Builder
-	fmt.Fprintf(&out, "URL: %s\nTitle: %s\n\n", res.FinalURL, res.Title)
+	fmt.Fprintf(&out, "URL: %s\nTitle: %s\n", res.FinalURL, res.Title)
+	if res.ReadinessFailed {
+		// The page was sampled without its readiness condition: say so before
+		// the HTML, so it is not read as the fully rendered page.
+		fmt.Fprintf(&out, "Readiness: %s — %s; the HTML below may be incomplete.\n", res.Readiness, res.ReadinessDetail)
+	}
+	out.WriteString("\n")
 	out.WriteString(html)
 
 	details := map[string]any{
@@ -409,12 +571,14 @@ func (w *webFetchTool) executeBrowser(ctx context.Context, url string, args map[
 	if len(res.Dialogs) > 0 {
 		details["dialogs"] = len(res.Dialogs)
 	}
-	// CDP capture writes records asynchronously and there can be many per
-	// page (one per XHR). We don't have a single "the" record_uuid to
-	// surface like HTTP mode does — the agent should call query_records
-	// with host=<final_url's host> to enumerate what was captured.
+	maps.Copy(details, readinessDetails(res))
+	// CDP capture writes many records per page (one per XHR), so there is no
+	// single record_uuid as in HTTP mode. What is reported comes from the
+	// capture receipt — what the writer confirmed after it drained — never
+	// from the fact that a sink was configured.
 	if cfg.CaptureSink != nil {
-		details["capture"] = "records persisted under source='web-fetch-browser'; use query_records to enumerate"
+		maps.Copy(details, captureDetails(res.Capture))
+		fmt.Fprintf(&out, "\n\n[capture: %s]", captureSummary(res.Capture, spitolas.CaptureSourceWebFetchBrowser))
 	}
 
 	return Result{

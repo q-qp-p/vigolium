@@ -2,10 +2,11 @@ package cli
 
 import (
 	"archive/tar"
-	"compress/gzip"
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,7 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/uptrace/bun"
-	"github.com/vigolium/vigolium/internal/config"
+	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/cli/internal/clicommon"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -171,56 +172,84 @@ func runDBExport(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		return exportBundle(context.Background(), db, projectUUID)
+		return exportDBBundle(context.Background(), db, projectUUID)
 	}
 
-	// Open output file once (outside the watch loop)
-	var outputFile *os.File
+	ctx := context.Background()
+
+	// A single-shot -o is staged and renamed, so a query that fails — or a
+	// cancelled run — leaves the previous export in place instead of a truncated
+	// file a consumer cannot distinguish from a complete one. 0o666 under the
+	// umask reproduces the os.Create this replaced.
+	//
+	// --watch is the deliberate exception: it rewrites the same destination on
+	// every tick for as long as it runs, so there is no single publication point
+	// to rename at. It keeps the open-once-and-append behavior it always had.
+	if exportOutput != "" && !dbExportWatching() {
+		return atomicfile.WriteFile(exportOutput, 0o666, func(w *bufio.Writer) error {
+			return writeDBExport(ctx, db, dateFrom, dateTo, w)
+		})
+	}
+
+	var out io.Writer = os.Stdout
 	if exportOutput != "" {
 		f, err := os.Create(exportOutput)
 		if err != nil {
 			return fmt.Errorf("failed to create output file: %w", err)
 		}
 		defer func() { _ = f.Close() }()
-		outputFile = f
-	} else {
-		outputFile = os.Stdout
+		out = f
 	}
 
 	return runWithWatch(func() error {
-		filters, err := dbExportFilters(dateFrom, dateTo)
-		if err != nil {
-			return err
-		}
-
-		ctx := context.Background()
-		qb := database.NewQueryBuilder(db, filters)
-		records, err := qb.Execute(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to query database: %w", err)
-		}
-
-		if exportRecordUUID != "" && len(records) == 0 {
-			return fmt.Errorf("record UUID %s not found", exportRecordUUID)
-		}
-
-		switch exportFormat {
-		case "jsonl":
-			return exportJSONL(ctx, db, records, outputFile)
-		case "json":
-			return exportJSON(records, outputFile)
-		case "raw":
-			return exportRaw(records, outputFile)
-		case "csv":
-			return exportCSV(records, outputFile)
-		case "markdown":
-			return exportMarkdown(records, outputFile)
-		case "markdown-table":
-			return exportMarkdownTable(records, outputFile)
-		default:
-			return fmt.Errorf("unsupported export format: %s", exportFormat)
-		}
+		return writeDBExport(ctx, db, dateFrom, dateTo, out)
 	})
+}
+
+// dbExportWatching reports whether --watch asked for a repeating read. An
+// unparseable interval is not watching: runWithWatch rejects it as a usage
+// error, and treating it as watching here would quietly skip atomic staging on
+// the way to that rejection.
+func dbExportWatching() bool {
+	interval, err := clicommon.ParseWatchInterval(globalWatchRaw)
+	return err == nil && interval > 0
+}
+
+// writeDBExport runs one query and renders it to w in the requested format. It
+// is the whole body of a `db export` iteration, extracted so the atomic -o path
+// and the watch loop share it exactly.
+func writeDBExport(ctx context.Context, db *database.DB, dateFrom, dateTo *time.Time, out io.Writer) error {
+	filters, err := dbExportFilters(dateFrom, dateTo)
+	if err != nil {
+		return err
+	}
+
+	qb := database.NewQueryBuilder(db, filters)
+	records, err := qb.Execute(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to query database: %w", err)
+	}
+
+	if exportRecordUUID != "" && len(records) == 0 {
+		return fmt.Errorf("record UUID %s not found", exportRecordUUID)
+	}
+
+	switch exportFormat {
+	case "jsonl":
+		return exportJSONL(ctx, db, records, out)
+	case "json":
+		return exportJSON(records, out)
+	case "raw":
+		return exportRaw(records, out)
+	case "csv":
+		return exportCSV(records, out)
+	case "markdown":
+		return exportMarkdown(records, out)
+	case "markdown-table":
+		return exportMarkdownTable(records, out)
+	default:
+		return fmt.Errorf("unsupported export format: %s", exportFormat)
+	}
 }
 
 // runDBExportFS writes the filtered records + findings to a flat
@@ -244,7 +273,7 @@ func runDBExportFS(db *database.DB, dateFrom, dateTo *time.Time) error {
 	return nil
 }
 
-func exportJSONL(ctx context.Context, db *database.DB, records []*database.HTTPRecord, out *os.File) error {
+func exportJSONL(ctx context.Context, db *database.DB, records []*database.HTTPRecord, out io.Writer) error {
 	for _, rec := range records {
 		// Fetch findings for this record
 		var findings []*database.Finding
@@ -267,7 +296,7 @@ func exportJSONL(ctx context.Context, db *database.DB, records []*database.HTTPR
 	return nil
 }
 
-func exportJSON(records []*database.HTTPRecord, out *os.File) error {
+func exportJSON(records []*database.HTTPRecord, out io.Writer) error {
 	result := map[string]interface{}{
 		"export_date":   time.Now().Format(time.RFC3339),
 		"total_records": len(records),
@@ -279,7 +308,7 @@ func exportJSON(records []*database.HTTPRecord, out *os.File) error {
 	return encoder.Encode(result)
 }
 
-func exportRaw(records []*database.HTTPRecord, out *os.File) error {
+func exportRaw(records []*database.HTTPRecord, out io.Writer) error {
 	for _, rec := range records {
 		if exportRequestOnly || !exportRequestOnly {
 			if len(rec.RawRequest) > 0 {
@@ -301,7 +330,7 @@ func exportRaw(records []*database.HTTPRecord, out *os.File) error {
 	return nil
 }
 
-func exportCSV(records []*database.HTTPRecord, out *os.File) error {
+func exportCSV(records []*database.HTTPRecord, out io.Writer) error {
 	_, _ = fmt.Fprintln(out, "uuid,hostname,port,method,path,status_code,response_time_ms,content_type,source,risk_score,surface_score,remarks,created_at")
 
 	for _, rec := range records {
@@ -386,7 +415,7 @@ func parseSeverity(s string) severity.Severity {
 	}
 }
 
-func exportMarkdown(records []*database.HTTPRecord, out *os.File) error {
+func exportMarkdown(records []*database.HTTPRecord, out io.Writer) error {
 	for i, rec := range records {
 		renderRecordMarkdown(rec, out, exportRequestOnly, false)
 		// Divider between records (skip after last)
@@ -398,7 +427,7 @@ func exportMarkdown(records []*database.HTTPRecord, out *os.File) error {
 	return nil
 }
 
-func exportMarkdownTable(records []*database.HTTPRecord, out *os.File) error {
+func exportMarkdownTable(records []*database.HTTPRecord, out io.Writer) error {
 	// Header
 	_, _ = fmt.Fprintln(out, "| HOST | METHOD | PATH | STATUS | TIME | SIZE | CONTENT_TYPE | SOURCE |")
 	_, _ = fmt.Fprintln(out, "|------|--------|------|--------|------|------|--------------|--------|")
@@ -435,19 +464,33 @@ func mdEscape(s string) string {
 	return strings.ReplaceAll(s, "|", "\\|")
 }
 
-func exportBundle(ctx context.Context, db *database.DB, projectUUID string) error {
-	f, err := os.Create(exportOutput)
+// dbBundleStats is what one bundle run produced, carried back out so the
+// summary is printed only after the archive has actually been published.
+type dbBundleStats struct {
+	counts             map[string]int
+	sessionCount       int
+	nativeSessionCount int
+}
+
+// exportDBBundle publishes the `db export --format bundle` archive. Staging,
+// gzip/tar lifetime and the Close-error rule all live in publishTarGz, shared
+// with `export --format bundle`; the summary prints only after the archive has
+// actually been renamed into place.
+func exportDBBundle(ctx context.Context, db *database.DB, projectUUID string) error {
+	stats, err := publishTarGz(exportOutput, func(tw *tar.Writer) (dbBundleStats, error) {
+		return writeDBBundleMembers(ctx, db, projectUUID, tw)
+	})
 	if err != nil {
-		return fmt.Errorf("failed to create output file: %w", err)
+		return err
 	}
-	defer func() { _ = f.Close() }()
+	printDBBundleSummary(projectUUID, stats)
+	return nil
+}
 
-	gw := gzip.NewWriter(f)
-	defer func() { _ = gw.Close() }()
-	tw := tar.NewWriter(gw)
-	defer func() { _ = tw.Close() }()
-
-	counts := make(map[string]int)
+// writeDBBundleMembers writes every archive member into tw.
+func writeDBBundleMembers(ctx context.Context, db *database.DB, projectUUID string, tw *tar.Writer) (dbBundleStats, error) {
+	stats := dbBundleStats{counts: make(map[string]int)}
+	counts := stats.counts
 	var dataLines []byte
 	var envelopes []any
 
@@ -479,7 +522,7 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 	} else {
 		for _, r := range records {
 			if err := appendEnvelope("http_record", r); err != nil {
-				return err
+				return stats, err
 			}
 		}
 	}
@@ -492,7 +535,7 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 	} else {
 		for _, fi := range findings {
 			if err := appendEnvelope("finding", fi); err != nil {
-				return err
+				return stats, err
 			}
 		}
 	}
@@ -505,7 +548,7 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 	} else {
 		for _, s := range scans {
 			if err := appendEnvelope("scan", s); err != nil {
-				return err
+				return stats, err
 			}
 		}
 	}
@@ -518,7 +561,7 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 	} else {
 		for _, a := range agenticScans {
 			if err := appendEnvelope("agentic_scan", a); err != nil {
-				return err
+				return stats, err
 			}
 		}
 	}
@@ -531,7 +574,7 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 	} else {
 		for _, i := range interactions {
 			if err := appendEnvelope("oast_interaction", i); err != nil {
-				return err
+				return stats, err
 			}
 		}
 	}
@@ -544,24 +587,18 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 	} else {
 		for _, s := range scopes {
 			if err := appendEnvelope("scope", s); err != nil {
-				return err
+				return stats, err
 			}
 		}
 	}
 
-	// Write data.jsonl into the archive
+	// Write data.jsonl into the archive. One mtime for every member, so the
+	// archive's own timestamps describe one export rather than three moments
+	// inside it.
+	now := time.Now()
 	if len(dataLines) > 0 {
-		hdr := &tar.Header{
-			Name:    "data.jsonl",
-			Size:    int64(len(dataLines)),
-			Mode:    0644,
-			ModTime: time.Now(),
-		}
-		if err := tw.WriteHeader(hdr); err != nil {
-			return fmt.Errorf("failed to write tar header for data.jsonl: %w", err)
-		}
-		if _, err := tw.Write(dataLines); err != nil {
-			return fmt.Errorf("failed to write tar data for data.jsonl: %w", err)
+		if err := writeTarBytes(tw, "data.jsonl", dataLines, now); err != nil {
+			return stats, fmt.Errorf("failed to write data.jsonl into the bundle: %w", err)
 		}
 	}
 
@@ -575,33 +612,17 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 			ScanTarget:      autoTarget,
 			ReportSharedURL: exportReportURL,
 		}
-		tmpFile, err := os.CreateTemp("", "vigolium-bundle-report-*.html")
+		// report.html is a member of the archive, not a bonus: a bundle without
+		// it is not the artifact the operator asked for, and warning about it on
+		// stderr while publishing the archive anyway meant nothing downstream
+		// could tell the two apart. Same decision as `vigolium export --format
+		// bundle`; renderBundleHTML is the shared renderer.
+		htmlData, err := renderBundleHTML(envelopes, meta)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s Failed to create temp file for HTML report: %v\n", terminal.WarningSymbol(), err)
-		} else {
-			tmpPath := tmpFile.Name()
-			_ = tmpFile.Close()
-			defer func() { _ = os.Remove(tmpPath) }()
-
-			if err := output.GenerateHTMLReport(envelopes, tmpPath, meta); err != nil {
-				fmt.Fprintf(os.Stderr, "%s Failed to generate HTML report: %v\n", terminal.WarningSymbol(), err)
-			} else {
-				htmlData, err := os.ReadFile(tmpPath)
-				if err == nil {
-					hdr := &tar.Header{
-						Name:    "report.html",
-						Size:    int64(len(htmlData)),
-						Mode:    0644,
-						ModTime: time.Now(),
-					}
-					if err := tw.WriteHeader(hdr); err != nil {
-						return fmt.Errorf("failed to write tar header for report.html: %w", err)
-					}
-					if _, err := tw.Write(htmlData); err != nil {
-						return fmt.Errorf("failed to write tar data for report.html: %w", err)
-					}
-				}
-			}
+			return stats, fmt.Errorf("render report.html for bundle: %w", err)
+		}
+		if err := writeTarBytes(tw, "report.html", htmlData, now); err != nil {
+			return stats, fmt.Errorf("failed to write report.html into the bundle: %w", err)
 		}
 	}
 
@@ -641,20 +662,19 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 	}
 	metaBytes, _ := json.MarshalIndent(meta, "", "  ")
 	metaBytes = append(metaBytes, '\n')
-	hdr := &tar.Header{
-		Name:    "metadata.json",
-		Size:    int64(len(metaBytes)),
-		Mode:    0644,
-		ModTime: time.Now(),
-	}
-	if err := tw.WriteHeader(hdr); err != nil {
-		return fmt.Errorf("failed to write tar header for metadata: %w", err)
-	}
-	if _, err := tw.Write(metaBytes); err != nil {
-		return fmt.Errorf("failed to write tar data for metadata: %w", err)
+	if err := writeTarBytes(tw, "metadata.json", metaBytes, now); err != nil {
+		return stats, fmt.Errorf("failed to write metadata.json into the bundle: %w", err)
 	}
 
-	// Print summary
+	stats.sessionCount = sessionCount
+	stats.nativeSessionCount = nativeSessionCount
+	return stats, nil
+}
+
+// printDBBundleSummary reports what the published archive contains. Called after
+// the rename, not before: a summary printed next to a file that was never
+// published is the same lie the atomic staging exists to prevent.
+func printDBBundleSummary(projectUUID string, stats dbBundleStats) {
 	total := 0
 	fmt.Fprintf(os.Stderr, "\n%s Export summary (format: %s)\n", terminal.InfoSymbol(), terminal.Cyan("bundle"))
 	fmt.Fprintf(os.Stderr, "  Output: %s\n", terminal.Cyan(exportOutput))
@@ -668,23 +688,21 @@ func exportBundle(ctx context.Context, db *database.DB, projectUUID string) erro
 		{"scope", "Scopes"},
 	}
 	for _, t := range typeOrder {
-		if c, ok := counts[t.key]; ok && c > 0 {
+		if c, ok := stats.counts[t.key]; ok && c > 0 {
 			fmt.Fprintf(os.Stderr, "  %-20s %d\n", t.label, c)
 			total += c
 		}
 	}
 	fmt.Fprintf(os.Stderr, "  %-20s %d\n", "Total records", total)
-	if sessionCount > 0 {
-		fmt.Fprintf(os.Stderr, "  %-20s %d\n", "Agent sessions", sessionCount)
+	if stats.sessionCount > 0 {
+		fmt.Fprintf(os.Stderr, "  %-20s %d\n", "Agent sessions", stats.sessionCount)
 	}
-	if nativeSessionCount > 0 {
-		fmt.Fprintf(os.Stderr, "  %-20s %d\n", "Native sessions", nativeSessionCount)
+	if stats.nativeSessionCount > 0 {
+		fmt.Fprintf(os.Stderr, "  %-20s %d\n", "Native sessions", stats.nativeSessionCount)
 	}
 	if projectUUID != "" {
 		fmt.Fprintf(os.Stderr, "  Project: %s\n", terminal.Cyan(projectUUID))
 	}
-
-	return nil
 }
 
 // archiveSessionDir walks sessionPath and streams its contents into tw under
@@ -747,9 +765,5 @@ func archiveSessionDir(tw *tar.Writer, sessionPath, prefix string) bool {
 // files live. Loads settings to honour user overrides; falls back to the
 // default when config can't be read.
 func resolveNativeSessionsDir() string {
-	settings, err := config.LoadSettings(globalConfig)
-	if err != nil {
-		settings = config.DefaultSettings()
-	}
-	return settings.ScanningStrategy.ScanLogs.EffectiveSessionsDir()
+	return settingsOrDefaults().ScanningStrategy.ScanLogs.EffectiveSessionsDir()
 }

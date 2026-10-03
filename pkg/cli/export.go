@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/uptrace/bun"
+	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/database"
 	"github.com/vigolium/vigolium/pkg/modules"
 	"github.com/vigolium/vigolium/pkg/output"
@@ -32,6 +35,12 @@ var (
 	topExportGeneratedAt  string
 	topExportReportURL    string
 	topExportScanUUIDs    []string
+
+	// topExportNoURLDedup belongs to `vigolium export` alone. The post-scan
+	// exporters never set it: their JSONL is the documented per-run artifact and
+	// changing its row count by default would break every consumer counting on
+	// one row per URL.
+	topExportNoURLDedup bool
 )
 
 // validExportTypes lists all accepted --only values.
@@ -48,7 +57,9 @@ Use --only to choose which tables to include, --omit-response to drop raw HTTP r
 
 Multiple formats can be combined in one run (--format html,markdown,bundle). The database is read once and every format is rendered from that one result set (fs is the exception — it streams its own record and finding cursors). With more than one format, -o/--output is the shared base path and each format appends its own extension (report.html, report.md, report.tar.gz); a single format still uses -o verbatim.
 
-The --format bundle (alias gz) emits a .tar.gz archive containing export.jsonl, report.html, manifest.json, and any agent session directories matching --scan-uuid <uuid> (repeatable).`,
+The --format bundle (alias gz) emits a .tar.gz archive containing export.jsonl, report.html, manifest.json, and any agent session directories matching --scan-uuid <uuid> (repeatable).
+
+JSONL coverage is a view, not a lossless archive: HTTP exchanges sharing a URL collapse to the first one (plus any exchange a finding links to), and only confirmed findings are emitted. Pass --no-url-dedup for every stored exchange; use --format sqlite on a stateless scan, or copy the database file, when you need the complete store.`,
 	RunE: runExportCmd,
 }
 
@@ -60,6 +71,8 @@ func init() {
 		"Export only these tables (repeatable: http, findings, scans, modules, oast, source-repos, scopes)")
 	exportCmd.Flags().BoolVar(&topExportOmitResponse, "omit-response", false,
 		"Omit raw HTTP request/response bytes (keeps metadata, smaller files)")
+	exportCmd.Flags().BoolVar(&topExportNoURLDedup, "no-url-dedup", false,
+		"Emit every stored HTTP exchange; by default exchanges sharing a URL collapse to the first one (plus any a finding links to)")
 	exportCmd.Flags().StringVar(&topExportSearch, "search", "",
 		"Fuzzy search filter across URLs, paths, hostnames, methods, content types, and sources")
 	exportCmd.Flags().IntVar(&topExportLimit, "limit", 0,
@@ -84,6 +97,8 @@ func init() {
 		"Read from --db (a standalone .sqlite or .jsonl export) instead of your project DB; never writes to it")
 	exportCmd.Flags().StringVar(&globalGlobDB, "glob-db", "",
 		"Export across a glob of result files merged into one temporary DB (e.g. --glob-db 'scans/*.sqlite'); implies -S")
+	exportCmd.Flags().BoolVar(&globalGlobStrict, "glob-strict", false,
+		"Fail the read on the first --glob-db source that cannot be imported, instead of skipping it with a warning")
 }
 
 // exportScope decides which envelope types an export emits.
@@ -319,7 +334,7 @@ func runExportCmd(cmd *cobra.Command, args []string) error {
 	}
 
 	if run.multi {
-		printMultiExportSummary(exportFormatNames(specs), run.items, outputs)
+		printMultiExportSummary(exportFormatNames(specs), run.items, outputs, run.printProjectScope)
 	}
 	if len(failed) > 0 {
 		// Each failure printed its own reason above; this only carries the
@@ -355,12 +370,29 @@ type exportRun struct {
 	metaDuration string
 	metaSet      bool
 
+	// projectUUID is the project filter every format in this run applies, or ""
+	// for the whole database. Resolved once in openDB, after the source is open,
+	// so a --project-name lookup hits the source being exported.
+	//
+	// It used to be hardcoded "" at four call sites, so `export --project-uuid X`
+	// exported every project while the {project-uuid} placeholder in -o named X —
+	// a file whose name asserted a scope its contents did not have. The default
+	// is still whole-DB: `vigolium export` with no project flag is the documented
+	// way to dump a store.
+	projectUUID string
+
 	// multi records that more than one format was requested, which switches the
 	// per-format count blocks off in favor of one unified summary at the end.
 	multi bool
 }
 
-// openDB opens the export database once per run.
+// openDB opens the export database once per run and resolves the project filter
+// against it.
+//
+// The order is load-bearing: resolveProjectUUID looks a --project-name up
+// through the opened handle and memoizes the answer for the process, so
+// resolving before the source is open would pin a UUID from the default store
+// and then filter the exported source by it.
 func (r *exportRun) openDB() (*database.DB, error) {
 	if r.db != nil {
 		return r.db, nil
@@ -370,6 +402,11 @@ func (r *exportRun) openDB() (*database.DB, error) {
 		return nil, err
 	}
 	r.db = db
+	if explicitProjectSelected() {
+		if r.projectUUID, err = resolveProjectUUID(); err != nil {
+			return nil, err
+		}
+	}
 	return db, nil
 }
 
@@ -379,7 +416,7 @@ func (r *exportRun) loadItems(ctx context.Context, db *database.DB) ([]any, erro
 	if r.itemsSet {
 		return r.items, nil
 	}
-	items, err := queryExportData(ctx, db, topExportOmitResponse, "", "")
+	items, err := queryExportData(ctx, db, topExportOmitResponse, r.projectUUID, "")
 	if err != nil {
 		return nil, err
 	}
@@ -407,7 +444,20 @@ func (r *exportRun) printStats(format, outputPath string, counts exportCounts) {
 	if outputPath != "" {
 		fmt.Fprintf(os.Stderr, "  Output: %s\n", terminal.Cyan(outputPath))
 	}
+	r.printProjectScope()
 	printExportTally(counts)
+}
+
+// printProjectScope states which project the counts below it cover. Stated
+// rather than left to be inferred: the default is the whole database, and an
+// operator who expected their active project to apply has no other way to find
+// out that it did not.
+func (r *exportRun) printProjectScope() {
+	if r.projectUUID != "" {
+		fmt.Fprintf(os.Stderr, "  Project: %s\n", terminal.Cyan(r.projectUUID))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "  Project: %s\n", terminal.Gray("all (no --project-uuid/--project-name)"))
 }
 
 // runFormat materializes one requested format at its resolved path, returning the
@@ -603,34 +653,54 @@ func (r *exportRun) exportJSONL(ctx context.Context, outputPath string) ([]expor
 		}
 	}
 
-	// Open output writer
-	var w *os.File
-	if outputPath != "" {
-		f, err := os.Create(outputPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create output file: %w", err)
+	// write produces the whole document into w. Shared by the stdout and the -o
+	// branch so the bytes cannot drift between them; it reports the counts the
+	// summary prints.
+	write := func(w io.Writer) (exportCounts, error) {
+		if streaming {
+			counts, err := streamJSONLExport(ctx, db, w, topExportOmitResponse, r.projectUUID)
+			if err != nil {
+				return counts, err
+			}
+			return counts, nil
 		}
-		defer func() { _ = f.Close() }()
-		w = f
-	} else {
-		w = os.Stdout
+		if _, err := encodeJSONL(w, items); err != nil {
+			return exportCounts{}, err
+		}
+		return countExportItems(items), nil
 	}
 
-	if streaming {
-		counts, err := streamJSONLExport(ctx, db, w, topExportOmitResponse, "")
+	// Stdout has nothing to protect: there is no previous artifact and no
+	// partially-published file, so a failure mid-stream is just a truncated pipe
+	// the exit code already reports. Buffered all the same, so a streamed export
+	// costs one write(2) per buffer rather than one per record — which is what
+	// the -o branch already gets from atomicfile's *bufio.Writer.
+	if outputPath == "" {
+		out := bufio.NewWriter(os.Stdout)
+		counts, err := write(out)
 		if err != nil {
 			return nil, fmt.Errorf("failed to encode record: %w", err)
 		}
-		r.printStats("jsonl", outputPath, counts)
-	} else {
-		if _, err := encodeJSONL(w, items); err != nil {
-			return nil, fmt.Errorf("failed to encode record: %w", err)
+		if err := out.Flush(); err != nil {
+			return nil, fmt.Errorf("failed to write export: %w", err)
 		}
-		r.printStats("jsonl", outputPath, countExportItems(items))
-	}
-	if outputPath == "" {
+		r.printStats("jsonl", "", counts)
 		return nil, nil // streamed to stdout; nothing to list
 	}
+
+	// A named output is staged and renamed. os.Create truncated before the first
+	// query ran, so a read failure — now that reads are strict — destroyed the
+	// previous export and left a partial file a consumer could not tell from a
+	// complete one. 0o666 under the umask reproduces os.Create's mode exactly.
+	var counts exportCounts
+	if err := atomicfile.WriteFile(outputPath, 0o666, func(w *bufio.Writer) error {
+		var werr error
+		counts, werr = write(w)
+		return werr
+	}); err != nil {
+		return nil, fmt.Errorf("export jsonl %s: %w", outputPath, err)
+	}
+	r.printStats("jsonl", outputPath, counts)
 	return []exportedFile{{label: "jsonl", path: outputPath}}, nil
 }
 
@@ -686,11 +756,12 @@ func printExportTally(counts exportCounts) {
 // printMultiExportSummary reports a multi-format run once: the shared item counts,
 // then every file written listed under one "Exports" header (reusing the scan
 // commands' summary renderer).
-func printMultiExportSummary(formats []string, items []any, outputs []exportedFile) {
+func printMultiExportSummary(formats []string, items []any, outputs []exportedFile, scope func()) {
 	if len(outputs) == 0 {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "\n%s Export summary (formats: %s)\n", terminal.InfoSymbol(), terminal.Cyan(strings.Join(formats, ", ")))
+	scope()
 	printExportTally(countExportItems(items))
 	printExportSummary(outputs)
 }
@@ -709,9 +780,10 @@ func (r *exportRun) exportFS(ctx context.Context, outputPath string) ([]exported
 		severities = strings.Split(topExportSeverity, ",")
 	}
 	filters := database.QueryFilters{
-		FuzzyTerm: topExportSearch,
-		Severity:  severities,
-		Limit:     topExportLimit,
+		ProjectUUID: r.projectUUID,
+		FuzzyTerm:   topExportSearch,
+		Severity:    severities,
+		Limit:       topExportLimit,
 	}
 	stats, err := writeFSExport(ctx, db, filters, outputPath, fsExportOptions{omitResponse: topExportOmitResponse})
 	if err != nil {
@@ -763,9 +835,18 @@ func exportExcludeSet() map[string]bool {
 // findings) are read with a row cursor — only one row is live at a time; the
 // small tables are loaded then emitted.
 //
-// Per-table query errors are logged and skipped (best-effort, matching the
-// legacy behavior); an error returned by emit (a downstream write failure) is
-// fatal and propagated immediately.
+// Reads are strict: a query, row-scan or cursor error anywhere in the stream
+// aborts the export and is returned. It used to warn and continue, which meant
+// a table that could not be read produced an export silently missing it — a
+// consumer reading that file has no way to tell "this scan found no findings"
+// from "the findings table could not be read", and the artifact it publishes is
+// indistinguishable from a complete one. An error returned by emit (a
+// downstream write failure) is likewise fatal and propagated immediately.
+//
+// The one thing still reported rather than returned is the host-facts
+// missing-count notice below: those facts are decoration on records that were
+// themselves read successfully, so their absence is incompleteness to announce,
+// not a failed read.
 //
 // When omitResponse is true the bulky raw_request/raw_response columns are not
 // selected for http_records (honoring an explicit --omit-response). Report
@@ -793,12 +874,11 @@ func streamExportData(ctx context.Context, db *database.DB, scope exportScope, o
 			q = q.Limit(topExportLimit)
 		}
 		if err := q.Scan(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "%s Failed to query scans: %v\n", terminal.WarningSymbol(), err)
-		} else {
-			for _, s := range scans {
-				if err := emitItem("scan", s); err != nil {
-					return err
-				}
+			return fmt.Errorf("export scans: %w", err)
+		}
+		for _, s := range scans {
+			if err := emitItem("scan", s); err != nil {
+				return err
 			}
 		}
 	}
@@ -869,12 +949,11 @@ func streamExportData(ctx context.Context, db *database.DB, scope exportScope, o
 			q = q.Limit(topExportLimit)
 		}
 		if err := q.Scan(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "%s Failed to query OAST interactions: %v\n", terminal.WarningSymbol(), err)
-		} else {
-			for _, i := range interactions {
-				if err := emitItem("oast_interaction", i); err != nil {
-					return err
-				}
+			return fmt.Errorf("export oast interactions: %w", err)
+		}
+		for _, i := range interactions {
+			if err := emitItem("oast_interaction", i); err != nil {
+				return err
 			}
 		}
 	}
@@ -891,12 +970,11 @@ func streamExportData(ctx context.Context, db *database.DB, scope exportScope, o
 			q = q.Limit(topExportLimit)
 		}
 		if err := q.Scan(ctx); err != nil {
-			fmt.Fprintf(os.Stderr, "%s Failed to query scopes: %v\n", terminal.WarningSymbol(), err)
-		} else {
-			for _, s := range scopes {
-				if err := emitItem("scope", s); err != nil {
-					return err
-				}
+			return fmt.Errorf("export scopes: %w", err)
+		}
+		for _, s := range scopes {
+			if err := emitItem("scope", s); err != nil {
+				return err
 			}
 		}
 	}
@@ -907,13 +985,17 @@ func streamExportData(ctx context.Context, db *database.DB, scope exportScope, o
 // findingReferencedRecordUUIDs returns the set of http_record UUIDs that at least
 // one finding links to (via finding_records), scoped to projectUUID (empty =
 // whole DB). These records are a finding's exact proof exchange, so streamHTTPRecords
-// must never drop them in its per-URL dedup. Best-effort: on error it returns an
-// empty set (the caller falls back to plain URL-dedup, the prior behavior). The
-// subquery form is dialect-agnostic (SQLite and PostgreSQL).
-func findingReferencedRecordUUIDs(ctx context.Context, db *database.DB, projectUUID string) map[string]struct{} {
+// must never drop them in its per-URL dedup. The subquery form is
+// dialect-agnostic (SQLite and PostgreSQL).
+//
+// Strict: a read failure is returned rather than degraded into an empty set.
+// Falling back to plain URL-dedup looks harmless but silently drops the exact
+// attack exchanges findings cite, which is the one class of record an export
+// exists to carry.
+func findingReferencedRecordUUIDs(ctx context.Context, db *database.DB, projectUUID string) (map[string]struct{}, error) {
 	referenced := make(map[string]struct{})
 	if db == nil {
-		return referenced
+		return referenced, nil
 	}
 	sqlText := "SELECT DISTINCT record_uuid FROM finding_records WHERE finding_id IN (SELECT id FROM findings"
 	var args []any
@@ -924,13 +1006,12 @@ func findingReferencedRecordUUIDs(ctx context.Context, db *database.DB, projectU
 	sqlText += ")"
 	var uuids []string
 	if err := db.NewRaw(sqlText, args...).Scan(ctx, &uuids); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to load finding-referenced records: %v\n", terminal.WarningSymbol(), err)
-		return referenced
+		return nil, fmt.Errorf("load finding-referenced records: %w", err)
 	}
 	for _, u := range uuids {
 		referenced[u] = struct{}{}
 	}
-	return referenced
+	return referenced, nil
 }
 
 // streamHTTPRecords reads http_records with a row cursor and emits one envelope
@@ -939,9 +1020,11 @@ func findingReferencedRecordUUIDs(ctx context.Context, db *database.DB, projectU
 // that a finding links to is ALWAYS emitted, even when another record already
 // claimed its URL — otherwise the per-URL dedup could drop the exact attack
 // exchange a finding proves, leaving replay/Burp/report evidence pointing at a
-// different same-URL record. omitResponse drops the raw_request/raw_response
-// columns from the SELECT entirely. A query/scan error is logged and ends this
-// table (best-effort); only emit errors are returned.
+// different same-URL record. `export --no-url-dedup` turns the collapse off
+// entirely, which also makes the finding-reference lookup unnecessary.
+//
+// omitResponse drops the raw_request/raw_response columns from the SELECT
+// entirely. Reads are strict: a query, row-scan or cursor error is returned.
 func streamHTTPRecords(ctx context.Context, db *database.DB, omitResponse bool, projectUUID, scanUUID string, emitItem func(string, any) error) error {
 	qb := database.NewQueryBuilder(db, database.QueryFilters{
 		ProjectUUID: projectUUID,
@@ -954,12 +1037,19 @@ func streamHTTPRecords(ctx context.Context, db *database.DB, omitResponse bool, 
 	query := qb.BuildRecordsQuery()
 	rows, err := query.Rows(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to query HTTP records: %v\n", terminal.WarningSymbol(), err)
-		return nil
+		return fmt.Errorf("export http records: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	referenced := findingReferencedRecordUUIDs(ctx, db, projectUUID)
+	// Only needed to protect proof exchanges from the dedup; with the dedup off
+	// every record is emitted anyway, so the query is skipped rather than run and
+	// ignored.
+	var referenced map[string]struct{}
+	if !topExportNoURLDedup {
+		if referenced, err = findingReferencedRecordUUIDs(ctx, db, projectUUID); err != nil {
+			return err
+		}
+	}
 
 	// The run's stored host observations, loaded once for the whole pass.
 	//
@@ -976,16 +1066,17 @@ func streamHTTPRecords(ctx context.Context, db *database.DB, omitResponse bool, 
 	for rows.Next() {
 		r := new(database.HTTPRecord)
 		if err := db.ScanRow(ctx, rows, r); err != nil {
-			fmt.Fprintf(os.Stderr, "%s Failed to scan HTTP record: %v\n", terminal.WarningSymbol(), err)
-			return nil
+			return fmt.Errorf("export http records: scan row: %w", err)
 		}
-		// A finding-referenced record is that finding's proof — emit it even when
-		// its URL was already claimed by an earlier (non-attack) record.
-		_, isReferenced := referenced[r.UUID]
-		if _, dup := seen[r.URL]; dup && !isReferenced {
-			continue
+		if !topExportNoURLDedup {
+			// A finding-referenced record is that finding's proof — emit it even
+			// when its URL was already claimed by an earlier (non-attack) record.
+			_, isReferenced := referenced[r.UUID]
+			if _, dup := seen[r.URL]; dup && !isReferenced {
+				continue
+			}
+			seen[r.URL] = struct{}{}
 		}
-		seen[r.URL] = struct{}{}
 		// WithFacts, not the bare record: this is the export of a run that may
 		// have resolved/probed the hosts it recorded. A process with neither
 		// stored observations nor a warm cache gets the bare record back
@@ -995,7 +1086,7 @@ func streamHTTPRecords(ctx context.Context, db *database.DB, omitResponse bool, 
 		}
 	}
 	if err := rows.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Error reading HTTP records: %v\n", terminal.WarningSymbol(), err)
+		return fmt.Errorf("export http records: %w", err)
 	}
 	// Incompleteness is reported rather than left to be inferred from absent
 	// keys. HostFacts.Empty() collapses "never probed", "probed and genuinely
@@ -1010,8 +1101,8 @@ func streamHTTPRecords(ctx context.Context, db *database.DB, omitResponse bool, 
 
 // streamFindings reads findings with a row cursor and emits one envelope per
 // row, holding only a single finding in memory at a time. Filters mirror the
-// legacy findings query exactly (search, severity, limit, found_at DESC). A
-// query/scan error is logged and ends this table; only emit errors are returned.
+// legacy findings query exactly (search, severity, limit, found_at DESC).
+// Reads are strict: a query, row-scan or cursor error is returned.
 func streamFindings(ctx context.Context, db *database.DB, projectUUID, scanUUID string, emitItem func(string, any) error) error {
 	q := scopeProjectBun(db.NewSelect().Model((*database.Finding)(nil)).OrderExpr("found_at DESC"), projectUUID)
 	// Confirmed findings only. E0 observations / E1 candidates are persisted in
@@ -1039,23 +1130,21 @@ func streamFindings(ctx context.Context, db *database.DB, projectUUID, scanUUID 
 	}
 	rows, err := q.Rows(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s Failed to query findings: %v\n", terminal.WarningSymbol(), err)
-		return nil
+		return fmt.Errorf("export findings: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		f := new(database.Finding)
 		if err := db.ScanRow(ctx, rows, f); err != nil {
-			fmt.Fprintf(os.Stderr, "%s Failed to scan finding: %v\n", terminal.WarningSymbol(), err)
-			return nil
+			return fmt.Errorf("export findings: scan row: %w", err)
 		}
 		if err := emitItem("finding", f); err != nil {
 			return err
 		}
 	}
 	if err := rows.Err(); err != nil {
-		fmt.Fprintf(os.Stderr, "%s Error reading findings: %v\n", terminal.WarningSymbol(), err)
+		return fmt.Errorf("export findings: %w", err)
 	}
 	return nil
 }

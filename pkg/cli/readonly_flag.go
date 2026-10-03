@@ -62,8 +62,12 @@ func applyReadOnlyMode(cmd *cobra.Command) error {
 	// A command is not a reader or a writer — an INVOCATION is. These flags turn
 	// an admitted read command into one that writes, and would otherwise be
 	// accepted here only to fail (or half-succeed) against the read-only handle.
+	//
+	// flagOn, not Changed: `--save-to-vigolium-db=false` writes nothing, so
+	// rejecting it was a conflict that did not exist — and the operator who spells
+	// out the safe value is exactly the one least deserving of a usage error.
 	for _, w := range []string{"save-to-vigolium-db", "in-replace"} {
-		if f := cmd.Flags().Lookup(w); f != nil && f.Changed {
+		if flagOn(cmd, w) {
 			return usageErrorf("--read-only cannot be combined with --%s: that flag writes to the database", w)
 		}
 	}

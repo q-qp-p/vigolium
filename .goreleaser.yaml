@@ -51,6 +51,10 @@ builds:
 archives:
   - formats:
       - tar.gz
+    files:
+      - LICENSE
+      - THIRD_PARTY_NOTICES.md
+      - README.md
     # zip on Windows: tar.gz needs a third-party tool on older Windows, and zip
     # is what every Windows install path (Explorer, Expand-Archive) handles.
     format_overrides:

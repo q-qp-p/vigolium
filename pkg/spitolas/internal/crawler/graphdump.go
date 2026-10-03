@@ -1,13 +1,16 @@
 package crawler
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
+	"github.com/vigolium/vigolium/internal/atomicfile"
 	"github.com/vigolium/vigolium/pkg/spitolas/internal/action"
 	"go.uber.org/zap"
 )
@@ -21,22 +24,49 @@ import (
 // produced a given request. That is the difference between a list of URLs and a
 // reproducible route, and it is what makes a state re-reachable later without
 // rediscovering the whole path to it.
+//
+// The manifest fields (RunID, Seed, Policy, Security, Capture, Redacted) say
+// which run the graph belongs to, what the crawl was permitted to change, the
+// browser's security posture and what its capture retained — the context a
+// reader needs before trusting or sharing the file.
 type GraphDump struct {
-	Version   int              `json:"version"`
-	Target    string           `json:"target"`
-	CreatedAt time.Time        `json:"created_at"`
-	Stats     GraphDumpStats   `json:"stats"`
-	States    []GraphDumpState `json:"states"`
-	Edges     []GraphDumpEdge  `json:"edges"`
+	Version   int       `json:"version"`
+	RunID     string    `json:"run_id,omitempty"`
+	Seed      string    `json:"seed,omitempty"`
+	Target    string    `json:"target"`
+	CreatedAt time.Time `json:"created_at"`
+	// Redacted is true when credential-bearing values were scrubbed (the
+	// default); false only under spidering.graph_include_values.
+	Redacted bool           `json:"redacted"`
+	Policy   map[string]any `json:"policy,omitempty"`
+	Security map[string]any `json:"security,omitempty"`
+	// Capture is the run's capture receipt (spitolas.CaptureReceipt), carried
+	// as written by the caller.
+	Capture any              `json:"capture,omitempty"`
+	Stats   GraphDumpStats   `json:"stats"`
+	States  []GraphDumpState `json:"states"`
+	Edges   []GraphDumpEdge  `json:"edges"`
+}
+
+// GraphManifest is the run context a caller supplies with WriteGraphDump.
+type GraphManifest struct {
+	RunID    string
+	Seed     string
+	Policy   map[string]any
+	Security map[string]any
+	Capture  any
 }
 
 // GraphDumpStats summarises the run the graph came from.
 type GraphDumpStats struct {
-	States          int `json:"states"`
-	Edges           int `json:"edges"`
-	ActionsExecuted int `json:"actions_executed"`
-	ActionsFailed   int `json:"actions_failed"`
-	FormsSubmitted  int `json:"forms_submitted"`
+	States               int `json:"states"`
+	Edges                int `json:"edges"`
+	ActionsExecuted      int `json:"actions_executed"`
+	ActionsFailed        int `json:"actions_failed"`
+	FormsSubmitted       int `json:"forms_submitted"`
+	FormSubmitsPrevented int `json:"form_submits_prevented"`
+	FormSubmitsUncertain int `json:"form_submits_uncertain"`
+	WaitConditionsFailed int `json:"wait_conditions_failed,omitempty"`
 }
 
 // GraphDumpState is one reached location. The DOM itself is deliberately not
@@ -85,42 +115,54 @@ type GraphDumpInput struct {
 	Inputs []string `json:"inputs,omitempty"`
 }
 
-// graphDumpVersion is bumped when the shape changes incompatibly.
-const graphDumpVersion = 1
+// graphDumpVersion is bumped when the shape or the meaning of a field changes.
+// 2: forms_submitted counts every submission mechanism (v1 counted only Enter
+// actions, so it was structurally 0); form_submits_prevented/_uncertain added;
+// the run manifest (run_id, seed, policy, security, capture, redacted) added;
+// credential-bearing values redacted by default. A v1 file may hold unredacted
+// values.
+const graphDumpVersion = 2
 
-// writeGraphDump serializes the finished graph to config.GraphOutputPath.
+// WriteGraphDump serializes the finished graph to path, owner-only (0600) and
+// atomically — a temp file in the same directory renamed into place — so an
+// interrupted write never truncates an earlier good graph. Credential-bearing
+// values are redacted unless includeValues is set (see redactGraphDump).
 //
-// Best-effort: a crawl that produced traffic is a successful crawl whether or
-// not the map of it could be written, so every failure here is logged and
-// swallowed rather than surfaced.
-func (c *Crawler) writeGraphDump() {
-	if c.config == nil || c.config.GraphOutputPath == "" || c.graph == nil {
-		return
+// The caller decides what a failure costs: a crawl that produced traffic is a
+// successful crawl whether or not the map of it could be written.
+func (c *Crawler) WriteGraphDump(path string, m GraphManifest, includeValues bool) error {
+	if path == "" || c.graph == nil {
+		return nil
 	}
 
 	dump := c.buildGraphDump()
-	data, err := json.MarshalIndent(dump, "", "  ")
-	if err != nil {
-		zap.L().Debug("Crawl-graph serialization failed", zap.Error(err))
-		return
+	dump.RunID, dump.Seed = m.RunID, m.Seed
+	dump.Policy, dump.Security, dump.Capture = m.Policy, m.Security, m.Capture
+	dump.Redacted = !includeValues
+	if dump.Redacted {
+		redactGraphDump(&dump)
 	}
 
-	path := c.config.GraphOutputPath
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
-			zap.L().Debug("Crawl-graph directory creation failed",
-				zap.String("dir", dir), zap.Error(mkErr))
-			return
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return fmt.Errorf("create crawl-graph directory: %w", err)
 		}
 	}
-	if wErr := os.WriteFile(path, data, 0o644); wErr != nil {
-		zap.L().Debug("Crawl-graph write failed", zap.String("path", path), zap.Error(wErr))
-		return
+	// atomicfile.Write leaves the temp file's 0600 in place.
+	err := atomicfile.Write(path, func(w *bufio.Writer) error {
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(dump)
+	})
+	if err != nil {
+		return fmt.Errorf("write crawl graph: %w", err)
 	}
 	zap.L().Info("Spidering: wrote crawl graph",
 		zap.String("path", path),
+		zap.Bool("redacted", dump.Redacted),
 		zap.Int("states", dump.Stats.States),
 		zap.Int("edges", dump.Stats.Edges))
+	return nil
 }
 
 // buildGraphDump converts the live graph into its serializable form. States and
@@ -169,6 +211,10 @@ func (c *Crawler) buildGraphDump() GraphDump {
 		ActionsExecuted: c.stats.ActionsExecuted,
 		ActionsFailed:   c.stats.ActionsFailed,
 		FormsSubmitted:  c.stats.FormsSubmitted,
+
+		FormSubmitsPrevented: c.stats.FormSubmitsPrevented,
+		FormSubmitsUncertain: c.stats.FormSubmitsUncertain,
+		WaitConditionsFailed: c.stats.WaitConditionsFailed,
 	}
 	c.mu.Unlock()
 
@@ -221,18 +267,32 @@ func graphDumpEdgeFrom(e *action.Eventable) GraphDumpEdge {
 	return out
 }
 
-// defaultGraphFileName is used when the crawl's host is unknown.
-const defaultGraphFileName = "crawl-graph.json"
-
-// GraphOutputPathFor joins a directory and a per-target file name, giving each
-// target in a multi-target run its own graph rather than one overwriting the
-// next. host may be empty, in which case the default name is used.
-func GraphOutputPathFor(dir, host string) string {
+// GraphOutputPathFor names one graph file in dir:
+// crawl-graph-<host>-<runID>-<seq>.json. The run id keeps repeat runs apart and
+// seq keeps same-host seeds of one run apart, so no graph overwrites another.
+// Empty host or runID components are left out; every component is reduced to
+// filename-safe characters.
+func GraphOutputPathFor(dir, host, runID, seq string) string {
 	if dir == "" {
 		return ""
 	}
-	if host == "" {
-		return filepath.Join(dir, defaultGraphFileName)
+	name := "crawl-graph"
+	for _, part := range []string{host, runID, seq} {
+		if p := fileNameSafe(part); p != "" {
+			name += "-" + p
+		}
 	}
-	return filepath.Join(dir, fmt.Sprintf("crawl-graph-%s.json", host))
+	return filepath.Join(dir, name+".json")
+}
+
+// fileNameSafe keeps [A-Za-z0-9._-] and replaces anything else (an IPv6
+// host's colons, a path separator in an operator-supplied run id) with "_".
+func fileNameSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			return r
+		}
+		return '_'
+	}, strings.Trim(s, "."))
 }
